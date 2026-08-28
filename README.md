@@ -20,8 +20,7 @@ Additionally, convenient and robust checkpoint saving/loading will be implemente
 
 * **tPC-E ([Ng-Kee-Kwong et al., 2026](https://www.biorxiv.org/content/10.64898/2026.07.09.737423v1))**: Temporal Predictive Coding with eligibility traces.
 * **PCN-HEP ([Mohammadi & Ororbia, 2026](https://arxiv.org/abs/2606.22744))**: PCN with Highway Error Propagation.
-* **Meta-PCN ([Ha et al., 2026](https://openreview.net/forum?id=kE5jJUHl9i))**: Hierarchical temporal Predictive Coding with eligibility traces.
-
+* **Meta-PCN ([Ha et al., 2026](https://openreview.net/forum?id=kE5jJUHl9i))**: PCN with meta-prediction errors and weight regularization.
 
 ## Planned Features
 

@@ -73,20 +73,27 @@ in the calling code that loops over a batch of sequences.
 
 
 import equinox as eqx
-from .model_base import ModelBase
+from .model_base import ModelBase, ACT_FN_REGISTRY
 import jax
 import jax.numpy as jnp
 import jax.random as jr
 import optax
 from jaxtyping import Array, PRNGKeyArray, PyTree
 from typing import Callable, List, Sequence, Tuple, Optional
+from pathlib import Path
 
 
-# A "state stack" is just a plain list of 1-D arrays, ordered top-to-bottom:
-#   [control_state, hidden_layer_0_state, hidden_layer_1_state, ...]
-# It does NOT include the observation, since y_t has no persistent state of
-# its own (it is re-computed from scratch at every time step).
-Activities = List[Array]
+# =============================================================================
+# 0. Config definition
+# =============================================================================
+
+@dataclass
+class TpchConfig:
+    control_layer_size: int
+    hidden_sizes: List[int]
+    obs_size: int  # observation / sensory dim
+    input_size: int = 0  # control input (optional)
+    act_fn: str = "tanh"
 
 
 # =============================================================================
@@ -229,6 +236,8 @@ class TpchModel(eqx.Module, ModelBase):
         key: Jax pseudo random number generator key used for layer initilizations.
         input_size: Width of input provided to control layer, defaults to 0.
     """
+    model_type: ClassVar[str] = "tpch"
+    config_cls: ClassVar[type] = TpchConfig
 
     control_layer: TpchControlLayer
     hidden_layers: List[TpchHiddenLayer]
@@ -557,3 +566,32 @@ class TpchModel(eqx.Module, ModelBase):
             return states_curr, (states_curr, energy_t)
 
         return sequence_step
+
+
+    # =============================================================================
+    # 7. Saving and Loading 
+    # =============================================================================
+    @classmethod
+    def from_config(cls, config, *, key) -> "TpchModel":
+        """
+        (Re)build model from config
+        """
+        return cls(
+            control_layer_size=config.control_layer_size,
+            hidden_sizes=config.hidden_sizes,
+            obs_size=config.obs_size,
+            key=key,
+            act_fn=ACT_FN_REGISTRY[config.act_fn],
+            input_size=config.input_size,
+        )
+
+    
+    @classmethod
+    def zero_activities(cls, config: TpchConfig) -> Activities:
+        """
+        Builds activities skeleton for TpchModel loading.
+        """
+        sizes = [config.control_layer_size, *config.hidden_sizes]
+        return [jnp.zeros(s) for s in sizes]
+
+

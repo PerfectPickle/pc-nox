@@ -1,14 +1,18 @@
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import ClassVar, Type
+from typing import ClassVar, Type, Optional, Any, Self, NamedTuple
 from dataclasses import asdict
 import json
 from datetime import datetime
 import equinox as eqx
+import optax
 import jax.random as jr
-
 import jax.numpy as jnp
 import  jax.nn as jnn
+
+# type aliases
+Activities = List[Array]
+Predictions = List[Array]
 
 # simple name : class mapping, e.g. "tpch" : TpchModel. Registered automatically on init
 MODEL_REGISTRY = {}
@@ -44,28 +48,22 @@ class ModelBase(ABC):
         # register model_type
         MODEL_REGISTRY[cls.model_type] = cls
 
-    # @abstract_method
-    # def build_activities():
-    #     """
-    #     Builds or rebuilds activities (latent states).
-    #     """
-    #     pass
 
     @abstractmethod
-    def predict():
+    def predict(self, *args, **kwargs):
         """
         Runs every layer's `predict` function once, given required args.
         Used by energy function.
         """
-        pass
+        ...
     
     @classmethod
     @abstractmethod
-    def from_config(cls, config, *, key):
+    def from_config(cls, config, *, key) -> "ModelBase":
         """
         (Re)build model from config, returns model.
         """
-        pass
+        ...
 
     
     # If more 'activities only' methods emerge, consider making an additional class
@@ -80,7 +78,7 @@ class ModelBase(ABC):
         )
 
 
-    def save_checkpoint(self, config, *, path: str | Path | None = None, metadata=None, opt_state=None, activities=None):
+    def save_checkpoint(self, config, *, path: str | Path | None = None, metadata=None, opt_state=None, activities=None) -> Path:
         """
         Save checkpoint: Deserialise and save all model config and metadata to dir
         """
@@ -117,8 +115,15 @@ class ModelBase(ABC):
         return path
 
 
+    # Named tuple for readability
+    class LoadedCheckpoint(NamedTuple):
+        model: "ModelBase"
+        metadata: dict
+        opt_state: optax.OptState | None # param opt state, to be clear
+        activities: Activities | None
+
     @classmethod
-    def load_checkpoint(cls, path, *, key=None, optim=None, activities_skeleton=None):
+    def load_checkpoint(cls, path, *, key=None, optim=None, activities_skeleton=None)-> LoadedCheckpoint:
         """
         Load checkpoint: Serialise and load all model config and metadata from dir
         """
@@ -143,23 +148,4 @@ class ModelBase(ABC):
             skeleton = activities_skeleton or cls.zero_activities(config)
             activities = eqx.tree_deserialise_leaves(path / "activities.eqx", skeleton)
 
-        return model, checkpoint["metadata"], opt_state, activities
-
-    
-    @classmethod
-    def find_latest_checkpoint(cls, root="checkpoints", model_type=None) -> Path:
-        root = Path(root)
-        candidates = []
-        for d in root.iterdir():
-            cp_file = d / "checkpoint.json"
-            if not (d.is_dir() and cp_file.exists()):
-                continue
-            checkpoint = json.loads(cp_file.read_text())
-            if model_type is not None and checkpoint["model_type"] != model_type:
-                continue
-            candidates.append((checkpoint["created_at"], d))
-
-        if not candidates:
-            raise FileNotFoundError(f"No checkpoints found under {root}" + (f" for model_type={model_type!r}" if model_type else ""))
-        candidates.sort(key=lambda pair: pair[0])  # ISO strings sort chronologically as strings too
-        return candidates[-1][1]
+        return LoadedCheckpoint(model, checkpoint["metadata"], opt_state, activities)

@@ -73,7 +73,7 @@ in the calling code that loops over a batch of sequences.
 
 
 import equinox as eqx
-from .model_base import ModelBase, ACT_FN_REGISTRY
+from .model_base import ModelBase, ACT_FN_REGISTRY, Activities, Predictions
 import jax
 import jax.numpy as jnp
 import jax.random as jr
@@ -275,7 +275,7 @@ class TpchModel(eqx.Module, ModelBase):
 
     def predict(
         self, states_prev: Activities, states_curr: Activities, control_input: Optional[Array] = None
-    ) -> Tuple[Activities, Array]:
+    ) -> Tuple[Predictions, Array]:
         """Run every layer's `predict` once, given:
           - states_prev: every layer's state at t-1 (fixed, "memory")
           - states_curr: every layer's CURRENT guess for its state at t (this

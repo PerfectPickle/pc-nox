@@ -1,6 +1,7 @@
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import ClassVar, Type, Optional, Any, Self, NamedTuple
+from typing import List, ClassVar, Type, Optional, Any, Self, NamedTuple
+from jaxtyping import Array
 from dataclasses import asdict
 import json
 from datetime import datetime
@@ -17,6 +18,14 @@ Predictions = List[Array]
 # simple name : class mapping, e.g. "tpch" : TpchModel. Registered automatically on init
 MODEL_REGISTRY = {}
 ACT_FN_REGISTRY = {"tanh": jnp.tanh, "relu": jnn.relu, "identity": lambda x: x}
+
+
+# Named tuple for readability
+class LoadedCheckpoint(NamedTuple):
+    model: "ModelBase"
+    metadata: dict
+    opt_state: optax.OptState | None # param opt state, to be clear
+    activities: Activities | None
 
 
 class ModelBase(ABC):
@@ -115,12 +124,6 @@ class ModelBase(ABC):
         return path
 
 
-    # Named tuple for readability
-    class LoadedCheckpoint(NamedTuple):
-        model: "ModelBase"
-        metadata: dict
-        opt_state: optax.OptState | None # param opt state, to be clear
-        activities: Activities | None
 
     @classmethod
     def load_checkpoint(cls, path, *, key=None, optim=None, activities_skeleton=None)-> LoadedCheckpoint:

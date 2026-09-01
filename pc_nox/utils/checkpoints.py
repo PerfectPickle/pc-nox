@@ -1,5 +1,6 @@
 from pathlib import Path
-from typing import Optional 
+from typing import Optional
+import json
 
 def find_latest_checkpoint(root: str | Path = "checkpoints", model_type: Optional[str] | None = None) -> Path:
     """

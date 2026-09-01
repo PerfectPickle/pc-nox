@@ -79,8 +79,9 @@ import jax.numpy as jnp
 import jax.random as jr
 import optax
 from jaxtyping import Array, PRNGKeyArray, PyTree
-from typing import Callable, List, Sequence, Tuple, Optional
+from typing import Callable, ClassVar, List, Sequence, Tuple, Optional
 from pathlib import Path
+from dataclasses import dataclass
 
 
 # =============================================================================

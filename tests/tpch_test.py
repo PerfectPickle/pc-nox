@@ -481,3 +481,65 @@ def test_sequence_step_over_short_synthetic_sequence(fx_model):
     assert jnp.all(jnp.isfinite(energies))
     for hist_leaf, prev_leaf in zip(states_history, states_prev_0):
         assert hist_leaf.shape == (seq_len,) + prev_leaf.shape
+
+
+# =============================================================================
+# H. Checkpointing (ModelBase.save_checkpoint / load_checkpoint) applied to
+#    a real TpchModel. The generic save/load *contract* (opt_state/activities
+#    flags, registry dispatch, the ValueError/NotImplementedError cases,
+#    etc.) is covered once, model-agnostically, in model_base_test.py against
+#    a throwaway dummy model -- these two just confirm nothing about tPC-H's
+#    actual shape (nested hidden_layers list, optional W_in, act_fn as a
+#    static field) breaks that generic round trip.
+# =============================================================================
+
+@pytest.fixture
+def fx_config():
+    return TpchConfig(
+        control_layer_size=FX_CONTROL_SIZE,
+        hidden_sizes=FX_HIDDEN_SIZES,
+        obs_size=FX_OBS_SIZE,
+        input_size=FX_INPUT_SIZE,
+        act_fn="tanh",
+    )
+
+
+def test_checkpoint_round_trip_predict_matches(fx_model, fx_config, fx_states_prev, fx_control_input, tmp_path):
+    out_dir = fx_model.save_checkpoint(fx_config, path=tmp_path / "tpch_ckpt")
+    loaded = TpchModel.load_checkpoint(out_dir)
+
+    states_curr_orig = fx_model.init_activities(fx_states_prev, fx_control_input)
+    states_curr_loaded = loaded.model.init_activities(fx_states_prev, fx_control_input)
+    for o, l in zip(states_curr_orig, states_curr_loaded):
+        assert_allclose(o, l, "init_activities before vs after checkpoint round trip")
+
+    preds_orig, y_hat_orig = fx_model.predict(fx_states_prev, states_curr_orig, fx_control_input)
+    preds_loaded, y_hat_loaded = loaded.model.predict(fx_states_prev, states_curr_loaded, fx_control_input)
+    assert_allclose(y_hat_orig, y_hat_loaded, "y_hat before vs after checkpoint round trip")
+    for o, l in zip(preds_orig, preds_loaded):
+        assert_allclose(o, l, "layer prediction before vs after checkpoint round trip")
+
+
+def test_checkpoint_round_trip_with_activities_and_opt_state(fx_model, fx_config, tmp_path):
+    """The 'everything at once' path: config + metadata + opt_state +
+    activities all saved and reloaded together, using TpchModel's real
+    zero_activities implementation."""
+    optim = optax.adam(learning_rate=1e-3)
+    opt_state = optim.init(eqx.filter(fx_model, eqx.is_array))
+    activities = fx_model.zero_activities(fx_config)
+
+    out_dir = fx_model.save_checkpoint(
+        fx_config,
+        path=tmp_path / "tpch_ckpt_full",
+        metadata={"epoch": 3},
+        opt_state=opt_state,
+        activities=activities,
+    )
+    loaded = TpchModel.load_checkpoint(out_dir, optim=optim)
+
+    assert loaded.metadata == {"epoch": 3}
+    assert loaded.opt_state is not None
+    assert loaded.activities is not None
+    assert len(loaded.activities) == len(activities)
+    for a in loaded.activities:
+        assert jnp.all(a == 0.0)

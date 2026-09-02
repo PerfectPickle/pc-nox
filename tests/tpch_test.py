@@ -1,4 +1,4 @@
-from models.tpch import TpchModel, TpchControlLayer, TpchHiddenLayer, TpchObservationLayer
+from models.tpch import TpchModel, TpchConfig, TpchControlLayer, TpchHiddenLayer, TpchObservationLayer
 import equinox as eqx
 import jax
 import jax.random as jr
@@ -504,8 +504,10 @@ def fx_config():
     )
 
 
-def test_checkpoint_round_trip_predict_matches(fx_model, fx_config, fx_states_prev, fx_control_input, tmp_path):
-    out_dir = fx_model.save_checkpoint(fx_config, path=tmp_path / "tpch_ckpt")
+def test_checkpoint_round_trip_predict_matches(fx_model, fx_states_prev, fx_control_input, tmp_path):
+    # No config= needed: TpchModel stores its config as self.config (set in
+    # __init__), and save_checkpoint falls back to that automatically.
+    out_dir = fx_model.save_checkpoint(path=tmp_path / "tpch_ckpt")
     loaded = TpchModel.load_checkpoint(out_dir)
 
     states_curr_orig = fx_model.init_activities(fx_states_prev, fx_control_input)
@@ -529,7 +531,6 @@ def test_checkpoint_round_trip_with_activities_and_opt_state(fx_model, fx_config
     activities = fx_model.zero_activities(fx_config)
 
     out_dir = fx_model.save_checkpoint(
-        fx_config,
         path=tmp_path / "tpch_ckpt_full",
         metadata={"epoch": 3},
         opt_state=opt_state,

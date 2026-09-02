@@ -255,7 +255,7 @@ class TpchModel(eqx.Module, ModelBase):
         act_fn: str = "tanh",
         input_size: Optional[int] = 0, # optional control input
     ):
-        self.config = TpchConfig(control_layer_size, hidden_sizes, obs_size, input_size, act_fn)
+        self.config = TpchConfig(control_layer_size, tuple(hidden_sizes), obs_size, input_size, act_fn)  # cast hidden_sizes to tuple to ensure config hashability
         try:
             act_fn_callable = ACT_FN_REGISTRY[act_fn] # Get Callable act_fn. This is the ONE place this str -> callable lookup happens.
         except KeyError:

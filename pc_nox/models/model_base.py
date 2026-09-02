@@ -22,6 +22,16 @@ ACT_FN_REGISTRY = {"tanh": jnp.tanh, "relu": jnn.relu, "identity": lambda x: x}
 
 # Named tuple for readability
 class LoadedCheckpoint(NamedTuple):
+    """
+    Result of ModelBase.load_checkpoint().
+
+    Attributes:
+        model: the reconstructed model, weights restored.
+        metadata: whatever dict was passed to save_checkpoint's metadata=.
+        opt_state: restored optax state, or None if the checkpoint had none.
+            Pass the *same* optax transform used at save time as optim= to load it.
+        activities: restored states (e.g. states_prev), or None.
+    """
     model: "ModelBase"
     metadata: dict
     opt_state: optax.OptState | None # param opt state, to be clear
@@ -30,7 +40,19 @@ class LoadedCheckpoint(NamedTuple):
 
 class ModelBase(ABC):
     """
-    Interface for all Model classses.
+    Base class for all PCN model variants.
+
+    Subclasses must define `model_type: ClassVar[str]`,
+    `config_cls: ClassVar[Type]`, and `self.config`, and implement 
+    `predict()` and `from_config()`. Registering a subclass 
+    (via __init_subclass__) makes it resolvable by name through 
+    MODEL_REGISTRY, which is what lets load_checkpoint() reconstruct 
+    the correct subclass from a checkpoint's model_type field alone. 
+
+    Attributes:
+        SCHEMA_VERSION: Envelope version, defined once here, for saving/loading.
+        model_type: Name of model type for registry usage.
+        config_cls: Dataclass for model config, used to interpret saved config.
     """
     SCHEMA_VERSION: ClassVar[int] = 1  # envelope version, defined once here, for saving/loading
 
@@ -71,6 +93,10 @@ class ModelBase(ABC):
     def from_config(cls, config, *, key) -> "ModelBase":
         """
         (Re)build model from config, returns model.
+
+        Args:
+            config: Instance of this class's config_cls.
+            key: PRNGKey for parameter initialisation.
         """
         ...
 
@@ -80,6 +106,9 @@ class ModelBase(ABC):
     def zero_activities(cls, config) -> Activities:
         """
         Builds empty activies skeleton when implemented by subclass, else raises error.
+
+        Args:
+            config: Instance of this class's config_cls.
         """
         raise NotImplementedError(
             f"{cls.__name__} does not support resumable activities "
@@ -87,10 +116,24 @@ class ModelBase(ABC):
         )
 
 
-    def save_checkpoint(self, config, *, path: str | Path | None = None, metadata=None, opt_state=None, activities=None) -> Path:
+    def save_checkpoint(self, *, path: str | Path | None = None, config=None, metadata=None, opt_state=None, activities=None) -> Path:
         """
-        Save checkpoint: Deserialise and save all model config and metadata to dir
+        Save model checkpoint.
+
+        Args:
+            config: Dataclass object containing all information necessary to reconstruct the model, such as variables describing network shape.
+            path: Directory to save checkpoint files into.
+            metadata: Dictionary containing any other relevant information, such as optim type, learning rates, last frame processed, env type, etc.
+            opt_state: OptState of Optax parameter optimiser.
+            activities: Latent states, for smooth resumption of inference in temporal models.
         """
+        config = config if config is not None else getattr(self, "config", None)
+        if config is None:
+            raise ValueError(
+                f"{type(self).__name__} has no self.config and none was passed explicitly. "
+                "Store the config used in from_config() as self.config, or pass config= here."
+            )
+
         # ensure sure activities skeleton builder is implemented, if relevant, for loading
         if activities is not None:
             # fail fast if this model can't actually reconstruct a matching skeleton later
@@ -124,18 +167,29 @@ class ModelBase(ABC):
         return path
 
 
-
+    # TODO return config! needed for further saving
     @classmethod
     def load_checkpoint(cls, path, *, key=None, optim=None, activities_skeleton=None)-> LoadedCheckpoint:
         """
-        Load checkpoint: Serialise and load all model config and metadata from dir
+        Load a checkpoint saved by save_checkpoint().
+
+        Returns a LoadedCheckpoint with attributes:
+            model:      the reconstructed model, weights restored, config
+                        restored automatically.
+            metadata:   whatever dict was passed to save_checkpoint's metadata=.
+            opt_state:  restored optax state, or None if none was saved.
+                        Pass the SAME optax transform used at save time as
+                        optim= to restore it correctly.
+            activities: restored state estimates (e.g. states_prev to resume
+                        settling from), or None.
         """
         path = Path(path)
         checkpoint = json.loads((path / "checkpoint.json").read_text())
         cls = MODEL_REGISTRY[checkpoint["model_type"]]
         config = cls.config_cls(**checkpoint["config"])
+        # from_config effectively restores self.config via model initialisation. deserialise only overwrites dynamic leaves on skeleton, self.config is static.
         model = eqx.tree_deserialise_leaves(
-            path / "weights.eqx", cls.from_config(config, key=key or jr.PRNGKey(0))
+            path / "weights.eqx", cls.from_config(config, key=key or jr.PRNGKey(0))  
         )
 
         opt_state = None
@@ -146,6 +200,7 @@ class ModelBase(ABC):
                 path / "opt_state.eqx", optim.init(eqx.filter(model, eqx.is_array))
             )
 
+        # TODO: tpch requires states prev + states curr, not just the latter.
         activities = None
         if checkpoint["has_activities"]:
             skeleton = activities_skeleton or cls.zero_activities(config)

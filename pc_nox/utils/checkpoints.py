@@ -2,9 +2,12 @@ from pathlib import Path
 from typing import Optional
 import json
 
+# TODO: list model types in docstring
 def find_latest_checkpoint(root: str | Path = "checkpoints", model_type: Optional[str] | None = None) -> Path:
     """
     Returns Path of most recently saved checkpoint in root according to checkpoint.json
+
+    Supported model_type values: 'tpch'
 
     Args:
         root: Directory to search for checkpoints (which are directories themselves)

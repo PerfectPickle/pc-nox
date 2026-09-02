@@ -88,13 +88,14 @@ from dataclasses import dataclass
 # 0. Config definition
 # =============================================================================
 
-@dataclass
+# frozen to ensure hashable for JAX Jax compilation
+@dataclass(frozen=True)
 class TpchConfig:
-    control_layer_size: int
-    hidden_sizes: List[int]
-    obs_size: int  # observation / sensory dim
-    input_size: int = 0  # control input (optional)
-    act_fn: str = "tanh"
+    control_layer_size: int  # Control layer width
+    hidden_sizes: Tuple[int]  # Ordered from top (just below control) to bottom (just above obs). Tuple is hashable, unlike List
+    obs_size: int  # Observation / sensory layer width
+    input_size: int = 0  # Control input (optional)
+    act_fn: str = "tanh"  # Activation function name, used as lookup key in ACT_FN_REGISTRY
 
 
 # =============================================================================
@@ -231,14 +232,15 @@ class TpchModel(eqx.Module, ModelBase):
 
     Args:
         control_layer_size: Width of the top/control layer.
-        hidden_sizes: List of hidden layer widths, number of elements determines the number of hidden layers.
+        hidden_sizes: Sequence of hidden layer widths, number of elements determines the number of hidden layers.
         obs_size: Width of the observation / output.
-        act_fn: Activation function used by the control and hidden layers.
+        act_fn: Name of activation function used by the control and hidden layers ('tanh').
         key: Jax pseudo random number generator key used for layer initilizations.
         input_size: Width of input provided to control layer, defaults to 0.
     """
     model_type: ClassVar[str] = "tpch"
     config_cls: ClassVar[type] = TpchConfig
+    config: TpchConfig = eqx.field(static=True)
 
     control_layer: TpchControlLayer
     hidden_layers: List[TpchHiddenLayer]
@@ -250,21 +252,30 @@ class TpchModel(eqx.Module, ModelBase):
         hidden_sizes: Sequence[int],
         obs_size: int,
         key: PRNGKeyArray,
-        act_fn: Callable = jnp.tanh,
+        act_fn: str = "tanh",
         input_size: Optional[int] = 0, # optional control input
     ):
+        self.config = TpchConfig(control_layer_size, hidden_sizes, obs_size, input_size, act_fn)
+        try:
+            act_fn_callable = ACT_FN_REGISTRY[act_fn] # Get Callable act_fn. This is the ONE place this str -> callable lookup happens.
+        except KeyError:
+            raise KeyError(
+                f"act_fn={act_fn!r} not in ACT_FN_REGISTRY. If this is a custom "
+                f"activation, register it before loading: ACT_FN_REGISTRY[{act_fn!r}] = ..."
+            ) from None
+
         n_hidden = len(hidden_sizes)
         key_control, *hidden_keys, key_obs = jr.split(key, 2 + n_hidden)
 
         self.control_layer = TpchControlLayer(
-            state_size=control_layer_size, input_size=input_size, act_fn=act_fn, key=key_control
+            state_size=control_layer_size, input_size=input_size, act_fn=act_fn_callable, key=key_control
         )
 
         hidden_layers = []
         parent_size = control_layer_size  # the first hidden layer's parent is the control layer
         for size, hkey in zip(hidden_sizes, hidden_keys):
             hidden_layers.append(
-                TpchHiddenLayer(state_size=size, parent_size=parent_size, act_fn=act_fn, key=hkey)
+                TpchHiddenLayer(state_size=size, parent_size=parent_size, act_fn=act_fn_callable, key=hkey)
             )
             parent_size = size  # each subsequent hidden layer's parent is the one above it
         self.hidden_layers = hidden_layers
@@ -582,7 +593,7 @@ class TpchModel(eqx.Module, ModelBase):
             hidden_sizes=config.hidden_sizes,
             obs_size=config.obs_size,
             key=key,
-            act_fn=ACT_FN_REGISTRY[config.act_fn],
+            act_fn=config.act_fn, # plaintext name of act_fn, used with registry
             input_size=config.input_size,
         )
 

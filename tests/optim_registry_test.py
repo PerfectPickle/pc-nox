@@ -85,3 +85,20 @@ def test_registry_keys_are_unique_and_expected_count():
     than it enforces a specific count."""
     assert len(OPTIM_REGISTRY) == 28
     assert len(set(OPTIM_REGISTRY)) == len(OPTIM_REGISTRY)
+
+
+def test_registry_entries_match_the_identically_named_optax_function():
+    """The real gap test_every_registered_optim_is_constructible can't
+    catch: a mislabeled entry (e.g. `"adam": optax.adamw`) would still
+    build something with .init/.update fine, so it wouldn't fail that
+    test -- but it WOULD silently hand back the wrong algorithm under the
+    right-looking name. Since OPTIM_REGISTRY's keys are deliberately
+    chosen to match optax's own attribute names 1:1, checking identity
+    against `getattr(optax, name)` catches exactly that mistake, tying
+    correctness to optax's own naming rather than trusting the registry's
+    hand-typed dict against itself."""
+    for name, fn in OPTIM_REGISTRY.items():
+        assert fn is getattr(optax, name), (
+            f"OPTIM_REGISTRY[{name!r}] is not optax.{name} -- "
+            f"registry entry is mislabeled or optax renamed/removed it"
+        )

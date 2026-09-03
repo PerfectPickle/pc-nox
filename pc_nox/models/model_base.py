@@ -34,7 +34,7 @@ class LoadedCheckpoint(NamedTuple):
     """
     model: "ModelBase"
     metadata: dict
-    opt_state: optax.OptState | None # param opt state, to be clear
+    opt_state: optax.OptState | None  # param opt state, to be clear
     activities: Activities | None
 
 
@@ -116,6 +116,19 @@ class ModelBase(ABC):
         )
 
 
+    # --- config vs. metadata ---
+    # config:   anything that changes what the model COMPUTES. If reloading
+    #           without this setting would give different energies/gradients/
+    #           predictions on identical weights, it belongs here (layer sizes,
+    #           act_fn, regularization coefficients, architectural switches).
+    #           Lives on the model itself (static field) and is restored
+    #           automatically on load -- the caller never has to know it existed.
+    # metadata: anything that describes THIS RUN rather than the model itself
+    #           (epoch, dataset name, which optimizer/lr produced this
+    #           opt_state, git commit, free-text notes). The model has no way
+    #           to know any of this on its own -- only the training loop does,
+    #           at the moment save_checkpoint() is called. Freeform, caller-
+    #           supplied, never affects what the model computes.
     def save_checkpoint(self, *, path: str | Path | None = None, config=None, metadata=None, opt_state=None, activities=None) -> Path:
         """
         Save model checkpoint.
@@ -167,7 +180,7 @@ class ModelBase(ABC):
         return path
 
 
-    # TODO return config! needed for further saving
+
     @classmethod
     def load_checkpoint(cls, path, *, key=None, optim=None, activities_skeleton=None)-> LoadedCheckpoint:
         """
@@ -200,7 +213,6 @@ class ModelBase(ABC):
                 path / "opt_state.eqx", optim.init(eqx.filter(model, eqx.is_array))
             )
 
-        # TODO: tpch requires states prev + states curr, not just the latter.
         activities = None
         if checkpoint["has_activities"]:
             skeleton = activities_skeleton or cls.zero_activities(config)

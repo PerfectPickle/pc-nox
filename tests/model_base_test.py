@@ -30,6 +30,7 @@ import pytest
 
 from models.model_base import ModelBase, MODEL_REGISTRY
 from models.tpch import TpchModel  # only used for the cross-subclass dispatch test below
+from utils.checkpoints import load_metadata  # used by the two-call optim-rebuild workflow test below
 
 
 def assert_allclose(actual, expected, name, atol=1e-6, rtol=1e-6):
@@ -343,6 +344,47 @@ def test_load_checkpoint_with_saved_opt_state_but_no_optim_raises(fx_model, fx_c
 
     with pytest.raises(ValueError):
         DummyModel.load_checkpoint(out_dir)
+
+
+def test_load_metadata_then_build_optim_then_load_checkpoint_round_trips(fx_model, fx_config, tmp_path):
+    """The intended two-call workflow: load_metadata() (now in
+    utils.checkpoints, alongside find_latest_checkpoint -- it doesn't
+    need ModelBase or MODEL_REGISTRY either) to see what optimiser was
+    used, build it (e.g. via utils.optim_registry.build_optim), then pass
+    the built optim into load_checkpoint -- no lambdas, no metadata-schema
+    assumptions baked into model_base.py itself."""
+    optim = optax.adamw(learning_rate=1e-3, weight_decay=1e-4)
+    opt_state = optim.init(eqx.filter(fx_model, eqx.is_array))
+    metadata = {"optim_name": "adamw", "optim_kwargs": {"learning_rate": 1e-3, "weight_decay": 1e-4}}
+    out_dir = fx_model.save_checkpoint(
+        config=fx_config, path=tmp_path / "ckpt", opt_state=opt_state, metadata=metadata
+    )
+
+    peeked = load_metadata(out_dir)
+    rebuilt_optim = optax.adamw(**peeked["optim_kwargs"])  # stand-in for build_optim(peeked["optim_name"], ...)
+    loaded = DummyModel.load_checkpoint(out_dir, optim=rebuilt_optim)
+
+    assert loaded.opt_state is not None
+    assert jax.tree_util.tree_structure(loaded.opt_state) == jax.tree_util.tree_structure(opt_state)
+
+
+def test_load_checkpoint_opt_state_matches_saved_when_optim_reused(fx_model, fx_config, tmp_path):
+    """The optim= passed in is the caller's own object already -- nothing
+    to echo back -- but the opt_state it restores should still match what
+    was saved."""
+    optim = optax.sgd(learning_rate=0.1)
+    opt_state = optim.init(eqx.filter(fx_model, eqx.is_array))
+    out_dir = fx_model.save_checkpoint(config=fx_config, path=tmp_path / "ckpt", opt_state=opt_state)
+
+    loaded = DummyModel.load_checkpoint(out_dir, optim=optim)
+    assert jax.tree_util.tree_structure(loaded.opt_state) == jax.tree_util.tree_structure(opt_state)
+
+
+def test_load_checkpoint_opt_state_is_none_when_no_opt_state_saved(fx_model, fx_config, tmp_path):
+    """Result.opt_state should be None when there was nothing to restore."""
+    out_dir = fx_model.save_checkpoint(config=fx_config, path=tmp_path / "ckpt")
+    loaded = DummyModel.load_checkpoint(out_dir)
+    assert loaded.opt_state is None
 
 
 # =============================================================================

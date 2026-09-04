@@ -1,6 +1,6 @@
 # pc-nox
 
-This library aims to provide easy to use [Equinox](https://github.com/patrick-kidger/equinox) ([JAX](https://github.com/jax-ml/jax)) implementations of cutting edge Predictive Coding (PC) variants, and experimental fusion architectures.
+This library aims to provide easy to use [Equinox](https://github.com/patrick-kidger/equinox) ([JAX](https://github.com/jax-ml/jax)) implementations of cutting edge Predictive Coding (PC) variants, and experimental fusion architectures, with an emphasis on deep and temporal models.
 
 Additionally, convenient and robust checkpoint saving/loading will be implemented, with the goal of supporting modular functionality within larger continual learning meta-architectures.
 
@@ -12,9 +12,10 @@ Additionally, convenient and robust checkpoint saving/loading will be implemente
 
 ## Other Features
 
-* **PyHGF Compatability**: Version matches (18/08/26) [pyHGF](https://github.com/ComputationalPsychiatry/pyhgf) shared dependencies for cross compatability. Compatability will be maintained.
+* **Model Management**: Comprehensive save/load methods, supporting seamless training resumption irrespective of model type or training environment.
 * **Visual Prediction Plotting**: Compare ground truth to pre and post inference predictions in visual environments, with the option to save frames and video. 
 * **Flexible Inference Modes**: Supports both step-by-step manual updates for granular control and debugging, as well as end-to-end jax.lax.scan fusion.
+* **PyHGF Compatability**: Version matches (18/08/26) [pyHGF](https://github.com/ComputationalPsychiatry/pyhgf) shared dependencies for cross compatability. Compatability will be maintained.
 
 ## Planned Architectures
 
@@ -24,7 +25,6 @@ Additionally, convenient and robust checkpoint saving/loading will be implemente
 
 ## Planned Features
 
-* **Model Management**: Easy model saving and loading functions.
 * **Analytics**: Additional test metrics and visualisation methods.
 * **Additional Inference Modes**: Inference using ODE solvers.
 * **Flexible Training Modes**: Such as scan fused learning.
@@ -47,6 +47,12 @@ pip install .
 # For CUDA (e.g. 12) usage, upgrade JAX
 pip install "jax[cuda12]>=0.4.26,<0.4.32" "jaxlib>=0.4.26,<0.4.32" "numpy>=2.0,<2.5" --force-reinstall
 ```
+
+
+## See Also
+
+* **[JPC](https://github.com/thebuckleylab/jpc)**: Supports other cutting edge PC developments not covered by pc-nox, such as bidirectional PC, ePC, and more.
+* **[pyHGF](https://github.com/ComputationalPsychiatry/pyhgf)**: Rich framework for a variety of cutting edge networks such as the generalised Hierarchical Gaussian Filter.
 
 
 ## References

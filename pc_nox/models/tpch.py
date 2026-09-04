@@ -73,20 +73,29 @@ in the calling code that loops over a batch of sequences.
 
 
 import equinox as eqx
-from .model_base import ModelBase
+from .model_base import ModelBase, ACT_FN_REGISTRY, Activities, Predictions
 import jax
 import jax.numpy as jnp
 import jax.random as jr
 import optax
 from jaxtyping import Array, PRNGKeyArray, PyTree
-from typing import Callable, List, Sequence, Tuple, Optional
+from typing import Callable, ClassVar, List, Sequence, Tuple, Optional
+from pathlib import Path
+from dataclasses import dataclass
 
 
-# A "state stack" is just a plain list of 1-D arrays, ordered top-to-bottom:
-#   [control_state, hidden_layer_0_state, hidden_layer_1_state, ...]
-# It does NOT include the observation, since y_t has no persistent state of
-# its own (it is re-computed from scratch at every time step).
-Activities = List[Array]
+# =============================================================================
+# 0. Config definition
+# =============================================================================
+
+# frozen to ensure hashable for JAX Jax compilation
+@dataclass(frozen=True)
+class TpchConfig:
+    control_layer_size: int  # Control layer width
+    hidden_sizes: Tuple[int]  # Ordered from top (just below control) to bottom (just above obs). Tuple is hashable, unlike List
+    obs_size: int  # Observation / sensory layer width
+    input_size: int = 0  # Control input (optional)
+    act_fn: str = "tanh"  # Activation function name, used as lookup key in ACT_FN_REGISTRY
 
 
 # =============================================================================
@@ -223,12 +232,15 @@ class TpchModel(eqx.Module, ModelBase):
 
     Args:
         control_layer_size: Width of the top/control layer.
-        hidden_sizes: List of hidden layer widths, number of elements determines the number of hidden layers.
+        hidden_sizes: Sequence of hidden layer widths, number of elements determines the number of hidden layers.
         obs_size: Width of the observation / output.
-        act_fn: Activation function used by the control and hidden layers.
+        act_fn: Name of activation function used by the control and hidden layers ('tanh').
         key: Jax pseudo random number generator key used for layer initilizations.
         input_size: Width of input provided to control layer, defaults to 0.
     """
+    model_type: ClassVar[str] = "tpch"
+    config_cls: ClassVar[type] = TpchConfig
+    config: TpchConfig = eqx.field(static=True)
 
     control_layer: TpchControlLayer
     hidden_layers: List[TpchHiddenLayer]
@@ -240,21 +252,30 @@ class TpchModel(eqx.Module, ModelBase):
         hidden_sizes: Sequence[int],
         obs_size: int,
         key: PRNGKeyArray,
-        act_fn: Callable = jnp.tanh,
+        act_fn: str = "tanh",
         input_size: Optional[int] = 0, # optional control input
     ):
+        self.config = TpchConfig(control_layer_size, tuple(hidden_sizes), obs_size, input_size, act_fn)  # cast hidden_sizes to tuple to ensure config hashability
+        try:
+            act_fn_callable = ACT_FN_REGISTRY[act_fn] # Get Callable act_fn. This is the ONE place this str -> callable lookup happens.
+        except KeyError:
+            raise KeyError(
+                f"act_fn={act_fn!r} not in ACT_FN_REGISTRY. If this is a custom "
+                f"activation, register it before loading: ACT_FN_REGISTRY[{act_fn!r}] = ..."
+            ) from None
+
         n_hidden = len(hidden_sizes)
         key_control, *hidden_keys, key_obs = jr.split(key, 2 + n_hidden)
 
         self.control_layer = TpchControlLayer(
-            state_size=control_layer_size, input_size=input_size, act_fn=act_fn, key=key_control
+            state_size=control_layer_size, input_size=input_size, act_fn=act_fn_callable, key=key_control
         )
 
         hidden_layers = []
         parent_size = control_layer_size  # the first hidden layer's parent is the control layer
         for size, hkey in zip(hidden_sizes, hidden_keys):
             hidden_layers.append(
-                TpchHiddenLayer(state_size=size, parent_size=parent_size, act_fn=act_fn, key=hkey)
+                TpchHiddenLayer(state_size=size, parent_size=parent_size, act_fn=act_fn_callable, key=hkey)
             )
             parent_size = size  # each subsequent hidden layer's parent is the one above it
         self.hidden_layers = hidden_layers
@@ -266,7 +287,7 @@ class TpchModel(eqx.Module, ModelBase):
 
     def predict(
         self, states_prev: Activities, states_curr: Activities, control_input: Optional[Array] = None
-    ) -> Tuple[Activities, Array]:
+    ) -> Tuple[Predictions, Array]:
         """Run every layer's `predict` once, given:
           - states_prev: every layer's state at t-1 (fixed, "memory")
           - states_curr: every layer's CURRENT guess for its state at t (this
@@ -557,3 +578,32 @@ class TpchModel(eqx.Module, ModelBase):
             return states_curr, (states_curr, energy_t)
 
         return sequence_step
+
+
+    # =============================================================================
+    # 7. Saving and Loading 
+    # =============================================================================
+    @classmethod
+    def from_config(cls, config, *, key) -> "TpchModel":
+        """
+        (Re)build model from config
+        """
+        return cls(
+            control_layer_size=config.control_layer_size,
+            hidden_sizes=config.hidden_sizes,
+            obs_size=config.obs_size,
+            key=key,
+            act_fn=config.act_fn, # plaintext name of act_fn, used with registry
+            input_size=config.input_size,
+        )
+
+    
+    @classmethod
+    def zero_activities(cls, config: TpchConfig) -> Activities:
+        """
+        Builds activities skeleton for TpchModel loading.
+        """
+        sizes = [config.control_layer_size, *config.hidden_sizes]
+        return [jnp.zeros(s) for s in sizes]
+
+

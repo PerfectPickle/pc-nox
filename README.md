@@ -1,8 +1,6 @@
 # pc-nox
 
-This library aims to provide easy to use [Equinox](https://github.com/patrick-kidger/equinox) ([JAX](https://github.com/jax-ml/jax)) implementations of cutting edge Predictive Coding (PC) variants, and experimental fusion architectures, with an emphasis on deep and temporal models.
-
-Additionally, convenient and robust checkpoint saving/loading will be implemented, with the goal of supporting modular functionality within larger continual learning meta-architectures.
+This library aims to provide easy to use [Equinox](https://github.com/patrick-kidger/equinox) ([JAX](https://github.com/jax-ml/jax)) implementations of cutting edge Predictive Coding (PC) variants, and experimental fusion architectures, with an emphasis on deep and temporal models. Development is done with the goal of supporting modular functionality within larger continual learning meta-architectures.
 
 
 ## Currently Supported Architectures
@@ -25,7 +23,7 @@ Additionally, convenient and robust checkpoint saving/loading will be implemente
 
 ## Planned Features
 
-* **Analytics**: Additional test metrics and visualisation methods.
+* **Analytics**: More test metrics and visualisation methods.
 * **Additional Inference Modes**: Inference using ODE solvers.
 * **Flexible Training Modes**: Such as scan fused learning.
 

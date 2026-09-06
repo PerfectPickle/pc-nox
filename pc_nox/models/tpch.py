@@ -78,6 +78,7 @@ import jax
 import jax.numpy as jnp
 import jax.random as jr
 import optax
+import warnings
 from jaxtyping import Array, PRNGKeyArray, PyTree
 from typing import Callable, ClassVar, List, Sequence, Tuple, Optional
 from pathlib import Path
@@ -96,6 +97,27 @@ class TpchConfig:
     obs_size: int  # Observation / sensory layer width
     input_size: int = 0  # Control input (optional)
     act_fn: str = "tanh"  # Activation function name, used as lookup key in ACT_FN_REGISTRY
+    loss: str = "mse"  # Observation-layer loss ('mse' | 'ce'); only changes the y_hat term, not the state-prediction terms
+    weight_decay: float = 0.0  # Coefficient for L2 penalty on weights (0 = disabled)
+    weight_decay_scope: str = "all"  # Which weights weight_decay applies to: 'all', 'rec' (recurrent, i.e. W_rec only), or 'ff' (everything except W_rec)
+    orthogonal_penalty: float = 0.0  # Coefficient for orthogonality penalty ||I - W^T W||^2 on weights (0 = disabled)
+    orthogonal_scope: str = "rec"  # Which weights orthogonal_penalty applies to: 'rec' (default, only weights guaranteed square), 'all', or 'ff'
+    activity_decay: float = 0.0  # Coefficient for L1/L2 penalty on current states/activities (0 = disabled)
+    activity_reg_type: str = "l1"  # Norm used by activity_decay ('l1' | 'l2')
+
+
+def _scopes_overlap(scope_a: str, scope_b: str) -> bool:
+    """Whether two weight scopes ('all' | 'rec' | 'ff') can refer to any of
+    the same weight matrices. Purely symbolic (doesn't need actual weight
+    arrays): 'all' is a superset of both 'rec' and 'ff', which are disjoint
+    from each other. Used to decide whether weight_decay and
+    orthogonal_penalty could compete for the same weights (see the warning
+    in TpchModel.__init__).
+    """
+    if scope_a == "all" or scope_b == "all":
+        return True
+    return scope_a == scope_b
+
 
 
 # =============================================================================
@@ -237,6 +259,26 @@ class TpchModel(eqx.Module, ModelBase):
         act_fn: Name of activation function used by the control and hidden layers ('tanh').
         key: Jax pseudo random number generator key used for layer initilizations.
         input_size: Width of input provided to control layer, defaults to 0.
+        loss: Loss used for the observation term of the free energy. Either
+            `"mse"` (default) or `"ce"` (cross-entropy, treating the
+            observation layer's linear output as logits). Only affects the
+            observation term -- state-prediction terms are always squared error.
+        weight_decay: Coefficient for an L2 penalty on the weights (0 =
+            disabled, the default). Applied to `weight_decay_scope` weights.
+        weight_decay_scope: Which weights `weight_decay` applies to: `"all"`
+            (default), `"rec"` (only the recurrent, self-to-self weights,
+            i.e. W_rec on the control and hidden layers), or `"ff"` (every
+            weight except W_rec -- use this to keep weight_decay from
+            competing with an `orthogonal_penalty` also targeting W_rec).
+        orthogonal_penalty: Coefficient for an orthogonality-promoting penalty
+            of the form ||I - W^T @ W||^2 on the weights (0 = disabled, the
+            default). Applied to `orthogonal_scope` weights.
+        orthogonal_scope: Which weights `orthogonal_penalty` applies to: `"rec"`
+            (default, the only weights guaranteed square), `"all"`, or `"ff"`.
+        activity_decay: Coefficient for an L1 or L2 penalty on the current
+            states/activities (0 = disabled, the default).
+        activity_reg_type: Either `"l1"` (default) or `"l2"`, selecting the
+            form of the `activity_decay` penalty.
     """
     model_type: ClassVar[str] = "tpch"
     config_cls: ClassVar[type] = TpchConfig
@@ -254,8 +296,66 @@ class TpchModel(eqx.Module, ModelBase):
         key: PRNGKeyArray,
         act_fn: str = "tanh",
         input_size: Optional[int] = 0, # optional control input
+        loss: str = "mse",
+        weight_decay: float = 0.0,
+        weight_decay_scope: str = "all",
+        orthogonal_penalty: float = 0.0,
+        orthogonal_scope: str = "rec",
+        activity_decay: float = 0.0,
+        activity_reg_type: str = "l1",
     ):
-        self.config = TpchConfig(control_layer_size, tuple(hidden_sizes), obs_size, input_size, act_fn)  # cast hidden_sizes to tuple to ensure config hashability
+        if loss not in ("mse", "ce"):
+            raise ValueError(f"loss must be 'mse' or 'ce', got {loss!r}")
+        if weight_decay_scope not in ("all", "rec", "ff"):
+            raise ValueError(f"weight_decay_scope must be 'all', 'rec' or 'ff', got {weight_decay_scope!r}")
+        if orthogonal_scope not in ("all", "rec", "ff"):
+            raise ValueError(f"orthogonal_scope must be 'all', 'rec' or 'ff', got {orthogonal_scope!r}")
+        if activity_reg_type not in ("l1", "l2"):
+            raise ValueError(f"activity_reg_type must be 'l1' or 'l2', got {activity_reg_type!r}")
+
+        # If weight_decay and orthogonal_penalty can touch the same weights,
+        # they pull those weights' singular values in opposite directions
+        # (decay -> 0, orthogonal -> 1). Solving for the gradient-descent
+        # fixed point of the two regularisation terms alone gives an
+        # equilibrium singular value of sigma* = sqrt(1 - weight_decay / (2 *
+        # orthogonal_penalty)), which only exists (is real and nonzero) when
+        # weight_decay < 2 * orthogonal_penalty; otherwise the only stable
+        # point is sigma=0, i.e. the affected weights collapse to zero
+        # instead of settling anywhere near orthogonal. This is a threshold
+        # on the *regularisation* landscape only -- the task gradient during
+        # real training can still push weights toward collapse for other
+        # reasons even when this check passes, so it's a necessary sanity
+        # check, not a guarantee about the full training dynamics.
+        if (
+            weight_decay > 0. and orthogonal_penalty > 0.
+            and _scopes_overlap(weight_decay_scope, orthogonal_scope)
+            and weight_decay >= 2 * orthogonal_penalty
+        ):
+            warnings.warn(
+                f"weight_decay ({weight_decay}) >= 2 * orthogonal_penalty ({orthogonal_penalty}) "
+                f"on overlapping scopes (weight_decay_scope={weight_decay_scope!r}, "
+                f"orthogonal_scope={orthogonal_scope!r}): the two regularisers have no stable "
+                "nonzero equilibrium on the shared weights and will tend to collapse them toward "
+                "zero. Lower weight_decay, raise orthogonal_penalty, or use non-overlapping "
+                "scopes (e.g. weight_decay_scope='ff' with orthogonal_scope='rec').",
+                stacklevel=2,
+            )
+
+        self.config = TpchConfig(
+            control_layer_size=control_layer_size,
+            hidden_sizes=tuple(hidden_sizes),  # cast hidden_sizes to tuple to ensure config hashability
+            obs_size=obs_size,
+            input_size=input_size,
+            act_fn=act_fn,
+            loss=loss,
+            weight_decay=weight_decay,
+            weight_decay_scope=weight_decay_scope,
+            orthogonal_penalty=orthogonal_penalty,
+            orthogonal_scope=orthogonal_scope,
+            activity_decay=activity_decay,
+            activity_reg_type=activity_reg_type,
+        )
+
         try:
             act_fn_callable = ACT_FN_REGISTRY[act_fn] # Get Callable act_fn. This is the ONE place this str -> callable lookup happens.
         except KeyError:
@@ -333,6 +433,133 @@ class TpchModel(eqx.Module, ModelBase):
     # =============================================================================
     # 3. Free energy -- eq. (19), generalised to an arbitrary number of layers
     # =============================================================================
+    #
+    # `self.config.loss` switches the observation term between MSE and
+    # cross-entropy (see `tpch_energy_fn` below) -- it doesn't need any of
+    # the plumbing discussed next, since it's just a branch inside the one
+    # energy function every other method already calls.
+    #
+    # Regularisation design note (why this lives entirely inside
+    # `tpch_energy_fn` and nowhere else):
+    #
+    # Every other method in this file -- `neg_activity_grad`, `param_grad`,
+    # `make_activity_step`, etc. -- only ever differentiates
+    # `tpch_energy_fn`, either w.r.t. `states_curr` (inference) or w.r.t.
+    # `self` (learning). Autodiff already routes each regulariser to the
+    # right place with zero extra plumbing:
+    #   - `_activity_reg` depends only on `states_curr`, so it contributes a
+    #     real term to the *inference* gradient and an exact-zero term to
+    #     the *weight* gradient.
+    #   - `_weight_l2_reg` / `_spectral_reg` depend only on `self`'s weights, so
+    #     they contribute a real term to the *learning* gradient and an
+    #     exact-zero term to the *inference* gradient.
+    # So it's correct -- not just convenient -- to add all three straight
+    # into the one energy function below
+
+
+    def _rec_weights(self) -> List[Array]:
+        """The recurrent, self-to-self weights: control_layer.W_rec and every
+        hidden layer's W_rec. These are the only weights guaranteed to be
+        square (state_size x state_size), which makes them the natural
+        default target for the orthogonality/spectral penalty below.
+        """
+        weights = [self.control_layer.W_rec.weight]
+        weights += [layer.W_rec.weight for layer in self.hidden_layers]
+        return weights
+
+
+    # feedforward weights only
+    def _ff_weights(self) -> List[Array]:
+        """Every weight EXCEPT the recurrent ones: W_in (if present), each
+        hidden layer's W_parent_prev/W_parent_curr, and the observation
+        layer's W_parent. Useful when you want weight_decay to leave the
+        recurrent weights alone entirely -- e.g. so it can't fight an
+        orthogonal_penalty also targeting W_rec (see the note above
+        `_weight_orthogonal_reg`) regardless of how the two coefficients are tuned.
+        """
+        weights = []
+        if self.control_layer.has_input:
+            weights.append(self.control_layer.W_in.weight)
+        for layer in self.hidden_layers:
+            weights += [layer.W_parent_prev.weight, layer.W_parent_curr.weight]
+        weights.append(self.observation_layer.W_parent.weight)
+        return weights
+
+
+    def _all_weights(self) -> List[Array]:
+        """Every weight matrix in the model (recurrent + feedforward/emission)."""
+        weights = [self.control_layer.W_rec.weight]
+        if self.control_layer.has_input:
+            weights.append(self.control_layer.W_in.weight)
+        for layer in self.hidden_layers:
+            weights += [
+                layer.W_rec.weight,
+                layer.W_parent_prev.weight,
+                layer.W_parent_curr.weight,
+            ]
+        weights.append(self.observation_layer.W_parent.weight)
+        return weights
+
+
+    def _weights_for_scope(self, scope: str) -> List[Array]:
+        """Resolves a scope string ('all' | 'rec' | 'ff') to the weight
+        arrays it refers to. Shared by `_weight_l2_reg` and `_weight_orthogonal_reg`
+        so both regularisers pick their targets the same way.
+        """
+        if scope == "rec":
+            return self._rec_weights()
+        elif scope == "ff":
+            return self._ff_weights()
+        else:  # "all", validated in __init__
+            return self._all_weights()
+
+
+    # extra energy (penalty) from L2 weight decay / regularisation
+    def _weight_l2_reg(self) -> Array:
+        """0.5 * weight_decay * sum ||W||_F^2 (squared Frobenius norm) over
+        `weight_decay_scope` weights."""
+        if self.config.weight_decay <= 0.0:
+            return jnp.asarray(0.0)
+        weights = self._weights_for_scope(self.config.weight_decay_scope)
+        sq_norm = sum(jnp.sum(W ** 2) for W in weights)
+        return 0.5 * self.config.weight_decay * sq_norm
+
+
+    def _weight_orthogonal_reg(self) -> Array:
+        """0.5 * orthogonal_penalty * sum ||I - W^T W||_F^2 (or W W^T for a
+        'wide' W) over `orthogonal_scope` weights -- an orthogonality penalty
+        that discourages the corresponding linear map from expanding or
+        contracting its input, which is particularly useful on recurrent
+        weights to keep the state dynamics well-conditioned over time.
+        """
+        if self.config.orthogonal_penalty <= 0.0:
+            return jnp.asarray(0.0)
+        weights = self._weights_for_scope(self.config.orthogonal_scope)
+        reg = jnp.asarray(0.0)
+        for W in weights:
+            # eqx.nn.Linear weights have shape (out_features, in_features).
+            # Use whichever of W^T @ W or W @ W^T is smaller, both to save
+            # compute and because only the smaller one can equal identity.
+            out_dim, in_dim = W.shape
+            dim = min(out_dim, in_dim)
+            gram = (W.T @ W) if in_dim <= out_dim else (W @ W.T)
+            reg = reg + jnp.sum((jnp.eye(dim) - gram) ** 2)
+        return 0.5 * self.config.orthogonal_penalty * reg
+
+    
+    def _activity_reg(self, states_curr: Activities) -> Array:
+        """0.5 * activity_decay * sum ||z||_p^p over every current state,
+        with p=1 (sparsity-promoting) or p=2 (soft bound on activity norm)
+        depending on `activity_reg_type`.
+        """
+        if self.config.activity_decay <= 0.:
+            return jnp.asarray(0.0)
+        if self.config.activity_reg_type == "l1":
+            reg = sum(jnp.sum(jnp.abs(state)) for state in states_curr)
+        else: # l2
+            reg = sum(jnp.sum(state ** 2) for state in states_curr)
+        return 0.5 * self.config.activity_decay * reg
+
 
     def tpch_energy_fn(
         self,
@@ -340,12 +567,27 @@ class TpchModel(eqx.Module, ModelBase):
         states_curr: Activities,
         observation: Array,
         control_input: Optional[Array] = None,
+        weight_reg_total: Optional[Array] = None,
     ) -> Array:
         """F_t = sum over every layer of 1/2 ||actual state - predicted state||^2,
-        plus the observation term 1/2 ||y_t - y_hat_t||^2.
+        plus the observation term 1/2 ||y_t - y_hat_t||^2 for `loss="mse"`,
+        or the cross-entropy of `y_t` under logits `y_hat_t` for
+        `loss="ce"`), plus any weight/orthogonal/activity regularisation
+        configured on `self.config`.
 
         This is exactly eq. (19), just written for however many layers `model`
         happens to have instead of being hard-coded to the 2-layer (s, z) case.
+
+        `weight_reg_total`: internal-use only. `_weight_l2_reg() + _weight_orthogonal_reg()`
+        is a pure function of `self`'s weights -- it cannot change while
+        `states_curr` is being relaxed towards a fixed point during
+        inference, since weights are frozen until `update_params` runs
+        between time steps. Callers doing repeated inference steps (e.g.
+        `settle`, `make_activity_step`) compute it ONCE and pass it in here
+        to avoid recomputing the same matrix products on every one of the
+        `n_steps` relaxation iterations. Leave as `None` (the default) to
+        recompute fresh from `self` -- this is what `param_grad` and any
+        one-off energy readout should do.
         """
         predictions, y_hat = self.predict(states_prev, states_curr, control_input)
 
@@ -354,8 +596,15 @@ class TpchModel(eqx.Module, ModelBase):
             error = state - prediction
             energy = energy + 0.5 * jnp.sum(error ** 2)
 
-        y_error = observation - y_hat
-        energy = energy + 0.5 * jnp.sum(y_error ** 2)
+        if self.config.loss == "mse":
+            y_error = observation - y_hat
+            energy = energy + 0.5 * jnp.sum(y_error ** 2)
+        else:  # "ce", validated in __init__
+            energy = energy - jnp.sum(observation * jax.nn.log_softmax(y_hat))
+
+        if weight_reg_total is None:
+            weight_reg_total = self._weight_l2_reg() + self._weight_orthogonal_reg()
+        energy = energy + weight_reg_total + self._activity_reg(states_curr)
         return energy
 
 
@@ -371,6 +620,7 @@ class TpchModel(eqx.Module, ModelBase):
         states_prev: Activities,
         observation: Array,
         control_input: Optional[Array] = None,
+        weight_reg_total: Optional[Array] = None,
     ) -> Activities:
         """-dF_t/d(states_curr), i.e. the direction each state should move in to
         reduce the free energy. This is the generalised form of eqs. (20)-(21):
@@ -379,10 +629,16 @@ class TpchModel(eqx.Module, ModelBase):
         below me" (the +R^T(eps^z_child ... ) / C^T eps^y term) -- exactly the
         two terms the paper derives by hand, but for however many layers you
         have.
+
+        `weight_reg_total`: see the docstring on `tpch_energy_fn` -- passed
+        straight through so repeated calls (from `settle`) don't recompute
+        the weight/orthogonal regularisation on every inference step.
         """
         # Get the energy function as a function of only 's' (states_current), freezing the other params as constants
         # This enables taking the derivative with respect to 's' via jax autograd, which does so wrt first positional arg by default
-        energy_of_states = lambda s: self.tpch_energy_fn(states_prev, s, observation, control_input)
+        energy_of_states = lambda s: self.tpch_energy_fn(
+            states_prev, s, observation, control_input, weight_reg_total=weight_reg_total
+        )
 
         # Traverses the gradient pytree and applies the jnp.negative function to every layer
         # This effectively returns the negative gradient wrt states_curr of every layer, preserving the PyTree hierarchy
@@ -396,12 +652,17 @@ class TpchModel(eqx.Module, ModelBase):
         observation: Array,
         control_input: Optional[Array] = None,
         state_lr: float = 0.1,
+        weight_reg_total: Optional[Array] = None,
     ) -> Activities:
         """One Euler step of the continuous-time inference dynamics in eqs.
         (20)-(21): states_curr <- states_curr + state_lr * (-dF_t/d(states_curr)).
         `state_lr` plays the role of the (dt / tau) discretisation step.
+
+        `weight_reg_total` is the weight regularisation penalty held static during state settling.
         """
-        grad_step = self.neg_activity_grad(states_curr, states_prev, observation, control_input)
+        grad_step = self.neg_activity_grad(
+            states_curr, states_prev, observation, control_input, weight_reg_total=weight_reg_total
+        )
         return jax.tree_util.tree_map(lambda s, g: s + state_lr * g, states_curr, grad_step)
 
 
@@ -417,9 +678,18 @@ class TpchModel(eqx.Module, ModelBase):
         (`init_activities`) and take `n_steps` of gradient-descent inference to
         let the states relax towards a local minimum of F_t before learning.
         """
+        # Weights are frozen for the whole relaxation below (they only change
+        # in `update_params`, between time steps), so this is computed once
+        # and reused for all `n_steps` rather than recomputed from `self` on
+        # every iteration -- exact, not an approximation, since the value
+        # cannot change during this loop.
+        weight_reg_total = self._weight_l2_reg() + self._weight_orthogonal_reg()
+
         states_curr = self.init_activities(states_prev, control_input)
         for _ in range(n_steps):
-            states_curr = self.infer_step(states_curr, states_prev, observation, control_input, state_lr)
+            states_curr = self.infer_step(
+                states_curr, states_prev, observation, control_input, state_lr, weight_reg_total=weight_reg_total
+            )
         return states_curr
 
 
@@ -511,7 +781,15 @@ class TpchModel(eqx.Module, ModelBase):
         scan output: states_curr at every step, so you can inspect the full
             relaxation trajectory (e.g. to check/plot convergence) if you want.
         """
-        energy_fn = lambda s: self.tpch_energy_fn(states_prev, s, observation, control_input)
+        # Same reasoning as in `settle`: weights are frozen for this whole
+        # scan, so the weight/orthogonal regularisation is computed once here
+        # and closed over, instead of being recomputed inside `energy_fn` on
+        # every one of the `n_steps` scanned iterations.
+        weight_reg_total = self._weight_l2_reg() + self._weight_orthogonal_reg()
+        energy_fn = lambda s: self.tpch_energy_fn(
+            states_prev, s, observation, control_input, weight_reg_total=weight_reg_total
+        )
+
 
         def activity_step(carry, _):
             states_curr, opt_state = carry
@@ -595,6 +873,13 @@ class TpchModel(eqx.Module, ModelBase):
             key=key,
             act_fn=config.act_fn, # plaintext name of act_fn, used with registry
             input_size=config.input_size,
+            loss=config.loss,
+            weight_decay=config.weight_decay,
+            weight_decay_scope=config.weight_decay_scope,
+            orthogonal_penalty=config.orthogonal_penalty,
+            orthogonal_scope=config.orthogonal_scope,
+            activity_decay=config.activity_decay,
+            activity_reg_type=config.activity_reg_type,
         )
 
     

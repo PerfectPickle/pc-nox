@@ -544,3 +544,820 @@ def test_checkpoint_round_trip_with_activities_and_opt_state(fx_model, fx_config
     assert len(loaded.activities) == len(activities)
     for a in loaded.activities:
         assert jnp.all(a == 0.0)
+
+
+# =============================================================================
+# I. Regularisation -- explicit, isolated correctness tests
+#
+# The regularisers live inside tpch_energy_fn(), so the strongest tests are
+# deliberately independent of the task-loss terms:
+#
+#   1. Make a zero-task-energy state by starting from init_activities() and
+#      choosing observation == y_hat.
+#   2. Compare an otherwise identical regularised model against a
+#      zero-regularisation model.
+#   3. Check the exact energy delta and the exact gradient delta.
+#
+# This prevents a broken regulariser from "passing" merely because the total
+# energy/gradient is finite or because the task gradient happens to dominate.
+#
+# These tests also exercise every public scope:
+#   weight_decay:       all / rec / ff
+#   orthogonal_penalty: all / rec / ff
+#   activity_decay:     l1 / l2
+#
+# The gradient checks below are analytic and are deliberately supplemented by
+# finite-difference checks for the *regularised* total energy, so they do not
+# rely exclusively on our hand-derived regulariser formulas.
+# =============================================================================
+
+
+def _weight_entries(model):
+    """Return all model weight matrices as (stable_name, array) pairs."""
+    entries = [("control.W_rec", model.control_layer.W_rec.weight)]
+    if model.control_layer.has_input:
+        entries.append(("control.W_in", model.control_layer.W_in.weight))
+    for i, layer in enumerate(model.hidden_layers):
+        entries.extend([
+            (f"hidden[{i}].W_rec", layer.W_rec.weight),
+            (f"hidden[{i}].W_parent_prev", layer.W_parent_prev.weight),
+            (f"hidden[{i}].W_parent_curr", layer.W_parent_curr.weight),
+        ])
+    entries.append(("observation.W_parent", model.observation_layer.W_parent.weight))
+    return entries
+
+
+def _recurrent_names(model):
+    return {
+        "control.W_rec",
+        *(f"hidden[{i}].W_rec" for i in range(len(model.hidden_layers))),
+    }
+
+
+def _flatten_model_param_grads(model, grads):
+    """Return parameter-gradient leaves using the same stable names as _weight_entries."""
+    result = {}
+    result["control.W_rec"] = grads.control_layer.W_rec.weight
+    if model.control_layer.has_input:
+        result["control.W_in"] = grads.control_layer.W_in.weight
+    for i, layer in enumerate(model.hidden_layers):
+        result[f"hidden[{i}].W_rec"] = grads.hidden_layers[i].W_rec.weight
+        result[f"hidden[{i}].W_parent_prev"] = grads.hidden_layers[i].W_parent_prev.weight
+        result[f"hidden[{i}].W_parent_curr"] = grads.hidden_layers[i].W_parent_curr.weight
+    result["observation.W_parent"] = grads.observation_layer.W_parent.weight
+    return result
+
+
+def _regularised_model(*, weight_decay=0.0, weight_decay_scope="all",
+                       orthogonal_penalty=0.0, orthogonal_scope="rec",
+                       activity_decay=0.0, activity_reg_type="l1"):
+    """Build the same small, intentionally rectangular network used by the tests."""
+    return TpchModel(
+        control_layer_size=FX_CONTROL_SIZE,
+        hidden_sizes=FX_HIDDEN_SIZES,
+        obs_size=FX_OBS_SIZE,
+        key=jr.key(101),
+        input_size=FX_INPUT_SIZE,
+        weight_decay=weight_decay,
+        weight_decay_scope=weight_decay_scope,
+        orthogonal_penalty=orthogonal_penalty,
+        orthogonal_scope=orthogonal_scope,
+        activity_decay=activity_decay,
+        activity_reg_type=activity_reg_type,
+    )
+
+
+@pytest.fixture
+def fx_zero_task_point():
+    """Construct a state where the unregularised task energy is exactly zero."""
+    model = _regularised_model()
+    states_prev = [jr.normal(k, (n,)) for k, n in
+                   zip(jr.split(jr.key(102), len([FX_CONTROL_SIZE] + FX_HIDDEN_SIZES)),
+                       [FX_CONTROL_SIZE] + FX_HIDDEN_SIZES)]
+    control_input = jr.normal(jr.key(103), (FX_INPUT_SIZE,))
+
+    states_curr = model.init_activities(states_prev, control_input)
+    _, y_hat = model.predict(states_prev, states_curr, control_input)
+    observation = y_hat
+
+    base_energy = model.tpch_energy_fn(
+        states_prev, states_curr, observation, control_input
+    )
+    # This is an especially useful invariant for these tests: any non-zero
+    # result means the test point itself is not actually isolating the
+    # regularisers.
+    assert base_energy == 0.0
+
+    return model, states_prev, states_curr, observation, control_input
+
+
+def _expected_orthogonal_grad(weight, coefficient):
+    """Gradient of 0.5 * coefficient * ||I - Gram(W)||_F^2.
+
+    tpch.py uses W.T @ W when the matrix is tall/square and W @ W.T when it
+    is wide, choosing the smaller Gram matrix. This helper mirrors that
+    mathematical definition rather than reaching into the implementation.
+    """
+    out_dim, in_dim = weight.shape
+    if in_dim <= out_dim:
+        gram = weight.T @ weight
+        identity = jnp.eye(in_dim, dtype=weight.dtype)
+        return 2.0 * coefficient * weight @ (gram - identity)
+    else:
+        gram = weight @ weight.T
+        identity = jnp.eye(out_dim, dtype=weight.dtype)
+        return 2.0 * coefficient * (gram - identity) @ weight
+
+
+def test_regularisation_zero_coefficients_are_exact_noops(
+    fx_model, fx_states_prev, fx_states_curr, fx_observation, fx_control_input
+):
+    """Setting every regularisation coefficient to zero must reproduce the
+    original energy, activity gradient, and parameter gradient exactly."""
+    base = _regularised_model()
+    explicit_zero = _regularised_model(
+        weight_decay=0.0,
+        orthogonal_penalty=0.0,
+        activity_decay=0.0,
+    )
+
+    e_base = base.tpch_energy_fn(
+        fx_states_prev, fx_states_curr, fx_observation, fx_control_input
+    )
+    e_zero = explicit_zero.tpch_energy_fn(
+        fx_states_prev, fx_states_curr, fx_observation, fx_control_input
+    )
+    assert e_base == e_zero
+
+    g_base = _flatten_model_param_grads(
+        base,
+        base.param_grad(fx_states_prev, fx_states_curr, fx_observation, fx_control_input),
+    )
+    g_zero = _flatten_model_param_grads(
+        explicit_zero,
+        explicit_zero.param_grad(
+            fx_states_prev, fx_states_curr, fx_observation, fx_control_input
+        ),
+    )
+    for name in g_base:
+        assert_allclose(g_zero[name], g_base[name], f"zero-reg param grad: {name}",
+                        atol=0.0, rtol=0.0)
+
+    a_base = base.neg_activity_grad(
+        fx_states_curr, fx_states_prev, fx_observation, fx_control_input
+    )
+    a_zero = explicit_zero.neg_activity_grad(
+        fx_states_curr, fx_states_prev, fx_observation, fx_control_input
+    )
+    for i, (a0, ab) in enumerate(zip(a_zero, a_base)):
+        assert_allclose(a0, ab, f"zero-reg activity grad[{i}]",
+                        atol=0.0, rtol=0.0)
+
+
+@pytest.mark.parametrize("scope", ["rec", "ff", "all"])
+def test_weight_decay_energy_matches_exact_frobenius_penalty(
+    fx_zero_task_point, scope
+):
+    """weight_decay must add exactly 0.5 * lambda * sum ||W||_F^2 over the
+    requested weight scope, and nothing else."""
+    _, states_prev, states_curr, observation, control_input = fx_zero_task_point
+    reg = _regularised_model(weight_decay=0.37, weight_decay_scope=scope)
+    base = _regularised_model()
+
+    expected = 0.5 * 0.37 * sum(
+        jnp.sum(weight ** 2)
+        for name, weight in _weight_entries(reg)
+        if (
+            scope == "all"
+            or (scope == "rec" and name in _recurrent_names(reg))
+            or (scope == "ff" and name not in _recurrent_names(reg))
+        )
+    )
+
+    e_reg = reg.tpch_energy_fn(
+        states_prev, states_curr, observation, control_input
+    )
+    e_base = base.tpch_energy_fn(
+        states_prev, states_curr, observation, control_input
+    )
+    assert_allclose(
+        e_reg - e_base, expected, f"weight_decay energy ({scope})",
+        atol=2e-6, rtol=2e-6,
+    )
+
+
+@pytest.mark.parametrize("scope", ["rec", "ff", "all"])
+def test_weight_decay_parameter_gradient_targets_only_requested_scope(
+    fx_states_prev, fx_states_curr, fx_observation, fx_control_input, scope
+):
+    """The parameter-gradient delta from weight decay must be lambda*W on
+    selected matrices and exactly zero on excluded matrices."""
+    coefficient = 0.23
+    base = _regularised_model()
+    reg = _regularised_model(
+        weight_decay=coefficient,
+        weight_decay_scope=scope,
+    )
+
+    base_grads = _flatten_model_param_grads(
+        base, base.param_grad(
+            fx_states_prev, fx_states_curr, fx_observation, fx_control_input
+        )
+    )
+    reg_grads = _flatten_model_param_grads(
+        reg, reg.param_grad(
+            fx_states_prev, fx_states_curr, fx_observation, fx_control_input
+        )
+    )
+
+    recurrent = _recurrent_names(reg)
+    for name, weight in _weight_entries(reg):
+        selected = (
+            scope == "all"
+            or (scope == "rec" and name in recurrent)
+            or (scope == "ff" and name not in recurrent)
+        )
+        expected_delta = coefficient * weight if selected else jnp.zeros_like(weight)
+        actual_delta = reg_grads[name] - base_grads[name]
+        assert_allclose(
+            actual_delta, expected_delta,
+            f"weight_decay gradient delta ({scope}, {name})",
+            atol=2e-6, rtol=2e-6,
+        )
+
+
+def test_weight_decay_does_not_change_activity_gradient(
+    fx_states_prev, fx_states_curr, fx_observation, fx_control_input
+):
+    """Weight-only regularisation depends only on parameters, so its gradient
+    w.r.t. current activities must be exactly zero."""
+    base = _regularised_model()
+    reg = _regularised_model(weight_decay=0.41, weight_decay_scope="all")
+
+    base_grad = base.neg_activity_grad(
+        fx_states_curr, fx_states_prev, fx_observation, fx_control_input
+    )
+    reg_grad = reg.neg_activity_grad(
+        fx_states_curr, fx_states_prev, fx_observation, fx_control_input
+    )
+
+    for i, (a, b) in enumerate(zip(base_grad, reg_grad)):
+        assert_allclose(
+            b, a, f"weight_decay activity gradient unchanged [{i}]",
+            atol=0.0, rtol=0.0,
+        )
+
+
+@pytest.mark.parametrize("scope", ["rec", "ff", "all"])
+def test_orthogonal_penalty_energy_matches_exact_definition(
+    fx_zero_task_point, scope
+):
+    """orthogonal_penalty must add exactly
+    0.5 * mu * sum ||I - Gram(W)||_F^2, with the same narrow/tall Gram
+    convention documented by tpch.py."""
+    _, states_prev, states_curr, observation, control_input = fx_zero_task_point
+    coefficient = 0.19
+    reg = _regularised_model(
+        orthogonal_penalty=coefficient,
+        orthogonal_scope=scope,
+    )
+    base = _regularised_model()
+
+    recurrent = _recurrent_names(reg)
+    expected = 0.0
+    for name, weight in _weight_entries(reg):
+        selected = (
+            scope == "all"
+            or (scope == "rec" and name in recurrent)
+            or (scope == "ff" and name not in recurrent)
+        )
+        if selected:
+            out_dim, in_dim = weight.shape
+            if in_dim <= out_dim:
+                gram = weight.T @ weight
+                identity = jnp.eye(in_dim, dtype=weight.dtype)
+            else:
+                gram = weight @ weight.T
+                identity = jnp.eye(out_dim, dtype=weight.dtype)
+            expected = expected + 0.5 * coefficient * jnp.sum((identity - gram) ** 2)
+
+    e_reg = reg.tpch_energy_fn(
+        states_prev, states_curr, observation, control_input
+    )
+    e_base = base.tpch_energy_fn(
+        states_prev, states_curr, observation, control_input
+    )
+    assert_allclose(
+        e_reg - e_base, expected, f"orthogonal energy ({scope})",
+        atol=2e-6, rtol=2e-6,
+    )
+
+
+@pytest.mark.parametrize("scope", ["rec", "ff", "all"])
+def test_orthogonal_penalty_gradient_targets_only_requested_scope(
+    fx_states_prev, fx_states_curr, fx_observation, fx_control_input, scope
+):
+    """The parameter-gradient delta from the orthogonality penalty must match
+    the derivative of the implemented Gram-matrix objective, and be exactly
+    zero on excluded weights."""
+    coefficient = 0.13
+    base = _regularised_model()
+    reg = _regularised_model(
+        orthogonal_penalty=coefficient,
+        orthogonal_scope=scope,
+    )
+
+    base_grads = _flatten_model_param_grads(
+        base, base.param_grad(
+            fx_states_prev, fx_states_curr, fx_observation, fx_control_input
+        )
+    )
+    reg_grads = _flatten_model_param_grads(
+        reg, reg.param_grad(
+            fx_states_prev, fx_states_curr, fx_observation, fx_control_input
+        )
+    )
+
+    recurrent = _recurrent_names(reg)
+    for name, weight in _weight_entries(reg):
+        selected = (
+            scope == "all"
+            or (scope == "rec" and name in recurrent)
+            or (scope == "ff" and name not in recurrent)
+        )
+        expected_delta = (
+            _expected_orthogonal_grad(weight, coefficient)
+            if selected else jnp.zeros_like(weight)
+        )
+        actual_delta = reg_grads[name] - base_grads[name]
+        assert_allclose(
+            actual_delta, expected_delta,
+            f"orthogonal gradient delta ({scope}, {name})",
+            atol=2e-5, rtol=2e-5,
+        )
+
+
+def test_orthogonal_penalty_is_zero_for_identity_recurrent_weights():
+    """An exactly orthogonal recurrent matrix must have zero orthogonal
+    penalty and zero orthogonal gradient."""
+    model = _regularised_model(
+        orthogonal_penalty=1.0,
+        orthogonal_scope="rec",
+    )
+
+    # Replace the control recurrent matrix with identity and the first hidden
+    # recurrent matrix with identity. These are square by construction.
+    identity_control = jnp.eye(FX_CONTROL_SIZE)
+    identity_hidden = jnp.eye(FX_HIDDEN_SIZES[0])
+    model = eqx.tree_at(
+        lambda m: (m.control_layer.W_rec.weight, m.hidden_layers[0].W_rec.weight),
+        model,
+        (identity_control, identity_hidden),
+    )
+
+    selected = model._rec_weights()
+    expected_energy = 0.5 * sum(
+        jnp.sum((jnp.eye(w.shape[0]) - w.T @ w) ** 2) for w in selected
+    )
+    actual_energy = model._weight_orthogonal_reg()
+    assert_allclose(actual_energy, expected_energy, "identity orthogonal penalty")
+    assert actual_energy >= 0.0
+
+    # Make the remaining terms irrelevant to this check by inspecting the
+    # direct weight-only energy contribution.
+    reg_grads = _flatten_model_param_grads(
+        model,
+        model.param_grad(
+            [jnp.zeros(n) for n in [FX_CONTROL_SIZE] + FX_HIDDEN_SIZES],
+            [jnp.zeros(n) for n in [FX_CONTROL_SIZE] + FX_HIDDEN_SIZES],
+            jnp.zeros(FX_OBS_SIZE),
+            jnp.zeros(FX_INPUT_SIZE),
+        ),
+    )
+    assert_allclose(
+        reg_grads["control.W_rec"],
+        jnp.zeros_like(identity_control),
+        "identity control W_rec orthogonal gradient",
+        atol=2e-6, rtol=2e-6,
+    )
+    assert_allclose(
+        reg_grads["hidden[0].W_rec"],
+        jnp.zeros_like(identity_hidden),
+        "identity hidden W_rec orthogonal gradient",
+        atol=2e-6, rtol=2e-6,
+    )
+
+
+@pytest.mark.parametrize("reg_type", ["l1", "l2"])
+def test_activity_regularisation_energy_matches_exact_norm(
+    fx_states_prev, fx_states_curr, fx_observation, fx_control_input, reg_type
+):
+    """activity_decay must add exactly 0.5 * lambda * sum |s| for L1 or
+    0.5 * lambda * sum s^2 for L2 over every current activity."""
+    coefficient = 0.29
+    base = _regularised_model()
+    reg = _regularised_model(
+        activity_decay=coefficient,
+        activity_reg_type=reg_type,
+    )
+
+    e_base = base.tpch_energy_fn(
+        fx_states_prev, fx_states_curr, fx_observation, fx_control_input
+    )
+    e_reg = reg.tpch_energy_fn(
+        fx_states_prev, fx_states_curr, fx_observation, fx_control_input
+    )
+
+    if reg_type == "l1":
+        expected = 0.5 * coefficient * sum(
+            jnp.sum(jnp.abs(state)) for state in fx_states_curr
+        )
+    else:
+        expected = 0.5 * coefficient * sum(
+            jnp.sum(state ** 2) for state in fx_states_curr
+        )
+
+    assert_allclose(
+        e_reg - e_base, expected,
+        f"activity {reg_type} energy",
+        atol=2e-6, rtol=2e-6,
+    )
+
+
+@pytest.mark.parametrize("reg_type", ["l1", "l2"])
+def test_activity_regularisation_changes_only_activity_gradients(
+    fx_states_prev, fx_observation, fx_control_input, reg_type
+):
+    """Activity regularisation must contribute to inference gradients but not
+    parameter gradients. L1 is tested away from zero so its sign derivative
+    is unambiguous."""
+    coefficient = 0.31
+    base = _regularised_model()
+    reg = _regularised_model(
+        activity_decay=coefficient,
+        activity_reg_type=reg_type,
+    )
+
+    states_curr = [
+        jnp.array([0.4, -0.7, 0.9, -1.1]),
+        jnp.array([-0.3, 0.8, -1.2]),
+        jnp.array([0.6, -0.5, 1.0, -0.9, 0.2]),
+    ]
+
+    base_act = base.neg_activity_grad(
+        states_curr, fx_states_prev, fx_observation, fx_control_input
+    )
+    reg_act = reg.neg_activity_grad(
+        states_curr, fx_states_prev, fx_observation, fx_control_input
+    )
+
+    for i, (actual, state) in enumerate(zip(
+        [r - b for r, b in zip(reg_act, base_act)], states_curr
+    )):
+        if reg_type == "l1":
+            expected = -0.5 * coefficient * jnp.sign(state)
+        else:
+            expected = -coefficient * state
+        assert_allclose(
+            actual, expected,
+            f"activity {reg_type} negative-gradient delta [{i}]",
+            atol=2e-6, rtol=2e-6,
+        )
+
+    base_param = _flatten_model_param_grads(
+        base, base.param_grad(
+            fx_states_prev, states_curr, fx_observation, fx_control_input
+        )
+    )
+    reg_param = _flatten_model_param_grads(
+        reg, reg.param_grad(
+            fx_states_prev, states_curr, fx_observation, fx_control_input
+        )
+    )
+    for name in base_param:
+        assert_allclose(
+            reg_param[name], base_param[name],
+            f"activity {reg_type} parameter gradient unchanged: {name}",
+            atol=0.0, rtol=0.0,
+        )
+
+
+def test_activity_l1_gradient_matches_jax_subgradient_at_zero(
+    fx_states_prev, fx_observation, fx_control_input
+):
+    """At exactly zero, the L1 contribution matches the subgradient chosen
+    by JAX for jnp.abs(). The L1 derivative is not uniquely defined at zero,
+    so the test checks the actual autodiff convention rather than assuming
+    a particular subgradient.
+    """
+    decay = 0.7
+
+    model = _regularised_model(
+        activity_decay=decay,
+        activity_reg_type="l1",
+    )
+    base = _regularised_model()
+
+    states_curr = [
+        jnp.zeros(FX_CONTROL_SIZE),
+        jnp.zeros(FX_HIDDEN_SIZES[0]),
+        jnp.zeros(FX_HIDDEN_SIZES[1]),
+    ]
+
+    regularised_grad = model.neg_activity_grad(
+        states_curr,
+        fx_states_prev,
+        fx_observation,
+        fx_control_input,
+    )
+    base_grad = base.neg_activity_grad(
+        states_curr,
+        fx_states_prev,
+        fx_observation,
+        fx_control_input,
+    )
+
+    # JAX's chosen derivative of abs(x) at x=0.
+    abs_grad_at_zero = jax.grad(lambda x: jnp.abs(x))(0.0)
+
+    # _activity_reg = 0.5 * decay * sum(abs(state))
+    # neg_activity_grad therefore receives:
+    #     -0.5 * decay * d|x|/dx
+    expected_contribution = -0.5 * decay * abs_grad_at_zero
+
+    for i, (reg_grad, base_g) in enumerate(zip(regularised_grad, base_grad)):
+        actual_contribution = reg_grad - base_g
+
+        assert jnp.all(jnp.isfinite(reg_grad))
+
+        assert_allclose(
+            actual_contribution,
+            jnp.full_like(actual_contribution, expected_contribution),
+            f"L1 zero-point subgradient [{i}]",
+            atol=1e-6,
+            rtol=1e-6,
+        )
+
+
+def test_combined_regularisation_energy_is_additive(
+    fx_zero_task_point
+):
+    """Weight L2 + orthogonal + activity regularisation must equal the sum of
+    the three individually-measured energy contributions, with no accidental
+    interaction or double counting."""
+    _, states_prev, states_curr, observation, control_input = fx_zero_task_point
+
+    wd = 0.17
+    op = 0.11
+    ad = 0.23
+
+    base = _regularised_model()
+    weight_only = _regularised_model(weight_decay=wd, weight_decay_scope="all")
+    orth_only = _regularised_model(orthogonal_penalty=op, orthogonal_scope="all")
+    activity_only = _regularised_model(activity_decay=ad, activity_reg_type="l2")
+    combined = _regularised_model(
+        weight_decay=wd,
+        weight_decay_scope="all",
+        orthogonal_penalty=op,
+        orthogonal_scope="all",
+        activity_decay=ad,
+        activity_reg_type="l2",
+    )
+
+    e0 = base.tpch_energy_fn(states_prev, states_curr, observation, control_input)
+    ew = weight_only.tpch_energy_fn(states_prev, states_curr, observation, control_input)
+    eo = orth_only.tpch_energy_fn(states_prev, states_curr, observation, control_input)
+    ea = activity_only.tpch_energy_fn(states_prev, states_curr, observation, control_input)
+    ec = combined.tpch_energy_fn(states_prev, states_curr, observation, control_input)
+
+    assert_allclose(
+        ec - e0,
+        (ew - e0) + (eo - e0) + (ea - e0),
+        "combined regularisation energy additivity",
+        atol=4e-6, rtol=4e-6,
+    )
+
+
+def test_combined_regularisation_gradient_matches_finite_differences(
+    fx_states_prev, fx_states_curr, fx_observation, fx_control_input
+):
+    """The complete regularised energy remains correctly differentiable:
+    jax.grad should agree with numerical finite differences when all three
+    regulariser families are enabled together.
+
+    This is intentionally a whole-model check rather than three isolated
+    formula checks; it catches plumbing mistakes such as accidentally
+    computing a regulariser but failing to add it to tpch_energy_fn().
+    """
+    model = _regularised_model(
+        weight_decay=0.07,
+        weight_decay_scope="all",
+        orthogonal_penalty=0.05,
+        orthogonal_scope="all",
+        activity_decay=0.09,
+        activity_reg_type="l2",
+    )
+
+    def energy_of_states(s):
+        return model.tpch_energy_fn(
+            fx_states_prev, s, fx_observation, fx_control_input
+        )
+
+    check_grads(
+        energy_of_states,
+        (fx_states_curr,),
+        order=1,
+        modes=("rev",),
+        atol=2e-2,
+        rtol=2e-2,
+    )
+
+    params, static = eqx.partition(model, eqx.is_array)
+
+    def energy_of_params(p):
+        m = eqx.combine(p, static)
+        return m.tpch_energy_fn(
+            fx_states_prev, fx_states_curr, fx_observation, fx_control_input
+        )
+
+    check_grads(
+        energy_of_params,
+        (params,),
+        order=1,
+        modes=("rev",),
+        atol=2e-2,
+        rtol=2e-2,
+    )
+
+
+def test_weight_reg_total_fast_path_is_exactly_equivalent(
+    fx_states_prev, fx_states_curr, fx_observation, fx_control_input
+):
+    """Passing the precomputed weight_reg_total must not change the energy
+    relative to the ordinary tpch_energy_fn path."""
+    model = _regularised_model(
+        weight_decay=0.12,
+        weight_decay_scope="all",
+        orthogonal_penalty=0.08,
+        orthogonal_scope="rec",
+        activity_decay=0.21,
+        activity_reg_type="l2",
+    )
+    cached = model._weight_l2_reg() + model._weight_orthogonal_reg()
+
+    normal = model.tpch_energy_fn(
+        fx_states_prev, fx_states_curr, fx_observation, fx_control_input
+    )
+    fast = model.tpch_energy_fn(
+        fx_states_prev, fx_states_curr, fx_observation, fx_control_input,
+        weight_reg_total=cached,
+    )
+    assert_allclose(normal, fast, "cached weight_reg_total vs normal energy",
+                    atol=0.0, rtol=0.0)
+
+
+def test_regularised_settle_and_settle_scan_agree(
+    fx_states_prev, fx_observation, fx_control_input
+):
+    """The two inference implementations must include activity regularisation
+    identically and remain numerically equivalent when weight regularisation
+    is also active."""
+    model = _regularised_model(
+        weight_decay=0.05,
+        weight_decay_scope="ff",
+        orthogonal_penalty=0.03,
+        orthogonal_scope="rec",
+        activity_decay=0.04,
+        activity_reg_type="l2",
+    )
+
+    settled = model.settle(
+        fx_states_prev, fx_observation, fx_control_input,
+        n_steps=15, state_lr=0.03,
+    )
+    settled_scan = model.settle_scan(
+        optax.sgd(learning_rate=0.03),
+        fx_states_prev, fx_observation, fx_control_input,
+        n_steps=15,
+    )
+
+    for i, (a, b) in enumerate(zip(settled, settled_scan)):
+        assert_allclose(
+            a, b, f"regularised settle vs settle_scan state[{i}]",
+            atol=3e-5, rtol=3e-5,
+        )
+
+    e1 = model.tpch_energy_fn(
+        fx_states_prev, settled, fx_observation, fx_control_input
+    )
+    e2 = model.tpch_energy_fn(
+        fx_states_prev, settled_scan, fx_observation, fx_control_input
+    )
+    assert_allclose(
+        e1, e2, "regularised settle vs settle_scan energy",
+        atol=3e-5, rtol=3e-5,
+    )
+
+
+def test_regularisation_config_round_trips_through_from_config_and_checkpoint(
+    tmp_path
+):
+    """All regularisation settings are computational config and therefore
+    must survive from_config() and ModelBase checkpoint round trips."""
+    config = TpchConfig(
+        control_layer_size=FX_CONTROL_SIZE,
+        hidden_sizes=tuple(FX_HIDDEN_SIZES),
+        obs_size=FX_OBS_SIZE,
+        input_size=FX_INPUT_SIZE,
+        act_fn="tanh",
+        loss="mse",
+        weight_decay=0.12,
+        weight_decay_scope="ff",
+        orthogonal_penalty=0.09,
+        orthogonal_scope="rec",
+        activity_decay=0.07,
+        activity_reg_type="l2",
+    )
+    original = TpchModel.from_config(config, key=jr.key(104))
+    rebuilt = TpchModel.from_config(config, key=jr.key(999))
+
+    assert original.config == rebuilt.config
+    assert original.config.weight_decay == 0.12
+    assert original.config.weight_decay_scope == "ff"
+    assert original.config.orthogonal_penalty == 0.09
+    assert original.config.orthogonal_scope == "rec"
+    assert original.config.activity_decay == 0.07
+    assert original.config.activity_reg_type == "l2"
+
+    out_dir = original.save_checkpoint(path=tmp_path / "tpch_reg_ckpt")
+    loaded = TpchModel.load_checkpoint(out_dir)
+
+    assert loaded.model.config == config
+    assert loaded.model.config.weight_decay_scope == "ff"
+    assert loaded.model.config.orthogonal_scope == "rec"
+    assert loaded.model.config.activity_reg_type == "l2"
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"weight_decay_scope": "bad"},
+        {"orthogonal_scope": "bad"},
+        {"activity_reg_type": "bad"},
+    ],
+)
+def test_regularisation_enum_validation(kwargs):
+    """Unsupported regularisation scope/type strings must fail at model
+    construction rather than being silently treated as another option."""
+    with pytest.raises(ValueError):
+        _regularised_model(**kwargs)
+
+
+def test_overlapping_weight_and_orthogonal_regularisation_warns_at_collapse_threshold():
+    """The documented no-nonzero-equilibrium threshold must emit a warning
+    exactly when positive, overlapping regularisers satisfy
+    weight_decay >= 2 * orthogonal_penalty."""
+    with pytest.warns(UserWarning, match="no stable nonzero equilibrium"):
+        _regularised_model(
+            weight_decay=0.2,
+            weight_decay_scope="rec",
+            orthogonal_penalty=0.1,
+            orthogonal_scope="rec",
+        )
+
+
+def test_non_overlapping_weight_and_orthogonal_regularisation_does_not_warn():
+    """The same coefficients are harmless when the two regularisers operate on
+    disjoint parameter sets."""
+    import warnings
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        _regularised_model(
+            weight_decay=0.2,
+            weight_decay_scope="ff",
+            orthogonal_penalty=0.1,
+            orthogonal_scope="rec",
+        )
+    assert not caught
+
+
+def test_regularised_param_grad_structure_still_matches_model(
+    fx_states_prev, fx_states_curr, fx_observation, fx_control_input
+):
+    """Adding regularisation must not alter the PyTree structure required by
+    eqx.apply_updates/Optax."""
+    model = _regularised_model(
+        weight_decay=0.1,
+        orthogonal_penalty=0.07,
+        activity_decay=0.05,
+        activity_reg_type="l1",
+    )
+    grads = model.param_grad(
+        fx_states_prev, fx_states_curr, fx_observation, fx_control_input
+    )
+    model_arrays = eqx.filter(model, eqx.is_array)
+    assert jax.tree_util.tree_structure(grads) == jax.tree_util.tree_structure(model_arrays)
+    for leaf in jax.tree_util.tree_leaves(grads):
+        assert jnp.all(jnp.isfinite(leaf))
+

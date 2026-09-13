@@ -1,4 +1,4 @@
-from models.tpch import TpchModel, TpchConfig, TpchControlLayer, TpchHiddenLayer, TpchObservationLayer
+from models.tpch import TpchModel, TpchConfig, TpchControlLayer, TpchHiddenLayer, TpchObservationLayer, make_train_step, make_train_run
 import equinox as eqx
 import jax
 import jax.random as jr
@@ -172,10 +172,17 @@ def layer_energies(model, states_prev, states_curr, observation, control_input=N
     """Per-term breakdown of tpch_energy_fn's sum: one entry per layer that
     contributes an error term (control, each hidden layer, observation), in
     top-to-bottom order. sum(layer_energies(...)) == tpch_energy_fn(...) by
-    construction -- handy for isolating which layer's prediction is off."""
+    construction -- handy for isolating which layer's prediction is off.
+
+    Mirrors tpch_energy_fn's own loss switch (mse vs ce) via model.config.loss,
+    so this stays a valid ground truth for both loss types, not just mse.
+    """
     predictions, y_hat = model.predict(states_prev, states_curr, control_input)
     energies = [0.5 * jnp.sum((s - p) ** 2) for s, p in zip(states_curr, predictions)]
-    energies.append(0.5 * jnp.sum((observation - y_hat) ** 2))
+    if model.config.loss == "mse":
+        energies.append(0.5 * jnp.sum((observation - y_hat) ** 2))
+    else:  # "ce"
+        energies.append(-jnp.sum(observation * jax.nn.log_softmax(y_hat)))
     return energies
 
 
@@ -1361,3 +1368,1005 @@ def test_regularised_param_grad_structure_still_matches_model(
     for leaf in jax.tree_util.tree_leaves(grads):
         assert jnp.all(jnp.isfinite(leaf))
 
+
+
+# =============================================================================
+# J. layer_labels() -- ModelBase's optional labelling hook. The generic
+#    default-raises / implemented-subclass contract is tested once,
+#    model-agnostically, in model_base_test.py against a dummy model (same
+#    split as save_checkpoint/load_checkpoint in section H). These just
+#    check TpchModel's actual labels and their relationship to
+#    return_layerwise's output (section K).
+# =============================================================================
+
+def test_layer_labels_matches_fx_model_hidden_layer_count(fx_model):
+    assert TpchModel.layer_labels(fx_model.config) == ["Control", "Hidden 1", "Hidden 2", "Observation"]
+
+
+def test_layer_labels_length_matches_return_layerwise_breakdown(
+    fx_model, fx_states_prev, fx_states_curr, fx_observation, fx_control_input
+):
+    labels = TpchModel.layer_labels(fx_model.config)
+    breakdown = fx_model.tpch_energy_fn(
+        fx_states_prev, fx_states_curr, fx_observation, fx_control_input, return_layerwise=True
+    )
+    assert len(labels) == breakdown.shape[0]
+
+
+def test_layer_labels_zero_hidden_layers():
+    config = TpchConfig(control_layer_size=4, hidden_sizes=(), obs_size=6, input_size=2)
+    assert TpchModel.layer_labels(config) == ["Control", "Observation"]
+
+
+@pytest.mark.parametrize("n_hidden", [0, 1, 4])
+def test_layer_labels_various_hidden_layer_counts(n_hidden):
+    config = TpchConfig(control_layer_size=4, hidden_sizes=tuple(range(3, 3 + n_hidden)), obs_size=6)
+    labels = TpchModel.layer_labels(config)
+    assert labels[0] == "Control"
+    assert labels[-1] == "Observation"
+    assert labels[1:-1] == [f"Hidden {i + 1}" for i in range(n_hidden)]
+    assert len(labels) == n_hidden + 2
+
+
+def test_layer_labels_depends_only_on_config_not_a_built_model():
+    """layer_labels is a classmethod taking `config`, not `self` -- it must
+    work from a bare TpchConfig with no TpchModel ever constructed."""
+    config = TpchConfig(control_layer_size=4, hidden_sizes=(3, 5), obs_size=6)
+    assert TpchModel.layer_labels(config) == ["Control", "Hidden 1", "Hidden 2", "Observation"]
+
+
+# =============================================================================
+# K. Layerwise energy (tpch_energy_fn(..., return_layerwise=True),
+#    settle_scan(..., return_layerwise=True))
+#
+# Same isolation philosophy as section I: build ground truth independently
+# of the implementation wherever possible (this file's own _weight_entries/
+# _recurrent_names, grouped by owning layer, rather than calling the
+# implementation's _weight_l2_reg_by_layer/_weight_orthogonal_reg_by_layer
+# directly) so a broken attribution can't "pass" just because it's
+# internally self-consistent.
+#
+# Unlike an earlier version of tpch_energy_fn, return_layerwise=True now
+# includes regularisation, attributed EXACTLY (not approximated) to
+# whichever layer's own weights/activities produced it -- these tests are
+# the ground-truth check on that exactness claim specifically.
+# =============================================================================
+
+
+def _owning_layer_idx(name: str, model) -> int:
+    """Maps a _weight_entries() name (this test file's own, independent of
+    the implementation) to the owning-layer index used by layer_labels()
+    and return_layerwise's breakdown: 0=control, 1..n=hidden, n+1=observation.
+    """
+    if name.startswith("control"):
+        return 0
+    if name.startswith("hidden["):
+        i = int(name[len("hidden["):name.index("]")])
+        return i + 1
+    if name.startswith("observation"):
+        return len(model.hidden_layers) + 1
+    raise ValueError(f"unrecognised weight name: {name}")
+
+
+# ---- K1. Basic shape/consistency -------------------------------------------
+
+def test_return_layerwise_shape_matches_states_plus_one(
+    fx_model, fx_states_prev, fx_states_curr, fx_observation, fx_control_input
+):
+    breakdown = fx_model.tpch_energy_fn(
+        fx_states_prev, fx_states_curr, fx_observation, fx_control_input, return_layerwise=True
+    )
+    assert breakdown.shape == (len(fx_states_curr) + 1,)
+    assert jnp.all(jnp.isfinite(breakdown))
+
+
+def test_return_layerwise_is_a_stacked_array_not_a_python_list(
+    fx_model, fx_states_prev, fx_states_curr, fx_observation, fx_control_input
+):
+    """Regression test: an earlier draft of tpch_energy_fn returned a plain
+    Python list under return_layerwise=True, which breaks settle_scan's
+    jax.vmap(energy_trace_fn)(states_hist) (vmap needs a stackable array
+    back, not a list)."""
+    breakdown = fx_model.tpch_energy_fn(
+        fx_states_prev, fx_states_curr, fx_observation, fx_control_input, return_layerwise=True
+    )
+    assert isinstance(breakdown, jax.Array)
+
+
+# ---- K2. Task-only breakdown matches the independent layer_energies() helper
+
+def test_return_layerwise_matches_manual_layer_energies_helper_at_zero_reg(
+    fx_model, fx_states_prev, fx_states_curr, fx_observation, fx_control_input
+):
+    """With all regularisation off, return_layerwise's breakdown must equal
+    this file's own hand-written per-layer task-error formula exactly."""
+    manual = jnp.stack(layer_energies(fx_model, fx_states_prev, fx_states_curr, fx_observation, fx_control_input))
+    actual = fx_model.tpch_energy_fn(
+        fx_states_prev, fx_states_curr, fx_observation, fx_control_input, return_layerwise=True
+    )
+    assert_allclose(actual, manual, "return_layerwise vs manual layer_energies (zero reg)", atol=1e-5, rtol=1e-5)
+
+
+def test_return_layerwise_matches_manual_layer_energies_helper_with_ce_loss(
+    fx_states_prev, fx_states_curr, fx_control_input
+):
+    """The loss switch (section on loss, if present) must also be reflected
+    correctly in the layerwise breakdown's observation entry, not just the
+    scalar total."""
+    model = TpchModel(
+        control_layer_size=FX_CONTROL_SIZE, hidden_sizes=FX_HIDDEN_SIZES, obs_size=FX_OBS_SIZE,
+        key=jr.key(210), input_size=FX_INPUT_SIZE, loss="ce",
+    )
+    observation = jax.nn.one_hot(2, FX_OBS_SIZE)
+    manual = jnp.stack(layer_energies(model, fx_states_prev, fx_states_curr, observation, fx_control_input))
+    actual = model.tpch_energy_fn(fx_states_prev, fx_states_curr, observation, fx_control_input, return_layerwise=True)
+    assert_allclose(actual, manual, "return_layerwise vs manual layer_energies (ce loss)", atol=1e-5, rtol=1e-5)
+
+
+# ---- K3. sum(return_layerwise) == scalar total, across regularisation configs
+
+@pytest.mark.parametrize(
+    "reg_kwargs",
+    [
+        {},
+        {"weight_decay": 0.2, "weight_decay_scope": "all"},
+        {"weight_decay": 0.2, "weight_decay_scope": "rec"},
+        {"weight_decay": 0.2, "weight_decay_scope": "ff"},
+        {"orthogonal_penalty": 0.15, "orthogonal_scope": "rec"},
+        {"orthogonal_penalty": 0.15, "orthogonal_scope": "all"},
+        {"activity_decay": 0.1, "activity_reg_type": "l1"},
+        {"activity_decay": 0.1, "activity_reg_type": "l2"},
+        {
+            "weight_decay": 0.13, "weight_decay_scope": "ff",
+            "orthogonal_penalty": 0.09, "orthogonal_scope": "rec",
+            "activity_decay": 0.07, "activity_reg_type": "l2",
+        },
+    ],
+)
+def test_return_layerwise_sum_equals_scalar_total(
+    fx_states_prev, fx_states_curr, fx_observation, fx_control_input, reg_kwargs
+):
+    """jnp.sum(return_layerwise output) must exactly equal the scalar
+    (return_layerwise=False) total on identical inputs -- this is the core
+    contract that makes the breakdown trustworthy for diagnostics: it's a
+    genuine partition of the real total, not a different, smaller quantity."""
+    model = _regularised_model(**reg_kwargs)
+    scalar_total = model.tpch_energy_fn(fx_states_prev, fx_states_curr, fx_observation, fx_control_input)
+    breakdown = model.tpch_energy_fn(
+        fx_states_prev, fx_states_curr, fx_observation, fx_control_input, return_layerwise=True
+    )
+    assert_allclose(jnp.sum(breakdown), scalar_total, f"sum(breakdown) vs scalar total {reg_kwargs}", atol=1e-4, rtol=1e-4)
+
+
+# ---- K4. Exact per-layer weight_decay attribution (independent formula) ----
+
+@pytest.mark.parametrize("scope", ["rec", "ff", "all"])
+def test_return_layerwise_weight_decay_attributed_to_correct_layer(fx_zero_task_point, scope):
+    """Each entry of the return_layerwise breakdown must equal exactly the
+    weight_decay penalty owed by THAT layer's own weights -- computed here
+    by grouping this test file's independent _weight_entries() by owning
+    layer, not by calling the implementation's internal grouping helpers.
+    """
+    _, states_prev, states_curr, observation, control_input = fx_zero_task_point
+    coefficient = 0.29
+    reg = _regularised_model(weight_decay=coefficient, weight_decay_scope=scope)
+
+    n_groups = len(reg.hidden_layers) + 2
+    expected = [0.0] * n_groups
+    recurrent = _recurrent_names(reg)
+    for name, weight in _weight_entries(reg):
+        selected = (
+            scope == "all"
+            or (scope == "rec" and name in recurrent)
+            or (scope == "ff" and name not in recurrent)
+        )
+        if selected:
+            expected[_owning_layer_idx(name, reg)] += 0.5 * coefficient * float(jnp.sum(weight ** 2))
+
+    breakdown = reg.tpch_energy_fn(states_prev, states_curr, observation, control_input, return_layerwise=True)
+    for i, exp in enumerate(expected):
+        assert_allclose(
+            breakdown[i], exp, f"weight_decay attribution, layer {i} ({TpchModel.layer_labels(reg.config)[i]}), scope={scope}",
+            atol=2e-6, rtol=2e-6,
+        )
+
+
+@pytest.mark.parametrize("scope", ["rec", "ff", "all"])
+def test_return_layerwise_orthogonal_penalty_attributed_to_correct_layer(fx_zero_task_point, scope):
+    """Same exactness check as above, for orthogonal_penalty, reusing the
+    same Gram-matrix ground truth as test_orthogonal_penalty_energy_matches_exact_definition."""
+    _, states_prev, states_curr, observation, control_input = fx_zero_task_point
+    coefficient = 0.17
+    reg = _regularised_model(orthogonal_penalty=coefficient, orthogonal_scope=scope)
+
+    n_groups = len(reg.hidden_layers) + 2
+    expected = [0.0] * n_groups
+    recurrent = _recurrent_names(reg)
+    for name, weight in _weight_entries(reg):
+        selected = (
+            scope == "all"
+            or (scope == "rec" and name in recurrent)
+            or (scope == "ff" and name not in recurrent)
+        )
+        if selected:
+            out_dim, in_dim = weight.shape
+            if in_dim <= out_dim:
+                gram = weight.T @ weight
+                identity = jnp.eye(in_dim, dtype=weight.dtype)
+            else:
+                gram = weight @ weight.T
+                identity = jnp.eye(out_dim, dtype=weight.dtype)
+            expected[_owning_layer_idx(name, reg)] += float(0.5 * coefficient * jnp.sum((identity - gram) ** 2))
+
+    breakdown = reg.tpch_energy_fn(states_prev, states_curr, observation, control_input, return_layerwise=True)
+    for i, exp in enumerate(expected):
+        assert_allclose(
+            breakdown[i], exp, f"orthogonal attribution, layer {i} ({TpchModel.layer_labels(reg.config)[i]}), scope={scope}",
+            atol=2e-5, rtol=2e-5,
+        )
+
+
+# ---- K5. Exact per-layer activity_decay attribution (trivially exact:
+#      states_curr is already one-per-layer, no grouping needed) ----------
+
+@pytest.mark.parametrize("reg_type", ["l1", "l2"])
+def test_return_layerwise_activity_decay_attributed_to_correct_layer(
+    fx_states_prev, fx_states_curr, fx_observation, fx_control_input, reg_type
+):
+    coefficient = 0.31
+    reg = _regularised_model(activity_decay=coefficient, activity_reg_type=reg_type)
+
+    if reg_type == "l1":
+        expected_per_state = [0.5 * coefficient * float(jnp.sum(jnp.abs(s))) for s in fx_states_curr]
+    else:
+        expected_per_state = [0.5 * coefficient * float(jnp.sum(s ** 2)) for s in fx_states_curr]
+
+    breakdown = reg.tpch_energy_fn(
+        fx_states_prev, fx_states_curr, fx_observation, fx_control_input, return_layerwise=True
+    )
+    manual_task = layer_energies(reg, fx_states_prev, fx_states_curr, fx_observation, fx_control_input)
+
+    for i, expected_activity in enumerate(expected_per_state):
+        expected_total = float(manual_task[i]) + expected_activity
+        assert_allclose(
+            breakdown[i], expected_total, f"activity {reg_type} attribution, layer {i}",
+            atol=2e-6, rtol=2e-6,
+        )
+
+
+def test_return_layerwise_activity_decay_observation_entry_is_task_only(
+    fx_states_prev, fx_states_curr, fx_observation, fx_control_input
+):
+    """states_curr has no observation-layer entry (the observation is
+    external ground truth y, not a state), so activity_decay must
+    contribute exactly zero to the breakdown's LAST (observation) entry --
+    that entry should be pure task/loss error, unaffected by activity_decay."""
+    coefficient = 0.5
+    base = _regularised_model()
+    reg = _regularised_model(activity_decay=coefficient, activity_reg_type="l2")
+
+    breakdown_base = base.tpch_energy_fn(
+        fx_states_prev, fx_states_curr, fx_observation, fx_control_input, return_layerwise=True
+    )
+    breakdown_reg = reg.tpch_energy_fn(
+        fx_states_prev, fx_states_curr, fx_observation, fx_control_input, return_layerwise=True
+    )
+    assert_allclose(
+        breakdown_reg[-1], breakdown_base[-1], "observation entry unaffected by activity_decay",
+        atol=0.0, rtol=0.0,
+    )
+    # sanity: some OTHER entry must actually have changed, or this test
+    # would trivially pass even if activity_decay were completely broken
+    assert not bool(jnp.allclose(breakdown_reg[:-1], breakdown_base[:-1]))
+
+
+# ---- K6. return_layerwise under jit / grad / vmap ---------------------------
+#
+# tpch_energy_fn builds return_layerwise's output via a plain Python
+# list.append() inside a for loop over states_curr. That's only safe under
+# jax transforms because len(states_curr) (the number of layers) is a
+# static property of the model's architecture, not a traced value -- the
+# loop unrolls at trace time, same as every other Python loop in tpch.py
+# (_all_weights, _weight_entries, predict, etc). These are regression tests
+# for that property specifically, not just "does return_layerwise work".
+
+def test_return_layerwise_compiles_under_eqx_filter_jit(
+    fx_model, fx_states_prev, fx_states_curr, fx_observation, fx_control_input
+):
+    energy_fn = eqx.filter_jit(
+        lambda m, sp, sc, y, x: m.tpch_energy_fn(sp, sc, y, x, return_layerwise=True)
+    )
+    out = energy_fn(fx_model, fx_states_prev, fx_states_curr, fx_observation, fx_control_input)
+    direct = fx_model.tpch_energy_fn(
+        fx_states_prev, fx_states_curr, fx_observation, fx_control_input, return_layerwise=True
+    )
+    assert_allclose(out, direct, "jit vs eager return_layerwise", atol=1e-5, rtol=1e-5)
+
+
+def test_return_layerwise_differentiable_wrt_states(
+    fx_model, fx_states_prev, fx_states_curr, fx_observation, fx_control_input
+):
+    grad_out = jax.grad(
+        lambda sc: jnp.sum(fx_model.tpch_energy_fn(
+            fx_states_prev, sc, fx_observation, fx_control_input, return_layerwise=True
+        ))
+    )(fx_states_curr)
+    assert len(grad_out) == len(fx_states_curr)
+    for g, s in zip(grad_out, fx_states_curr):
+        assert g.shape == s.shape
+        assert jnp.all(jnp.isfinite(g))
+
+
+def test_return_layerwise_vmaps_over_a_batch_of_states(
+    fx_model, fx_states_prev, fx_states_curr, fx_observation, fx_control_input
+):
+    """This is exactly the mechanism settle_scan(return_layerwise=True) relies
+    on internally (jax.vmap over the recorded states_hist trajectory) --
+    tested directly here, independent of settle_scan, to isolate the
+    property from settle_scan's own scan/optax machinery."""
+    batched = [jnp.stack([s, s * 1.5]) for s in fx_states_curr]
+    vmap_out = jax.vmap(
+        lambda sc: fx_model.tpch_energy_fn(fx_states_prev, sc, fx_observation, fx_control_input, return_layerwise=True)
+    )(batched)
+    assert vmap_out.shape == (2, len(fx_states_curr) + 1)
+    direct_0 = fx_model.tpch_energy_fn(
+        fx_states_prev, fx_states_curr, fx_observation, fx_control_input, return_layerwise=True
+    )
+    assert_allclose(vmap_out[0], direct_0, "vmap row 0 vs direct call", atol=1e-5, rtol=1e-5)
+
+
+# ---- K7. settle_scan(return_layerwise=True) --------------------------------
+
+def test_settle_scan_return_layerwise_false_returns_states_only(
+    fx_model, fx_states_prev, fx_control_input, fx_observation
+):
+    """The default (False) must return exactly what it always returned --
+    just states_curr, not a tuple -- regardless of what return_layerwise=True
+    now does."""
+    opt = optax.sgd(learning_rate=0.05)
+    result = fx_model.settle_scan(opt, fx_states_prev, fx_observation, fx_control_input, n_steps=10)
+    assert isinstance(result, list)
+    assert len(result) == len(fx_states_prev)
+
+
+def test_settle_scan_return_layerwise_true_states_match_false(
+    fx_model, fx_states_prev, fx_control_input, fx_observation
+):
+    opt = optax.sgd(learning_rate=0.05)
+    states_default = fx_model.settle_scan(opt, fx_states_prev, fx_observation, fx_control_input, n_steps=10)
+    states_curr, trace = fx_model.settle_scan(
+        opt, fx_states_prev, fx_observation, fx_control_input, n_steps=10, return_layerwise=True
+    )
+    for a, b in zip(states_default, states_curr):
+        assert_allclose(a, b, "settle_scan states identical with/without return_layerwise", atol=0.0, rtol=0.0)
+
+
+@pytest.mark.parametrize(
+    "reg_kwargs",
+    [
+        {},
+        {"weight_decay": 0.1, "weight_decay_scope": "all"},
+        {"orthogonal_penalty": 0.1, "orthogonal_scope": "rec"},
+        {"activity_decay": 0.1, "activity_reg_type": "l1"},
+    ],
+)
+def test_settle_scan_return_layerwise_trace_shape_and_sum_matches_scalar(
+    fx_states_prev, fx_control_input, fx_observation, reg_kwargs
+):
+    model = _regularised_model(**reg_kwargs)
+    opt = optax.sgd(learning_rate=0.05)
+    n_steps = 12
+    states_curr, trace = model.settle_scan(
+        opt, fx_states_prev, fx_observation, fx_control_input, n_steps=n_steps, return_layerwise=True
+    )
+    assert trace.shape == (n_steps, len(fx_states_prev) + 1)
+    assert jnp.all(jnp.isfinite(trace))
+
+    # every row's sum must equal a scalar tpch_energy_fn call on that
+    # row's own (recorded) states -- checked here for just the last row,
+    # which we can reconstruct directly (see next test for interior rows)
+    direct_final_breakdown = model.tpch_energy_fn(
+        fx_states_prev, states_curr, fx_observation, fx_control_input, return_layerwise=True
+    )
+    assert_allclose(trace[-1], direct_final_breakdown, "trace last row vs direct recomputation", atol=1e-4, rtol=1e-4)
+
+
+def test_settle_scan_return_layerwise_regularisation_rows_are_constant_across_steps(
+    fx_states_prev, fx_control_input, fx_observation
+):
+    """Weights are frozen for the entire duration of one settle_scan call
+    (they only change via param_grad + an optimiser step, between calls) --
+    so the REGULARISATION contribution to the trace must be bit-identical
+    at every one of the n_steps rows, even though the TASK-error part
+    varies as the states relax. This is a structural property of the
+    physics, not an implementation detail -- if this ever fails, weights
+    are leaking into the trace somehow."""
+    model = _regularised_model(weight_decay=0.15, weight_decay_scope="all", orthogonal_penalty=0.08, orthogonal_scope="rec")
+    base = _regularised_model()  # zero regularisation, for isolating the reg-only contribution
+    opt = optax.sgd(learning_rate=0.05)
+    n_steps = 10
+
+    _, trace_reg = model.settle_scan(opt, fx_states_prev, fx_observation, fx_control_input, n_steps=n_steps, return_layerwise=True)
+    _, trace_base = base.settle_scan(opt, fx_states_prev, fx_observation, fx_control_input, n_steps=n_steps, return_layerwise=True)
+
+    # NOTE: task-error rows differ between model/base because activity
+    # regularisation (none here) would change the inference trajectory --
+    # with only weight-only regularisers on, the trajectories are IDENTICAL
+    # (weight_decay/orthogonal contribute zero gradient to states), so the
+    # difference isolates purely the regularisation contribution at each step.
+    reg_only_per_step = trace_reg - trace_base
+    for t in range(1, n_steps):
+        assert_allclose(
+            reg_only_per_step[t], reg_only_per_step[0], f"regularisation contribution constant across steps (row {t})",
+            atol=1e-5, rtol=1e-5,
+        )
+    # and it should be strictly nonzero (a broken/no-op regulariser would
+    # trivially satisfy the "constant" check above with all zeros)
+    assert not bool(jnp.allclose(reg_only_per_step[0], jnp.zeros_like(reg_only_per_step[0])))
+
+
+# =============================================================================
+# L. make_train_step -- module-level factory (not a TpchModel method) that
+#    fuses settle_scan + logging quantities + one param_grad/optax weight
+#    update into a single eqx.filter_jit-compiled function, built once per
+#    training run and called once per frame.
+#
+# The strongest tests here (L4/L5) manually recompose the exact same
+# sequence of calls WITHOUT make_train_step and check for agreement --
+# this is what actually validates the fused version matches its documented
+# behaviour, rather than just "it runs and returns finite numbers".
+# =============================================================================
+
+def _manual_train_step(model, param_optim, activity_optim, param_opt_state, states_prev, y, control_input, n_infer_steps):
+    """Direct (unfused, eager) re-implementation of make_train_step's
+    train_step body, built from public TpchModel methods only. Used as an
+    independent ground truth for the tests below."""
+    states_curr_init = model.init_activities(states_prev, control_input)
+    _, y_hat_before = model.predict(states_prev, states_curr_init, control_input)
+    energy_before = model.tpch_energy_fn(states_prev, states_curr_init, y, control_input)
+
+    states_curr = model.settle_scan(activity_optim, states_prev, y, control_input, n_steps=n_infer_steps)
+
+    _, y_hat_after = model.predict(states_prev, states_curr, control_input)
+    energy_after = model.tpch_energy_fn(states_prev, states_curr, y, control_input)
+
+    grads = model.param_grad(states_prev, states_curr, y, control_input)
+    updates, new_opt_state = param_optim.update(grads, param_opt_state, model)
+    new_model = eqx.apply_updates(model, updates)
+
+    return new_model, new_opt_state, states_curr, y_hat_before, y_hat_after, energy_before, energy_after
+
+
+@pytest.fixture
+def fx_train_step_setup(fx_model, fx_states_prev, fx_observation, fx_control_input):
+    """Common setup for make_train_step tests: a param optimiser + its
+    initial state, matched to fx_model."""
+    param_optim = optax.adam(learning_rate=1e-3)
+    activity_optim = optax.adam(learning_rate=1e-2)
+    param_opt_state = param_optim.init(eqx.filter(fx_model, eqx.is_array))
+    return param_optim, activity_optim, param_opt_state
+
+
+# ---- L1. Output contract ----------------------------------------------------
+
+def test_make_train_step_default_returns_none_energy_trace(
+    fx_model, fx_states_prev, fx_observation, fx_control_input, fx_train_step_setup
+):
+    param_optim, activity_optim, param_opt_state = fx_train_step_setup
+    n_infer_steps = 8
+    train_step = make_train_step(param_optim, activity_optim, n_infer_steps, fx_control_input)
+
+    result = train_step(fx_model, param_opt_state, fx_states_prev, fx_observation)
+    assert len(result) == 8
+    model, opt_state, states_curr, y_hat_before, y_hat_after, energy_before, energy_after, energy_trace = result
+    assert energy_trace is None
+    assert len(states_curr) == len(fx_states_prev)
+    assert y_hat_before.shape == fx_observation.shape
+    assert y_hat_after.shape == fx_observation.shape
+    assert jnp.isfinite(energy_before)
+    assert jnp.isfinite(energy_after)
+
+
+def test_make_train_step_return_layerwise_true_gives_correctly_shaped_trace(
+    fx_model, fx_states_prev, fx_observation, fx_control_input, fx_train_step_setup
+):
+    param_optim, activity_optim, param_opt_state = fx_train_step_setup
+    n_infer_steps = 8
+    train_step = make_train_step(param_optim, activity_optim, n_infer_steps, fx_control_input)
+
+    result = train_step(fx_model, param_opt_state, fx_states_prev, fx_observation, return_layerwise=True)
+    energy_trace = result[-1]
+    assert energy_trace is not None
+    assert energy_trace.shape == (n_infer_steps, len(fx_states_prev) + 1)
+    assert jnp.all(jnp.isfinite(energy_trace))
+
+
+def test_make_train_step_weight_update_actually_changes_weights(
+    fx_model, fx_states_prev, fx_observation, fx_control_input, fx_train_step_setup
+):
+    param_optim, activity_optim, param_opt_state = fx_train_step_setup
+    train_step = make_train_step(param_optim, activity_optim, 8, fx_control_input)
+
+    new_model, *_ = train_step(fx_model, param_opt_state, fx_states_prev, fx_observation)
+
+    before_leaves = jax.tree_util.tree_leaves(eqx.filter(fx_model, eqx.is_array))
+    after_leaves = jax.tree_util.tree_leaves(eqx.filter(new_model, eqx.is_array))
+    assert len(before_leaves) == len(after_leaves)
+    assert any(not bool(jnp.array_equal(b, a)) for b, a in zip(before_leaves, after_leaves))
+    for leaf in after_leaves:
+        assert jnp.all(jnp.isfinite(leaf))
+
+
+# ---- L4. Manual recomposition -- the strongest correctness check ----------
+
+def test_make_train_step_matches_manual_recomposition(
+    fx_model, fx_states_prev, fx_observation, fx_control_input, fx_train_step_setup
+):
+    """train_step's fused/jitted computation must agree with calling the
+    exact same sequence of public methods by hand, eagerly, outside any
+    make_train_step machinery. This is the test that actually validates
+    the fusion didn't silently change what gets computed."""
+    param_optim, activity_optim, param_opt_state = fx_train_step_setup
+    n_infer_steps = 8
+    train_step = make_train_step(param_optim, activity_optim, n_infer_steps, fx_control_input)
+
+    fused_model, fused_opt_state, fused_states, fused_y_before, fused_y_after, fused_e_before, fused_e_after, _ = train_step(
+        fx_model, param_opt_state, fx_states_prev, fx_observation
+    )
+    manual_model, manual_opt_state, manual_states, manual_y_before, manual_y_after, manual_e_before, manual_e_after = _manual_train_step(
+        fx_model, param_optim, activity_optim, param_opt_state, fx_states_prev, fx_observation, fx_control_input, n_infer_steps
+    )
+
+    for f, m in zip(fused_states, manual_states):
+        assert_allclose(f, m, "states_curr: fused vs manual", atol=1e-4, rtol=1e-4)
+    assert_allclose(fused_y_before, manual_y_before, "y_hat_before: fused vs manual", atol=1e-4, rtol=1e-4)
+    assert_allclose(fused_y_after, manual_y_after, "y_hat_after: fused vs manual", atol=1e-4, rtol=1e-4)
+    assert_allclose(fused_e_before, manual_e_before, "energy_before: fused vs manual", atol=1e-4, rtol=1e-4)
+    assert_allclose(fused_e_after, manual_e_after, "energy_after: fused vs manual", atol=1e-4, rtol=1e-4)
+
+    fused_arrays = jax.tree_util.tree_leaves(eqx.filter(fused_model, eqx.is_array))
+    manual_arrays = jax.tree_util.tree_leaves(eqx.filter(manual_model, eqx.is_array))
+    for f, m in zip(fused_arrays, manual_arrays):
+        assert_allclose(f, m, "updated model weights: fused vs manual", atol=1e-4, rtol=1e-4)
+
+
+# ---- L5. return_layerwise must not perturb training dynamics --------------
+
+def test_make_train_step_return_layerwise_does_not_change_training_dynamics(
+    fx_model, fx_states_prev, fx_observation, fx_control_input, fx_train_step_setup
+):
+    """The two compiled traces (return_layerwise True/False) must agree on
+    everything except the trace itself -- return_layerwise is purely an
+    additional diagnostic readout, not a different computation path."""
+    param_optim, activity_optim, param_opt_state = fx_train_step_setup
+    train_step = make_train_step(param_optim, activity_optim, 8, fx_control_input)
+
+    result_false = train_step(fx_model, param_opt_state, fx_states_prev, fx_observation, return_layerwise=False)
+    result_true = train_step(fx_model, param_opt_state, fx_states_prev, fx_observation, return_layerwise=True)
+
+    for i, label in enumerate([
+        "model", "param_opt_state", "states_curr", "y_hat_before", "y_hat_after", "energy_before", "energy_after"
+    ]):
+        a = jax.tree_util.tree_leaves(result_false[i])
+        b = jax.tree_util.tree_leaves(result_true[i])
+        for la, lb in zip(a, b):
+            assert_allclose(la, lb, f"{label}: return_layerwise=False vs True", atol=1e-5, rtol=1e-5)
+
+    assert result_false[-1] is None
+    assert result_true[-1] is not None
+
+
+# ---- L6. Multi-step training-loop integration ------------------------------
+
+def test_make_train_step_multi_step_loop_threads_state_correctly(
+    fx_model, fx_control_input, fx_train_step_setup
+):
+    """Simulates a real training loop: repeatedly call train_step, threading
+    model/param_opt_state/states_curr through as the next call's inputs,
+    exactly as the documented usage pattern describes."""
+    param_optim, activity_optim, param_opt_state = fx_train_step_setup
+    train_step = make_train_step(param_optim, activity_optim, 6, fx_control_input)
+
+    model = fx_model
+    sizes = [FX_CONTROL_SIZE] + list(FX_HIDDEN_SIZES)
+    states_prev = [jr.normal(k, (n,)) for k, n in zip(jr.split(jr.key(500), len(sizes)), sizes)]
+
+    weight_snapshots = []
+    for i in range(5):
+        y = jr.normal(jr.fold_in(jr.key(501), i), (FX_OBS_SIZE,))
+        do_record = i % 2 == 0
+        model, param_opt_state, states_curr, y_hat_before, y_hat_after, e_before, e_after, e_trace = train_step(
+            model, param_opt_state, states_prev, y, return_layerwise=do_record
+        )
+        assert jnp.isfinite(e_before)
+        assert jnp.isfinite(e_after)
+        assert (e_trace is not None) == do_record
+        for s in states_curr:
+            assert jnp.all(jnp.isfinite(s))
+        weight_snapshots.append(jax.tree_util.tree_leaves(eqx.filter(model, eqx.is_array))[0].copy())
+        states_prev = states_curr  # thread forward, as the real loop does
+
+    # weights should have moved at every step (not stuck/frozen)
+    for a, b in zip(weight_snapshots[:-1], weight_snapshots[1:]):
+        assert not bool(jnp.array_equal(a, b))
+
+
+# ---- L7. n_infer_steps is actually wired to settle_scan --------------------
+
+def test_make_train_step_n_infer_steps_matches_settle_scan_n_steps(
+    fx_model, fx_states_prev, fx_observation, fx_control_input, fx_train_step_setup
+):
+    """states_curr returned by train_step (computed BEFORE the weight update)
+    must exactly match a direct model.settle_scan(..., n_steps=n_infer_steps)
+    call on the same, still-unmodified model -- confirms n_infer_steps is
+    genuinely passed through, not silently ignored or hardcoded."""
+    param_optim, activity_optim, param_opt_state = fx_train_step_setup
+    n_infer_steps = 11
+    train_step = make_train_step(param_optim, activity_optim, n_infer_steps, fx_control_input)
+
+    _, _, states_curr, *_ = train_step(fx_model, param_opt_state, fx_states_prev, fx_observation)
+    direct = fx_model.settle_scan(activity_optim, fx_states_prev, fx_observation, fx_control_input, n_steps=n_infer_steps)
+
+    for a, b in zip(states_curr, direct):
+        assert_allclose(a, b, "train_step's states_curr vs direct settle_scan(n_steps=n_infer_steps)", atol=1e-4, rtol=1e-4)
+
+
+def test_make_train_step_different_n_infer_steps_give_different_settled_states(
+    fx_model, fx_states_prev, fx_observation, fx_control_input, fx_train_step_setup
+):
+    param_optim, activity_optim, param_opt_state = fx_train_step_setup
+    train_step_short = make_train_step(param_optim, activity_optim, 2, fx_control_input)
+    train_step_long = make_train_step(param_optim, activity_optim, 40, fx_control_input)
+
+    _, _, states_short, *_ = train_step_short(fx_model, param_opt_state, fx_states_prev, fx_observation)
+    _, _, states_long, *_ = train_step_long(fx_model, param_opt_state, fx_states_prev, fx_observation)
+
+    assert any(
+        not bool(jnp.allclose(s, l, atol=1e-4, rtol=1e-4)) for s, l in zip(states_short, states_long)
+    )
+
+
+# ---- L8. control_input is genuinely used, not silently dropped ------------
+
+def test_make_train_step_control_input_actually_affects_predictions(
+    fx_model, fx_states_prev, fx_observation, fx_train_step_setup
+):
+    param_optim, activity_optim, param_opt_state = fx_train_step_setup
+    control_input = jr.normal(jr.key(502), (FX_INPUT_SIZE,))
+
+    train_step_with_input = make_train_step(param_optim, activity_optim, 8, control_input)
+    train_step_without_input = make_train_step(param_optim, activity_optim, 8, None)
+
+    _, _, _, y_before_with, *_ = train_step_with_input(fx_model, param_opt_state, fx_states_prev, fx_observation)
+    _, _, _, y_before_without, *_ = train_step_without_input(fx_model, param_opt_state, fx_states_prev, fx_observation)
+
+    assert not bool(jnp.allclose(y_before_with, y_before_without, atol=1e-4, rtol=1e-4))
+
+
+# ---- L9/L10. Edge cases: zero hidden layers, ce loss -----------------------
+
+def test_make_train_step_zero_hidden_layers():
+    model = TpchModel(control_layer_size=4, hidden_sizes=[], obs_size=5, key=jr.key(503), input_size=2)
+    param_optim = optax.adam(1e-3)
+    activity_optim = optax.adam(1e-2)
+    param_opt_state = param_optim.init(eqx.filter(model, eqx.is_array))
+    control_input = jr.normal(jr.key(504), (2,))
+    train_step = make_train_step(param_optim, activity_optim, 6, control_input)
+
+    states_prev = [jr.normal(jr.key(505), (4,))]
+    y = jr.normal(jr.key(506), (5,))
+    new_model, new_opt_state, states_curr, y_before, y_after, e_before, e_after, trace = train_step(
+        model, param_opt_state, states_prev, y, return_layerwise=True
+    )
+    assert len(states_curr) == 1
+    assert trace.shape == (6, 2)  # control + observation only
+    assert jnp.isfinite(e_after)
+
+
+def test_make_train_step_with_ce_loss():
+    model = TpchModel(
+        control_layer_size=FX_CONTROL_SIZE, hidden_sizes=FX_HIDDEN_SIZES, obs_size=FX_OBS_SIZE,
+        key=jr.key(507), input_size=FX_INPUT_SIZE, loss="ce",
+    )
+    param_optim = optax.adam(1e-3)
+    activity_optim = optax.adam(1e-2)
+    param_opt_state = param_optim.init(eqx.filter(model, eqx.is_array))
+    control_input = jr.normal(jr.key(508), (FX_INPUT_SIZE,))
+    train_step = make_train_step(param_optim, activity_optim, 8, control_input)
+
+    sizes = [FX_CONTROL_SIZE] + list(FX_HIDDEN_SIZES)
+    states_prev = [jr.normal(k, (n,)) for k, n in zip(jr.split(jr.key(509), len(sizes)), sizes)]
+    y = jax.nn.one_hot(2, FX_OBS_SIZE)
+
+    new_model, new_opt_state, states_curr, y_before, y_after, e_before, e_after, trace = train_step(
+        model, param_opt_state, states_prev, y
+    )
+    assert jnp.isfinite(e_before)
+    assert jnp.isfinite(e_after)
+    weight_before = jax.tree_util.tree_leaves(eqx.filter(model, eqx.is_array))[0]
+    weight_after = jax.tree_util.tree_leaves(eqx.filter(new_model, eqx.is_array))[0]
+    assert not bool(jnp.array_equal(weight_before, weight_after))
+
+
+
+
+
+# =============================================================================
+# M. make_train_run -- module-level factory (same reasoning as
+#    make_train_step: model/param_opt_state must be call-time arguments,
+#    not closed over, since both change every frame). Fuses settle+learn
+#    for `run_length` consecutive frames into ONE jax.lax.scan.
+#
+# The strongest tests here (M3, M5) check agreement against completely
+# independent references: M3 against make_train_step looped by hand (no
+# make_train_run involved at all), M5 against calling make_train_run
+# itself with a different run_length/call pattern over the same data --
+# i.e. the "goldilocks blocks == one big run" equivalence this function's
+# whole design rests on.
+# =============================================================================
+
+@pytest.fixture
+def fx_train_run_setup(fx_model):
+    param_optim = optax.adam(learning_rate=1e-3)
+    activity_optim = optax.adam(learning_rate=1e-2)
+    param_opt_state = param_optim.init(eqx.filter(fx_model, eqx.is_array))
+    return param_optim, activity_optim, param_opt_state
+
+
+def _fresh_states_prev(seed):
+    sizes = [FX_CONTROL_SIZE] + list(FX_HIDDEN_SIZES)
+    return [jr.normal(k, (n,)) for k, n in zip(jr.split(jr.key(seed), len(sizes)), sizes)]
+
+
+# ---- M1. Output contract ----------------------------------------------------
+
+def test_make_train_run_default_returns_none_energy_traces(fx_model, fx_control_input, fx_train_run_setup):
+    param_optim, activity_optim, param_opt_state = fx_train_run_setup
+    run_length = 5
+    train_run = make_train_run(param_optim, activity_optim, n_infer_steps=6, run_length=run_length, control_input=fx_control_input)
+
+    states_prev = _fresh_states_prev(600)
+    ys = jr.normal(jr.key(601), (run_length, FX_OBS_SIZE))
+
+    result = train_run(fx_model, param_opt_state, states_prev, ys)
+    assert len(result) == 8
+    model, opt_state, states_curr, y_before, y_after, energies_before, energies_after, energy_traces = result
+    assert energy_traces is None
+    assert len(states_curr) == len(states_prev)
+    assert y_before.shape == (run_length, FX_OBS_SIZE)
+    assert y_after.shape == (run_length, FX_OBS_SIZE)
+    assert energies_before.shape == (run_length,)
+    assert energies_after.shape == (run_length,)
+    assert jnp.all(jnp.isfinite(energies_before))
+    assert jnp.all(jnp.isfinite(energies_after))
+
+
+def test_make_train_run_return_layerwise_true_gives_correctly_shaped_traces(fx_model, fx_control_input, fx_train_run_setup):
+    param_optim, activity_optim, param_opt_state = fx_train_run_setup
+    run_length, n_infer_steps = 5, 7
+    train_run = make_train_run(param_optim, activity_optim, n_infer_steps, run_length=run_length, control_input=fx_control_input)
+
+    states_prev = _fresh_states_prev(602)
+    ys = jr.normal(jr.key(603), (run_length, FX_OBS_SIZE))
+
+    *_, energy_traces = train_run(fx_model, param_opt_state, states_prev, ys, return_layerwise=True)
+    assert energy_traces.shape == (run_length, n_infer_steps, len(FX_HIDDEN_SIZES) + 2)
+    assert jnp.all(jnp.isfinite(energy_traces))
+
+
+def test_make_train_run_weight_update_actually_changes_weights(fx_model, fx_control_input, fx_train_run_setup):
+    param_optim, activity_optim, param_opt_state = fx_train_run_setup
+    train_run = make_train_run(param_optim, activity_optim, n_infer_steps=6, run_length=4, control_input=fx_control_input)
+
+    states_prev = _fresh_states_prev(604)
+    ys = jr.normal(jr.key(605), (4, FX_OBS_SIZE))
+    new_model, *_ = train_run(fx_model, param_opt_state, states_prev, ys)
+
+    before = jax.tree_util.tree_leaves(eqx.filter(fx_model, eqx.is_array))
+    after = jax.tree_util.tree_leaves(eqx.filter(new_model, eqx.is_array))
+    assert any(not bool(jnp.array_equal(b, a)) for b, a in zip(before, after))
+    for leaf in after:
+        assert jnp.all(jnp.isfinite(leaf))
+
+
+# ---- M3. Manual recomposition via make_train_step, looped by hand ---------
+
+def test_make_train_run_matches_make_train_step_looped_manually(fx_model, fx_control_input, fx_train_run_setup):
+    """make_train_run's fused multi-frame scan must agree with calling
+    make_train_step (itself already independently verified) once per
+    frame in an ordinary Python loop -- completely independent of
+    make_train_run's own internals."""
+    param_optim, activity_optim, param_opt_state = fx_train_run_setup
+    n_infer_steps, run_length = 6, 5
+
+    states_prev = _fresh_states_prev(606)
+    ys = jr.normal(jr.key(607), (run_length, FX_OBS_SIZE))
+
+    # reference: make_train_step, looped by hand
+    train_step = make_train_step(param_optim, activity_optim, n_infer_steps, fx_control_input)
+    m, ops, sp = fx_model, param_opt_state, states_prev
+    ref_energies_before, ref_energies_after, ref_y_before, ref_y_after = [], [], [], []
+    for i in range(run_length):
+        m, ops, sp, y_bef, y_aft, e_before, e_after, _ = train_step(m, ops, sp, ys[i])
+        ref_energies_before.append(e_before)
+        ref_energies_after.append(e_after)
+        ref_y_before.append(y_bef)
+        ref_y_after.append(y_aft)
+
+    # fused
+    train_run = make_train_run(param_optim, activity_optim, n_infer_steps, run_length=run_length, control_input=fx_control_input)
+    fused_model, fused_ops, fused_sp, fused_y_before, fused_y_after, fused_energies_before, fused_energies_after, _ = train_run(
+        fx_model, param_opt_state, states_prev, ys
+    )
+
+    assert_allclose(fused_energies_before, jnp.stack(ref_energies_before), "energies_before: make_train_run vs looped make_train_step", atol=1e-4, rtol=1e-4)
+    assert_allclose(fused_energies_after, jnp.stack(ref_energies_after), "energies_after: make_train_run vs looped make_train_step", atol=1e-4, rtol=1e-4)
+    assert_allclose(fused_y_before, jnp.stack(ref_y_before), "y_hat_before: make_train_run vs looped make_train_step", atol=1e-4, rtol=1e-4)
+    assert_allclose(fused_y_after, jnp.stack(ref_y_after), "y_hat_after: make_train_run vs looped make_train_step", atol=1e-4, rtol=1e-4)
+    for f, r in zip(fused_sp, sp):
+        assert_allclose(f, r, "final states: make_train_run vs looped make_train_step", atol=1e-4, rtol=1e-4)
+
+    fused_weights = jax.tree_util.tree_leaves(eqx.filter(fused_model, eqx.is_array))
+    ref_weights = jax.tree_util.tree_leaves(eqx.filter(m, eqx.is_array))
+    for f, r in zip(fused_weights, ref_weights):
+        assert_allclose(f, r, "final weights: make_train_run vs looped make_train_step", atol=1e-4, rtol=1e-4)
+
+
+# ---- M4. return_layerwise must not perturb training dynamics --------------
+
+def test_make_train_run_return_layerwise_does_not_change_training_dynamics(fx_model, fx_control_input, fx_train_run_setup):
+    param_optim, activity_optim, param_opt_state = fx_train_run_setup
+    train_run = make_train_run(param_optim, activity_optim, n_infer_steps=6, run_length=4, control_input=fx_control_input)
+
+    states_prev = _fresh_states_prev(608)
+    ys = jr.normal(jr.key(609), (4, FX_OBS_SIZE))
+
+    out_false = train_run(fx_model, param_opt_state, states_prev, ys, return_layerwise=False)
+    out_true = train_run(fx_model, param_opt_state, states_prev, ys, return_layerwise=True)
+
+    for i, label in enumerate(["model", "param_opt_state", "states_curr", "y_hat_before", "y_hat_after", "energies_before", "energies_after"]):
+        a = jax.tree_util.tree_leaves(out_false[i])
+        b = jax.tree_util.tree_leaves(out_true[i])
+        for la, lb in zip(a, b):
+            assert_allclose(la, lb, f"{label}: return_layerwise False vs True", atol=1e-5, rtol=1e-5)
+
+    assert out_false[-1] is None
+    assert out_true[-1] is not None
+
+
+# ---- M5. Goldilocks blocks == one big run (the core design equivalence) ---
+
+def test_make_train_run_goldilocks_blocks_match_one_big_run(fx_model, fx_control_input, fx_train_run_setup):
+    """Calling train_run 3 times with run_length=3 (threading model/
+    opt_state/states_prev through, exactly the goldilocks usage pattern)
+    must produce the same final model/states as ONE call with
+    run_length=9 over the same 9 frames -- this is the actual property
+    that makes the goldilocks pattern trustworthy: splitting a run into
+    blocks for side effects must not change what gets computed."""
+    param_optim, activity_optim, param_opt_state = fx_train_run_setup
+    n_infer_steps = 5
+    block_len, n_blocks = 3, 3
+    total_len = block_len * n_blocks
+
+    states_prev0 = _fresh_states_prev(610)
+    all_ys = jr.normal(jr.key(611), (total_len, FX_OBS_SIZE))
+
+    # one big run
+    train_run_full = make_train_run(param_optim, activity_optim, n_infer_steps, run_length=total_len, control_input=fx_control_input)
+    full_model, full_opt_state, full_states, full_y_before, full_y_after, full_energies_before, full_energies_after, _ = train_run_full(
+        fx_model, param_opt_state, states_prev0, all_ys
+    )
+
+    # goldilocks blocks
+    train_run_block = make_train_run(param_optim, activity_optim, n_infer_steps, run_length=block_len, control_input=fx_control_input)
+    model, opt_state, states_prev = fx_model, param_opt_state, states_prev0
+    block_energies_before, block_energies_after = [], []
+    for b in range(n_blocks):
+        ys_block = all_ys[b * block_len:(b + 1) * block_len]
+        model, opt_state, states_prev, y_before, y_after, energies_before, energies_after, _ = train_run_block(model, opt_state, states_prev, ys_block)
+        block_energies_before.append(energies_before)
+        block_energies_after.append(energies_after)
+    block_energies_before = jnp.concatenate(block_energies_before)
+    block_energies_after = jnp.concatenate(block_energies_after)
+
+    assert_allclose(block_energies_before, full_energies_before, "energies_before: goldilocks blocks vs one big run", atol=1e-4, rtol=1e-4)
+    assert_allclose(block_energies_after, full_energies_after, "energies_after: goldilocks blocks vs one big run", atol=1e-4, rtol=1e-4)
+    for a, b in zip(states_prev, full_states):
+        assert_allclose(a, b, "final states: goldilocks blocks vs one big run", atol=1e-4, rtol=1e-4)
+    block_weights = jax.tree_util.tree_leaves(eqx.filter(model, eqx.is_array))
+    full_weights = jax.tree_util.tree_leaves(eqx.filter(full_model, eqx.is_array))
+    for a, b in zip(block_weights, full_weights):
+        assert_allclose(a, b, "final weights: goldilocks blocks vs one big run", atol=1e-4, rtol=1e-4)
+
+
+# ---- M6. n_infer_steps and run_length are genuinely wired, not hardcoded --
+
+def test_make_train_run_run_length_matches_scan_length(fx_model, fx_control_input, fx_train_run_setup):
+    param_optim, activity_optim, param_opt_state = fx_train_run_setup
+    states_prev = _fresh_states_prev(612)
+
+    for run_length in [1, 3, 7]:
+        train_run = make_train_run(param_optim, activity_optim, n_infer_steps=5, run_length=run_length, control_input=fx_control_input)
+        ys = jr.normal(jr.fold_in(jr.key(613), run_length), (run_length, FX_OBS_SIZE))
+        _, _, _, y_before, y_after, energies_before, energies_after, _ = train_run(fx_model, param_opt_state, states_prev, ys)
+        assert energies_before.shape == (run_length,)
+        assert energies_after.shape == (run_length,)
+        assert y_before.shape == (run_length, FX_OBS_SIZE)
+
+
+def test_make_train_run_different_n_infer_steps_give_different_settled_states(fx_model, fx_control_input, fx_train_run_setup):
+    param_optim, activity_optim, param_opt_state = fx_train_run_setup
+    states_prev = _fresh_states_prev(614)
+    ys = jr.normal(jr.key(615), (3, FX_OBS_SIZE))
+
+    train_run_short = make_train_run(param_optim, activity_optim, n_infer_steps=2, run_length=3, control_input=fx_control_input)
+    train_run_long = make_train_run(param_optim, activity_optim, n_infer_steps=30, run_length=3, control_input=fx_control_input)
+
+    _, _, states_short, *_ = train_run_short(fx_model, param_opt_state, states_prev, ys)
+    _, _, states_long, *_ = train_run_long(fx_model, param_opt_state, states_prev, ys)
+
+    assert any(not bool(jnp.allclose(s, l, atol=1e-4, rtol=1e-4)) for s, l in zip(states_short, states_long))
+
+
+# ---- M7. control_input is genuinely used ------------------------------------
+
+def test_make_train_run_control_input_actually_affects_predictions(fx_model, fx_train_run_setup):
+    param_optim, activity_optim, param_opt_state = fx_train_run_setup
+    states_prev = _fresh_states_prev(616)
+    ys = jr.normal(jr.key(617), (3, FX_OBS_SIZE))
+    control_input = jr.normal(jr.key(618), (FX_INPUT_SIZE,))
+
+    train_run_with = make_train_run(param_optim, activity_optim, n_infer_steps=5, run_length=3, control_input=control_input)
+    train_run_without = make_train_run(param_optim, activity_optim, n_infer_steps=5, run_length=3, control_input=None)
+
+    _, _, _, y_before_with, *_ = train_run_with(fx_model, param_opt_state, states_prev, ys)
+    _, _, _, y_before_without, *_ = train_run_without(fx_model, param_opt_state, states_prev, ys)
+
+    assert not bool(jnp.allclose(y_before_with, y_before_without, atol=1e-4, rtol=1e-4))
+
+
+# ---- M8/M9. Edge cases: zero hidden layers, ce loss ------------------------
+
+def test_make_train_run_zero_hidden_layers():
+    model = TpchModel(control_layer_size=4, hidden_sizes=[], obs_size=5, key=jr.key(619), input_size=2)
+    param_optim = optax.adam(1e-3)
+    activity_optim = optax.adam(1e-2)
+    param_opt_state = param_optim.init(eqx.filter(model, eqx.is_array))
+    control_input = jr.normal(jr.key(620), (2,))
+    run_length, n_infer_steps = 4, 6
+    train_run = make_train_run(param_optim, activity_optim, n_infer_steps, run_length=run_length, control_input=control_input)
+
+    states_prev = [jr.normal(jr.key(621), (4,))]
+    ys = jr.normal(jr.key(622), (run_length, 5))
+    new_model, new_opt_state, states_curr, y_before, y_after, energies_before, energies_after, energy_traces = train_run(
+        model, param_opt_state, states_prev, ys, return_layerwise=True
+    )
+    assert len(states_curr) == 1
+    assert energy_traces.shape == (run_length, n_infer_steps, 2)  # control + observation only
+    assert jnp.all(jnp.isfinite(energies_before))
+    assert jnp.all(jnp.isfinite(energies_after))
+
+
+def test_make_train_run_with_ce_loss():
+    model = TpchModel(
+        control_layer_size=FX_CONTROL_SIZE, hidden_sizes=FX_HIDDEN_SIZES, obs_size=FX_OBS_SIZE,
+        key=jr.key(623), input_size=FX_INPUT_SIZE, loss="ce",
+    )
+    param_optim = optax.adam(1e-3)
+    activity_optim = optax.adam(1e-2)
+    param_opt_state = param_optim.init(eqx.filter(model, eqx.is_array))
+    control_input = jr.normal(jr.key(624), (FX_INPUT_SIZE,))
+    run_length = 4
+    train_run = make_train_run(param_optim, activity_optim, n_infer_steps=6, run_length=run_length, control_input=control_input)
+
+    states_prev = _fresh_states_prev(625)
+    ys = jax.nn.one_hot(jnp.array([0, 1, 2, 0]), FX_OBS_SIZE)
+
+    new_model, new_opt_state, states_curr, y_before, y_after, energies_before, energies_after, _ = train_run(
+        model, param_opt_state, states_prev, ys
+    )
+    assert jnp.all(jnp.isfinite(energies_before))
+    assert jnp.all(jnp.isfinite(energies_after))
+    weight_before = jax.tree_util.tree_leaves(eqx.filter(model, eqx.is_array))[0]
+    weight_after = jax.tree_util.tree_leaves(eqx.filter(new_model, eqx.is_array))[0]
+    assert not bool(jnp.array_equal(weight_before, weight_after))

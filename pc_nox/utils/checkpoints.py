@@ -45,5 +45,25 @@ def load_metadata(path: str | Path) -> dict:
             checkpoint = TpchModel.load_checkpoint(path, optim=optim)
         """
         path = Path(path)
-        checkpoint = json.loads((path / "checkpoint.json").read_text())
-        return checkpoint["metadata"]
+
+        target = Path(path) / "checkpoint.json"
+
+        if not target.is_file():
+            raise FileNotFoundError(f"Checkpoint missing at {target}")
+
+        try:
+            with target.open("r", encoding="utf-8") as f:
+                checkpoint = json.load(f)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid or corrupted JSON in {target}: {e}") from e
+
+        metadata = checkpoint.get("metadata")
+        if metadata is None:
+            return {}
+        if not isinstance(metadata, dict):
+            raise TypeError(f"Expected 'metadata' to be a dict, got {type(metadata).__name__}")
+
+        # Explicit check for empty dictionary ({})
+        if not metadata:
+            raise ValueError("Metadata dictionary exists but is empty")
+        return metadata

@@ -79,6 +79,10 @@ class DummyModel(eqx.Module, ModelBase):
     def zero_activities(cls, config: DummyConfig):
         return [jnp.zeros(config.size)]
 
+    @classmethod
+    def layer_labels(cls, config: DummyConfig):
+        return ["only_layer"]
+
 
 class DummyModelNoActivities(eqx.Module, ModelBase):
     """Same as DummyModel but deliberately does NOT override zero_activities,
@@ -472,3 +476,38 @@ def test_subclass_missing_required_classvar_raises():
                 ...
 
 
+
+# =============================================================================
+# G. layer_labels() -- ModelBase's optional labelling hook, same
+#    default-raises / opt-in pattern as zero_activities (section E above).
+#    Deliberately mirrors that section's structure test-for-test.
+# =============================================================================
+
+def test_layer_labels_default_raises_for_unsupported_model():
+    """Direct check of the documented fallback behaviour on ModelBase
+    itself -- DummyModelNoActivities implements neither zero_activities
+    nor layer_labels, so it's reused here rather than adding a third dummy
+    class purely for this."""
+    with pytest.raises(NotImplementedError):
+        DummyModelNoActivities.layer_labels(DummyConfig(size=DUMMY_SIZE))
+
+
+def test_layer_labels_implemented_subclass_returns_expected():
+    assert DummyModel.layer_labels(DummyConfig(size=DUMMY_SIZE)) == ["only_layer"]
+
+
+def test_layer_labels_is_a_classmethod_not_requiring_an_instance():
+    """Matches zero_activities' contract: callable directly on the class
+    with just a config, no model instance constructed."""
+    assert DummyModel.layer_labels(DummyConfig(size=999)) == ["only_layer"]
+
+
+def test_layer_labels_real_tpch_model():
+    """Integration check: the actual TpchModel implementation, not just the
+    generic ModelBase contract against a dummy. Detailed correctness
+    (label content, ordering, edge cases) lives in tpch_test.py; this just
+    confirms the real subclass participates in the generic hook correctly."""
+    from models.tpch import TpchConfig
+    config = TpchConfig(control_layer_size=4, hidden_sizes=(3, 5), obs_size=6)
+    labels = TpchModel.layer_labels(config)
+    assert labels == ["Control", "Hidden 1", "Hidden 2", "Observation"]

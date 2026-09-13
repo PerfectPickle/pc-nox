@@ -450,7 +450,7 @@ class TpchModel(eqx.Module, ModelBase):
     #   - `_activity_reg` depends only on `states_curr`, so it contributes a
     #     real term to the *inference* gradient and an exact-zero term to
     #     the *weight* gradient.
-    #   - `_weight_l2_reg` / `_spectral_reg` depend only on `self`'s weights, so
+    #   - `_weight_l2_reg` / `_weight_orthogonal_reg` depend only on `self`'s weights, so
     #     they contribute a real term to the *learning* gradient and an
     #     exact-zero term to the *inference* gradient.
     # So it's correct -- not just convenient -- to add all three straight
@@ -561,6 +561,116 @@ class TpchModel(eqx.Module, ModelBase):
         return 0.5 * self.config.activity_decay * reg
 
 
+    # -------------------------------------------------------------------
+    # Layerwise regularisation (for `return_layerwise=True`) -- additive to
+    # everything above; `_weight_l2_reg`/`_weight_orthogonal_reg`/
+    # `_activity_reg` (the scalar totals used by the default, cached
+    # `weight_reg_total` path) are untouched, deliberately, since they're
+    # covered by strict atol=0.0 tests and float summation order matters
+    # for those.
+    #
+    # Why this is exact, not an approximation (see the earlier "divide by
+    # number of layers" discussion): weight_decay/orthogonal_penalty are
+    # each a SUM over a set of weight MATRICES, and every matrix has one
+    # unambiguous owning layer. Grouping matrices by owning layer before
+    # summing, instead of after, is exactly the same total (sum of sums ==
+    # sum of everything) -- just partitioned. activity_decay is already a
+    # sum over one term per state, i.e. already one-per-layer; no grouping
+    # needed at all.
+    # -------------------------------------------------------------------
+
+    def _weight_entries(self) -> List[Tuple[int, bool, Array]]:
+        """(owning_layer_idx, is_recurrent, weight) for every weight matrix
+        in the model. owning_layer_idx matches `layer_labels()`'s order:
+        0 = control, 1..num_hidden = hidden layers top-to-bottom,
+        num_hidden+1 = observation. Single source of truth for the
+        layerwise regularisers below, so "which weights count as
+        rec/ff" can't drift from `_rec_weights`/`_ff_weights`/`_all_weights`
+        (which remain independent and untouched -- this doesn't replace them).
+        """
+        entries = [(0, True, self.control_layer.W_rec.weight)]
+        if self.control_layer.has_input:
+            entries.append((0, False, self.control_layer.W_in.weight))
+        for i, layer in enumerate(self.hidden_layers, start=1):
+            entries += [
+                (i, True, layer.W_rec.weight),
+                (i, False, layer.W_parent_prev.weight),
+                (i, False, layer.W_parent_curr.weight),
+            ]
+        entries.append((len(self.hidden_layers) + 1, False, self.observation_layer.W_parent.weight))
+        return entries
+
+    def _weight_groups_for_scope(self, scope: str) -> List[List[Array]]:
+        """Weights selected by `scope` ('all' | 'rec' | 'ff'), grouped by
+        owning layer -- one sub-list per `layer_labels()` entry, possibly
+        empty (e.g. a layer with no weight selected under 'ff' if it has
+        no parent/input matrices). Same selection semantics as
+        `_weights_for_scope`, just partitioned instead of flattened.
+        """
+        num_groups = len(self.hidden_layers) + 2
+        groups = [[] for _ in range(num_groups)]
+        for layer_idx, is_rec, weight in self._weight_entries():
+            selected = scope == "all" or (scope == "rec" and is_rec) or (scope == "ff" and not is_rec)
+            if selected:
+                groups[layer_idx].append(weight)
+        return groups
+
+    def _weight_l2_reg_by_layer(self) -> Array:
+        """Per-layer breakdown of `_weight_l2_reg()`: shape (num_hidden+2,),
+        same order as `layer_labels()`. `jnp.sum(...)` of this exactly
+        equals `_weight_l2_reg()`'s scalar (same terms, just partitioned).
+        """
+        num_groups = len(self.hidden_layers) + 2
+        if self.config.weight_decay <= 0.:
+            return jnp.zeros(num_groups)
+        groups = self._weight_groups_for_scope(self.config.weight_decay_scope)
+        per_layer = [
+            0.5 * self.config.weight_decay * sum(jnp.sum(W ** 2) for W in group)
+            if group else jnp.asarray(0.0)
+            for group in groups
+        ]
+        return jnp.stack(per_layer)
+
+    def _weight_orthogonal_reg_by_layer(self) -> Array:
+        """Per-layer breakdown of `_weight_orthogonal_reg()`, same Gram-matrix
+        convention (narrow-side identity) applied per matrix, grouped by
+        owning layer instead of summed across the whole scope.
+        """
+        num_groups = len(self.hidden_layers) + 2
+        if self.config.orthogonal_penalty <= 0.:
+            return jnp.zeros(num_groups)
+        groups = self._weight_groups_for_scope(self.config.orthogonal_scope)
+        per_layer = []
+        for group in groups:
+            if not group:
+                per_layer.append(jnp.asarray(0.0))
+                continue
+            reg = jnp.asarray(0.0)
+            for W in group:
+                out_dim, in_dim = W.shape
+                dim = min(out_dim, in_dim)
+                gram = (W.T @ W) if in_dim <= out_dim else (W @ W.T)
+                reg = reg + jnp.sum((jnp.eye(dim) - gram) ** 2)
+            per_layer.append(0.5 * self.config.orthogonal_penalty * reg)
+        return jnp.stack(per_layer)
+
+    def _activity_reg_by_layer(self, states_curr: Activities) -> Array:
+        """Per-layer breakdown of the activity-regularisation term: shape
+        (len(states_curr),) -- NOT padded to num_hidden+2, since activity
+        regularisation has no observation-layer term (states_curr never
+        includes one). Callers combining this with the weight-reg
+        breakdowns above must pad with one trailing zero themselves (see
+        `tpch_energy_fn`).
+        """
+        if self.config.activity_decay <= 0.:
+            return jnp.zeros(len(states_curr))
+        if self.config.activity_reg_type == "l1":
+            per_layer = [0.5 * self.config.activity_decay * jnp.sum(jnp.abs(s)) for s in states_curr]
+        else:
+            per_layer = [0.5 * self.config.activity_decay * jnp.sum(s ** 2) for s in states_curr]
+        return jnp.stack(per_layer)
+
+
     def tpch_energy_fn(
         self,
         states_prev: Activities,
@@ -568,8 +678,12 @@ class TpchModel(eqx.Module, ModelBase):
         observation: Array,
         control_input: Optional[Array] = None,
         weight_reg_total: Optional[Array] = None,
+        return_layerwise: bool = False,
     ) -> Array:
-        """F_t = sum over every layer of 1/2 ||actual state - predicted state||^2,
+        """
+        Sum over every layer's energy, calculated with prediction errors.
+
+        F_t = sum over every layer of 1/2 ||actual state - predicted state||^2,
         plus the observation term 1/2 ||y_t - y_hat_t||^2 for `loss="mse"`,
         or the cross-entropy of `y_t` under logits `y_hat_t` for
         `loss="ce"`), plus any weight/orthogonal/activity regularisation
@@ -588,24 +702,58 @@ class TpchModel(eqx.Module, ModelBase):
         `n_steps` relaxation iterations. Leave as `None` (the default) to
         recompute fresh from `self` -- this is what `param_grad` and any
         one-off energy readout should do.
+
+        `return_layerwise`: if True, returns an unsummed Array of per-layer
+        energies instead of the total scalar -- one entry per element of
+        `states_curr` (top-to-bottom: control, then each hidden layer),
+        followed by one final entry for the observation term. Order matches
+        `TpchModel.layer_labels()`. Unlike an earlier version of this
+        method, regularisation IS included here, attributed exactly (not
+        approximated) to whichever layer's weights/activities produced it
+        -- see `_weight_l2_reg_by_layer`/`_weight_orthogonal_reg_by_layer`/
+        `_activity_reg_by_layer`. `jnp.sum(...)` of this array exactly
+        equals the summed-scalar output (`return_layerwise=False`) on the
+        same inputs. Mainly for diagnostics/plotting (e.g.
+        `plot_train_energies`), not for the inference/learning gradients,
+        which always use the summed scalar.
+
+        Args:
+            states_prev: Activities from previous state.
+            states_curr: Activities from current state.
+            observation: Current observation.
+            control_input: Optional control layer input.
+            weight_reg_total: Precalculated regularisation penalty to be added, else calculates weight reg automatically.
+            layerwise: Whether or not to return jnp stack of per layer energies, instead of the default total energy sum. Useful for diagnostics and visualisation.
+
         """
         predictions, y_hat = self.predict(states_prev, states_curr, control_input)
 
-        energy = jnp.asarray(0.0)
+        layer_energies = []
         for state, prediction in zip(states_curr, predictions):
             error = state - prediction
-            energy = energy + 0.5 * jnp.sum(error ** 2)
+            layer_energies.append(0.5 * jnp.sum(error ** 2))
 
         if self.config.loss == "mse":
             y_error = observation - y_hat
-            energy = energy + 0.5 * jnp.sum(y_error ** 2)
+            obs_energy = 0.5 * jnp.sum(y_error ** 2)
         else:  # "ce", validated in __init__
-            energy = energy - jnp.sum(observation * jax.nn.log_softmax(y_hat))
+            obs_energy = -jnp.sum(observation * jax.nn.log_softmax(y_hat))
+        layer_energies.append(obs_energy)
+
+        if return_layerwise:
+            weight_l2_by_layer = self._weight_l2_reg_by_layer()
+            weight_orth_by_layer = self._weight_orthogonal_reg_by_layer()
+            activity_by_layer = self._activity_reg_by_layer(states_curr)
+            # activity has no observation-layer term (states_curr never
+            # includes one) -- pad with one trailing zero to line up with
+            # the weight-reg breakdowns and layer_energies, which both do.
+            activity_by_layer = jnp.concatenate([activity_by_layer, jnp.zeros((1,), dtype=activity_by_layer.dtype)])
+            return jnp.stack(layer_energies) + weight_l2_by_layer + weight_orth_by_layer + activity_by_layer
 
         if weight_reg_total is None:
             weight_reg_total = self._weight_l2_reg() + self._weight_orthogonal_reg()
-        energy = energy + weight_reg_total + self._activity_reg(states_curr)
-        return energy
+        
+        return sum(layer_energies)+ weight_reg_total + self._activity_reg(states_curr)
 
 
 
@@ -790,7 +938,6 @@ class TpchModel(eqx.Module, ModelBase):
             states_prev, s, observation, control_input, weight_reg_total=weight_reg_total
         )
 
-
         def activity_step(carry, _):
             states_curr, opt_state = carry
             grads = jax.grad(energy_fn)(states_curr)  # positive grad -- see eqs. (20)-(21)
@@ -808,17 +955,50 @@ class TpchModel(eqx.Module, ModelBase):
         observation: Array,
         control_input: Optional[Array] = None,
         n_steps: int = 20,
+        return_layerwise: bool = False,
     ) -> Activities:
         """Scan-fused equivalent of `settle`: same feedforward init, but the
         relaxation loop runs as a single `jax.lax.scan` instead of a Python
         `for` loop.
+
+        `return_layerwise`: `make_activity_step`'s scan already records
+        `states_curr` at every step (its `ys` output). By default that
+        trajectory is thrown away and only the final `states_curr` is
+        returned, same signature as always. If `return_layerwise=True`,
+        it's additionally run back through `tpch_energy_fn(...,
+        return_layerwise=True)` via `vmap`, and this returns `(states_curr,
+        energy_trace)` instead, with `energy_trace` shape (n_steps,
+        num_layers+1) -- see `tpch_energy_fn`'s `return_layerwise` docstring
+        for the layer order -- for diagnostics/plotting (e.g.
+        `plot_train_energies`). Same pattern as `return_layerwise` on
+        `tpch_energy_fn` itself: one function, a bool flag decides what
+        comes back out, rather than a second near-duplicate method to
+        maintain. `return_layerwise` is a plain Python bool (resolved at
+        trace time under jit, like any other static flag), not a traced
+        value, so it's not something you'd toggle per-call inside a scan
+        or vmap -- decide it once when you call `settle_scan`.
+
+        Costs one extra `tpch_energy_fn(..., return_layerwise=True)`
+        evaluation per step when `return_layerwise=True` -- prefer the
+        default (`False`) as your per-step training call, and only pass
+        `return_layerwise=True` where you actually want the trace (e.g.
+        every `record_every`-th training iteration for logging).
         """
         states_curr0 = self.init_activities(states_prev, control_input)
         opt_state0 = activity_optim.init(states_curr0)
 
         activity_step = self.make_activity_step(activity_optim, states_prev, observation, control_input)
-        (states_curr, _), _ = jax.lax.scan(activity_step, (states_curr0, opt_state0), xs=None, length=n_steps)
-        return states_curr
+        (states_curr, _), states_hist = jax.lax.scan(activity_step, (states_curr0, opt_state0), xs=None, length=n_steps)
+        
+        if not return_layerwise:
+            return states_curr
+
+        energy_trace_fn = lambda s: self.tpch_energy_fn(
+            states_prev, s, observation, control_input, return_layerwise=True
+        )
+        # get energy trace from already processed states history
+        energy_trace = jax.vmap(energy_trace_fn)(states_hist)  # (n_steps, num_layers+1)
+        return states_curr, energy_trace
 
 
     def make_tpch_sequence_step(
@@ -846,6 +1026,7 @@ class TpchModel(eqx.Module, ModelBase):
         the whole sequence before a single weight update -- whichever fits
         your training regime.
         """
+        @eqx.filter_jit
         def sequence_step(states_prev, xy_t):
             control_input_t, observation_t = xy_t
             states_curr = self.settle_scan(
@@ -856,6 +1037,8 @@ class TpchModel(eqx.Module, ModelBase):
             return states_curr, (states_curr, energy_t)
 
         return sequence_step
+
+
 
 
     # =============================================================================
@@ -884,6 +1067,20 @@ class TpchModel(eqx.Module, ModelBase):
 
     
     @classmethod
+    def layer_labels(cls, config) -> List[str]:
+        """
+        Labels matching `tpch_energy_fn(..., return_layerwise=True)`'s output
+        order: control layer, then each hidden layer top-to-bottom, then
+        the observation/output term.
+        """
+        return (
+            ["Control"]
+            + [f"Hidden {i + 1}" for i in range(len(config.hidden_sizes))]
+            + ["Observation"]
+        )
+
+
+    @classmethod
     def zero_activities(cls, config: TpchConfig) -> Activities:
         """
         Builds activities skeleton for TpchModel loading.
@@ -892,3 +1089,198 @@ class TpchModel(eqx.Module, ModelBase):
         return [jnp.zeros(s) for s in sizes]
 
 
+
+# =============================================================================
+# 8. Training helpers
+# =============================================================================
+
+def make_train_step(param_optim: optax.GradientTransformation, activity_optim: optax.GradientTransformation, n_infer_steps: int, control_input: Optional[Array] = None):
+    """Builds one fully-jitted training step: settle -> log-quantities -> weight update.
+
+    The returned `train_step` is traced once per distinct `return_layerwise`
+    value on first use, then reused for every subsequent call with that same
+    value -- not re-traced per training iteration. Pass `return_layerwise=True`
+    on the iterations where you want a per-layer energy trace for
+    `plot_train_energies` (e.g. every `record_every`-th frame); the default
+    `False` path stays on its own, cheaper compiled trace the rest of the
+    time. This costs exactly two compiles total across a whole run (one per
+    value ever passed), not one per iteration.
+
+    Args:
+        param_optim: Optax transform used for the weight update (`param_grad`
+            -> `param_optim.update` -> `eqx.apply_updates`).
+        activity_optim: Optax transform used for the inference/settling loop,
+            passed straight through to `model.settle_scan`.
+        n_infer_steps: Number of relaxation steps per call, i.e. `settle_scan`'s
+            `n_steps`. Fixed at build time (not a `train_step` argument)
+            because it becomes `jax.lax.scan`'s `length=` internally, which
+            must be a concrete Python int known at trace time.
+        control_input: Optional control-layer input, constant for the whole
+            training run and closed over here rather than passed to
+            `train_step` each call. Pass an actual array instead of `None`
+            if it needs to vary per frame in your setup.
+
+    Returns:
+        train_step: A function with signature
+            `train_step(model, param_opt_state, states_prev, y, return_layerwise=False)`
+            -> `(model, param_opt_state, states_curr, y_hat_before, y_hat_after,
+            energy_before, energy_after, energy_trace)`, where:
+            - `model`: the model with one weight update applied.
+            - `param_opt_state`: updated optimizer state for `param_optim`.
+            - `states_curr`: the settled states, to pass back in as
+                `states_prev` for the next call.
+            - `y_hat_before`, `y_hat_after`: observation-layer predictions
+                from the pre- and post-inference states, using the
+                pre-update weights.
+            - `energy_before`, `energy_after`: scalar total energies at
+                those same two points.
+            - `energy_trace`: per-layer energy breakdown across all
+                `n_infer_steps` relaxation steps (shape `(n_infer_steps,
+                num_layers + 1)`, see `settle_scan`'s docstring for row/column
+                order) if `return_layerwise=True`, else `None`.
+    """
+    @eqx.filter_jit
+    def train_step(model: TpchModel, param_opt_state, states_prev, y, return_layerwise: bool = False):
+        states_curr_init = model.init_activities(states_prev, control_input)
+        _, y_hat_before = model.predict(states_prev, states_curr_init, control_input)
+        energy_before = model.tpch_energy_fn(states_prev, states_curr_init, y, control_input)
+
+        settle_result = model.settle_scan(
+            activity_optim, states_prev, y, control_input, n_steps=n_infer_steps, return_layerwise=return_layerwise
+        )
+        states_curr, energy_trace = settle_result if return_layerwise else (settle_result, None)
+
+        _, y_hat_after = model.predict(states_prev, states_curr, control_input)
+        energy_after = model.tpch_energy_fn(states_prev, states_curr, y, control_input)
+
+        grads = model.param_grad(states_prev, states_curr, y, control_input)
+        updates, param_opt_state = param_optim.update(grads, param_opt_state, model)
+        model = eqx.apply_updates(model, updates)
+
+        return model, param_opt_state, states_curr, y_hat_before, y_hat_after, energy_before, energy_after, energy_trace
+
+    return train_step
+
+
+def make_train_run(param_optim, activity_optim, n_infer_steps, run_length, control_input=None):
+    """Builds one fully-jitted, multi-frame training run: settle -> learn,
+    repeated for `run_length` consecutive frames, fused into a single
+    `jax.lax.scan` (and hence one JIT compile for the whole block) instead
+    of one `eqx.filter_jit` call per frame the way `make_train_step` works.
+
+    This is the same underlying computation as calling `make_train_step`'s
+    `train_step` in a Python loop `run_length` times, just fused so XLA
+    compiles and executes the whole block as one program -- verified to
+    produce identical energies, settled states, and updated weights.
+
+    Use this for two related patterns:
+      - A fully jitted whole-training-run: pass `run_length=len(frames)`
+        and call it once. Fastest option, at the cost of no side effects
+        (plotting, checkpointing) until the whole run finishes.
+        `y_hat_before`/`y_hat_after`/`energies_before`/`energies_after`/
+        `energy_traces` are all materialized for every frame
+        simultaneously, but each is cheap per frame (a prediction, a
+        scalar, and a handful of per-layer scalars respectively) --
+        device memory isn't the practical constraint here, the lack of
+        any way to checkpoint or inspect progress mid-run is.
+      - The "goldilocks" pattern: pass `run_length=record_every` and call
+        this repeatedly from an outer Python loop, doing plotting/
+        checkpointing in the gaps between calls (ordinary Python there --
+        `model` is a concrete value at that point, not a tracer). One
+        compile total (traced once, reused every block, same static-
+        argument caching as `make_train_step`), and memory stays bounded
+        by `run_length` rather than total training length.
+
+    Args:
+        param_optim: Optax transform used for the weight update at every
+            frame in the run.
+        activity_optim: Optax transform used for the inference/settling
+            loop at every frame, passed straight through to
+            `model.settle_scan`.
+        n_infer_steps: Number of relaxation steps per frame, i.e.
+            `settle_scan`'s `n_steps`. Fixed at build time, same reasoning
+            as `make_train_step`: it becomes part of a `jax.lax.scan`
+            `length=` internally (inside `settle_scan` itself), which must
+            be a concrete Python int known at trace time.
+        run_length: Number of frames processed per call to the returned
+            `train_run` -- the length of this function's own outer
+            `jax.lax.scan`. Also fixed at build time and for the same
+            reason. Set to the length of one `ys` block you'll pass in.
+        control_input: Optional control-layer input, constant for every
+            frame in the run and closed over here rather than passed to
+            `train_run` each call. Pass an actual array instead of `None`
+            if it needs to vary per frame in your setup.
+
+    Returns:
+        train_run: A function with signature
+            `train_run(model, param_opt_state, states_prev, ys, return_layerwise=False)`
+            -> `(model, param_opt_state, states_curr, y_hat_before,
+            y_hat_after, energies_before, energies_after, energy_traces)`,
+            where `ys` is an array of `run_length` observations (leading
+            axis = `run_length`), and:
+              - `model`: the model after `run_length` weight updates, one
+                per frame.
+              - `param_opt_state`: `param_optim`'s state after those updates.
+              - `states_curr`: the last frame's settled states, to pass
+                back in as `states_prev` for the next call.
+              - `y_hat_before`, `y_hat_after`: stacked per-frame
+                observation-layer predictions from the pre- and
+                post-inference states, shape `(run_length, obs_size)`,
+                using each frame's pre-update weights.
+              - `energies_before`, `energies_after`: stacked per-frame
+                scalar total energies at those same two points (pre-update
+                weights throughout), shape `(run_length,)` each -- exact
+                per-frame analogue of `make_train_step`'s `energy_before`/
+                `energy_after`, not to be confused with `energy_traces`
+                (below), which measures something related but distinct:
+                `energy_traces[i, 0]` is the energy after the FIRST
+                relaxation step, whereas `energies_before[i]` is measured
+                at zero relaxation steps (the raw feedforward guess) --
+                close but not the same quantity.
+              - `energy_traces`: per-frame, per-relaxation-step layerwise
+                energy breakdown if `return_layerwise=True` (shape
+                `(run_length, n_infer_steps, num_layers + 1)` -- one
+                scalar per layer per step per frame, see
+                `tpch_energy_fn`'s `return_layerwise` docstring for the
+                layer order -- cheap even for a whole training run, since
+                each entry is a single float, not a full state vector),
+                else `None`. Same call-time-bool pattern as
+                `make_train_step`: traced once per distinct value passed,
+                cached thereafter, so toggling it doesn't cost a retrace
+                per call. Realistically only useful at goldilocks-sized
+                `run_length` regardless of its own (small) cost, since
+                that's what periodic checkpointing/plotting already
+                requires -- there's no way to interrupt a `scan` mid-run
+                to look at it anyway.
+    """
+    @eqx.filter_jit
+    def train_run(model: TpchModel, param_opt_state, states_prev: Activities, ys: Array, return_layerwise: bool = False):
+        def step(carry, y_t):
+            model, param_opt_state, states_prev = carry
+
+            states_curr_init = model.init_activities(states_prev, control_input)
+            _, y_hat_before = model.predict(states_prev, states_curr_init, control_input)
+            energy_before_t = model.tpch_energy_fn(states_prev, states_curr_init, y_t, control_input)
+
+            settle_result = model.settle_scan(
+                activity_optim, states_prev, y_t, control_input, n_steps=n_infer_steps, return_layerwise=return_layerwise
+            )
+            states_curr, energy_trace_t = settle_result if return_layerwise else (settle_result, None)
+
+            _, y_hat_after = model.predict(states_prev, states_curr, control_input)
+            energy_after_t = model.tpch_energy_fn(states_prev, states_curr, y_t, control_input)
+
+            grads = model.param_grad(states_prev, states_curr, y_t, control_input)
+            updates, param_opt_state = param_optim.update(grads, param_opt_state, model)
+            model = eqx.apply_updates(model, updates)
+
+            return (model, param_opt_state, states_curr), (
+                y_hat_before, y_hat_after, energy_before_t, energy_after_t, energy_trace_t
+            )
+
+        (model, param_opt_state, states_curr), (y_hat_before, y_hat_after, energies_before, energies_after, energy_traces) = jax.lax.scan(
+            step, (model, param_opt_state, states_prev), xs=ys, length=run_length
+        )
+        return model, param_opt_state, states_curr, y_hat_before, y_hat_after, energies_before, energies_after, energy_traces
+
+    return train_run

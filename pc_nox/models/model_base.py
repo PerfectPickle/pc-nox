@@ -116,6 +116,29 @@ class ModelBase(ABC):
         )
 
 
+    @classmethod
+    def layer_labels(cls, config) -> List[str]:
+        """
+        Human-readable label for each entry of the per-layer energy array
+        returned by an energy fn's `return_layerwise=True` mode (e.g.
+        `TpchModel.tpch_energy_fn`). Order must match that array exactly.
+        Used by e.g. `plot_train_energies` to auto-label plots when a model
+        is passed in, instead of falling back to generic layer numbers.
+
+        Optional -- raises by default, same as `zero_activities`. Implement
+        it on a subclass to get auto-labelling for free wherever a
+        `model=` is accepted; it's fine to leave unimplemented and just
+        pass explicit labels instead.
+
+        Args:
+            config: Instance of this class's config_cls.
+        """
+        raise NotImplementedError(
+            f"{cls.__name__} does not support layer_labels "
+            f"(no layer_labels implementation)."
+        )
+
+
     # --- config vs. metadata ---
     # config:   anything that changes what the model COMPUTES. If reloading
     #           without this setting would give different energies/gradients/
@@ -177,6 +200,7 @@ class ModelBase(ABC):
             eqx.tree_serialise_leaves(path / "opt_state.eqx", opt_state)
         if activities is not None:
             eqx.tree_serialise_leaves(path / "activities.eqx", activities)
+        print(f"Saved checkpoint to {path}")
         return path
 
 

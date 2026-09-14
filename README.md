@@ -12,7 +12,7 @@ This library aims to provide easy to use [Equinox](https://github.com/patrick-ki
 
 * **Model Management**: Comprehensive save/load methods, supporting seamless training resumption irrespective of model type or training environment.
 * **Visual Prediction Plotting**: Compare ground truth to pre and post inference predictions in visual environments, with the option to save frames and video. 
-* **Flexible Inference & Training Modes**: Supports both step-by-step manual updates for granular control and debugging, as well as end-to-end jax.lax.scan fusion.
+* **Flexible Inference & Training Modes**: Supports both step-by-step manual updates for granular control and debugging, as well as end-to-end jax.lax.scan fusion, step by step or chunk by chunk.
 * **PyHGF Compatability**: Version matches (18/08/26) [pyHGF](https://github.com/ComputationalPsychiatry/pyhgf) shared dependencies for cross compatability. Compatability will be maintained.
 
 ## Planned Architectures
@@ -25,7 +25,6 @@ This library aims to provide easy to use [Equinox](https://github.com/patrick-ki
 
 * **Analytics**: More test metrics and visualisation methods.
 * **Additional Inference Modes**: Inference using ODE solvers.
-* **Flexible Training Modes**: Such as scan fused learning.
 
 
 ## Installation

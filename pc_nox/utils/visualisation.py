@@ -10,22 +10,13 @@ import imageio.v2 as imageio
 import os
 from matplotlib.lines import Line2D
 from matplotlib.collections import LineCollection
+import math
 
 
 
 ##
 ##################### Plot Energies ###########################
 ##
-
-import os
-import re
-import math
-
-import numpy as np
-import matplotlib.pyplot as plt
-import matplotlib.colors as mcolors
-from matplotlib.collections import LineCollection
-from matplotlib.lines import Line2D
 
 # A small set of hand-picked, maximally-distinguishable anchor hues
 # (based on matplotlib's tab10/tab20 qualitative families, which are
@@ -170,7 +161,7 @@ def _draw_overlay(ax, num_layers, energies, trace_lengths, colormaps, norm, iter
     ax.set_ylabel(ylabel, fontsize=18, labelpad=14)
 
 
-def _add_overlay_colorbar(fig, ax, norm, num_layers):
+def _add_overlay_colorbar(fig, ax, norm, num_layers, iteration_offset: int = 0):
     """
     Adds the "training iteration" colorbar for an overlay plot. When the
     legend is small enough to sit at "upper right" inside the axes (see
@@ -190,6 +181,13 @@ def _add_overlay_colorbar(fig, ax, norm, num_layers):
                              fraction=0.05, pad=0.03)
         cbar.set_label("Training iteration", fontsize=12, labelpad=8)
         cbar.ax.tick_params(labelsize=10)
+
+    # Offset iterations legend if desired (e.g. when resuming checkpoints)
+    if iteration_offset != 0:
+        ticks = cbar.get_ticks()
+        cbar.set_ticks(ticks)
+        cbar.set_ticklabels([f"{int(t + iteration_offset)}" for t in ticks])
+
     return cbar
 
 
@@ -212,6 +210,7 @@ def plot_train_energies(
     display: bool = True,
     dpi: int = 300,
     output_dir: str = "figures",
+    iteration_offset: int = 0,
 ):
     r"""
     Plots training energies (e.g. variational free energy) over inference
@@ -236,6 +235,9 @@ def plot_train_energies(
     display: bool, optional. If true, the plot is displayed using plt.show().
     dpi: int, optional. What dpi (resolution) to save the plots at.
     output_dir: str, optional. Directory under which plots are saved, if any of the `save_*` options are True. Default "figures".
+    iteration_offset: int, optional. Offset applied to the recorded training-iteration numbers. For example, if training is resumed from checkpoint at iteration 5000, set `iteration_offset=5000` 
+      so the first recorded iteration is plotted as 5000 rather than 0.
+      Does not affect the indexing or contents of `energies`. Default 0.
 
     Returns:
     None
@@ -336,7 +338,7 @@ def plot_train_energies(
         _draw_overlay(ax, num_layers, energies, trace_lengths, colormaps, norm, iter_positions,
                       layer_labels, ylabel)
         ax.tick_params(axis="both", which="major", labelsize=16)
-        _add_overlay_colorbar(fig, ax, norm, num_layers)
+        _add_overlay_colorbar(fig, ax, norm, num_layers, iteration_offset)
 
     if save_plot:
         os.makedirs(output_dir, exist_ok=True)
@@ -349,7 +351,7 @@ def plot_train_energies(
         _draw_overlay(overlay_ax, num_layers, energies, trace_lengths, colormaps, norm,
                       iter_positions, layer_labels, ylabel)
         overlay_ax.tick_params(axis="both", which="major", labelsize=16)
-        _add_overlay_colorbar(overlay_fig, overlay_ax, norm, num_layers)
+        _add_overlay_colorbar(overlay_fig, overlay_ax, norm, num_layers, iteration_offset)
         overlay_fig.savefig(os.path.join(output_dir, "train_energies_overlay.png"),
                              bbox_inches="tight", dpi=dpi)
         plt.close(overlay_fig)
@@ -378,7 +380,6 @@ def plot_train_energies(
 ##################### Save / plot / show prediction frame ###########################
 ##
 
-#TODO improve performance
 class VisualPredictionPlotter:
     """
     Reusable plotter for visual predictions — avoids re-creating the
@@ -524,6 +525,227 @@ class VisualPredictionPlotter:
         """
         plt.close(self.fig)
 
+
+##
+##################### Efficient Environment & Prediction Recording  ###########################
+##
+"""
+Idea: accumulate predictions in memory during training (cheap - no device
+sync happens on append), flush a batch to disk at the same cadence as your
+model checkpoints (one batched device->host transfer + one disk write per
+flush, instead of one of each per frame), then reconstruct the usual
+combined/separate PNGs + videos *after* training using the existing
+VisualPredictionPlotter, where matplotlib's per-frame cost no longer
+matters.
+ 
+    recorder = PredictionRecorder(output_dir="visual_predictions_raw")
+    for i, y in enumerate(frames):
+        ...
+        recorder.append(y=y, prior_pred=y_hat_before, posterior_pred=y_hat_after,
+                         inference_steps_made=NUM_INFERENCE_STEPS, frame_number=i)
+        if i % CHECKPOINT_INTERVAL == 0 or i == last_i:
+            model.save_checkpoint(...)
+            recorder.flush()   # <- same cadence as the model checkpoint
+ 
+    replay_recordings("visual_predictions_raw", output_shape=(ENV_HEIGHT, ENV_WIDTH),
+                       output_dir="visual_predictions", total_frames=N_TRAIN_ITERS)
+    compile_videos_from_frames(output_dir="visual_predictions")
+"""
+
+ 
+class PredictionRecorder:
+    """
+    Buffers prediction blocks as JAX-array references and periodically flushes
+    everything accumulated since the last flush as a single .npz chunk.
+
+    Both single-frame and block-based recording are supported:
+
+        recorder.append(...)
+        recorder.append_block(...)
+
+    Internally everything is stored as blocks, and flush() concatenates those
+    blocks along the leading frame axis before doing the single device->host
+    transfer and disk write.
+    """
+
+    def __init__(self, output_dir="visual_predictions_raw"):
+        self.output_dir = output_dir
+        os.makedirs(output_dir, exist_ok=True)
+        self._reset_buffer()
+
+    def _reset_buffer(self):
+        self._y_blocks = []
+        self._prior_blocks = []
+        self._posterior_blocks = []
+        self._frame_number_blocks = []
+        self._inference_step_blocks = []
+
+    def append(
+        self,
+        y,
+        prior_pred,
+        posterior_pred,
+        inference_steps_made,
+        frame_number,
+    ):
+        """
+        Record a single frame.
+
+        This is a thin wrapper around append_block(), so the single-frame
+        training loop remains compatible with the block-based recorder.
+        """
+        self.append_block(
+            y=jnp.expand_dims(y, axis=0),
+            prior_pred=jnp.expand_dims(prior_pred, axis=0),
+            posterior_pred=jnp.expand_dims(posterior_pred, axis=0),
+            inference_steps_made=[inference_steps_made],
+            frame_numbers=[frame_number],
+        )
+
+    def append_block(
+        self,
+        y,
+        prior_pred,
+        posterior_pred,
+        inference_steps_made,
+        frame_numbers,
+    ):
+        """
+        Record an entire scan block.
+
+        Expected shapes:
+
+            y:              (block_len, ...)
+            prior_pred:     (block_len, ...)
+            posterior_pred: (block_len, ...)
+
+        `inference_steps_made` may be either:
+
+            - a single integer, applied to every frame in the block
+            - an array/list of length block_len
+
+        `frame_numbers` must contain one frame number per frame.
+        """
+        block_len = len(frame_numbers)
+
+        if y.shape[0] != block_len:
+            raise ValueError(
+                f"y has {y.shape[0]} frames but frame_numbers has "
+                f"{block_len} entries"
+            )
+
+        if prior_pred.shape[0] != block_len:
+            raise ValueError(
+                f"prior_pred has {prior_pred.shape[0]} frames but frame_numbers "
+                f"has {block_len} entries"
+            )
+
+        if posterior_pred.shape[0] != block_len:
+            raise ValueError(
+                f"posterior_pred has {posterior_pred.shape[0]} frames but "
+                f"frame_numbers has {block_len} entries"
+            )
+
+        # Allow one scalar inference-step count for the whole block.
+        if np.isscalar(inference_steps_made):
+            inference_steps = [inference_steps_made] * block_len
+        else:
+            inference_steps = list(inference_steps_made)
+
+            if len(inference_steps) != block_len:
+                raise ValueError(
+                    f"inference_steps_made has {len(inference_steps)} entries "
+                    f"but frame_numbers has {block_len} entries"
+                )
+
+        self._y_blocks.append(y)
+        self._prior_blocks.append(prior_pred)
+        self._posterior_blocks.append(posterior_pred)
+        self._frame_number_blocks.append(np.asarray(frame_numbers))
+        self._inference_step_blocks.append(np.asarray(inference_steps))
+
+
+    def flush(self):
+        """
+        Concatenate all buffered blocks and write one .npz chunk.
+
+        There is one batched device->host transfer per prediction field and
+        one disk write for the entire accumulated buffer.
+        """
+        if not self._frame_number_blocks:
+            return
+
+        # Concatenate blocks along the frame axis.
+        y_stack = np.asarray(jnp.concatenate(self._y_blocks, axis=0))
+        prior_stack = np.asarray(
+            jnp.concatenate(self._prior_blocks, axis=0)
+        )
+        posterior_stack = np.asarray(
+            jnp.concatenate(self._posterior_blocks, axis=0)
+        )
+
+        frame_numbers = np.concatenate(self._frame_number_blocks)
+        inference_steps = np.concatenate(self._inference_step_blocks)
+
+        lo = int(frame_numbers[0])
+        hi = int(frame_numbers[-1])
+
+        chunk_path = os.path.join(
+            self.output_dir,
+            f"chunk_{lo:07d}_{hi:07d}.npz",
+        )
+
+        np.savez(
+            chunk_path,
+            y=y_stack,
+            prior_pred=prior_stack,
+            posterior_pred=posterior_stack,
+            frame_numbers=frame_numbers,
+            inference_steps=inference_steps,
+        )
+
+        self._reset_buffer()
+ 
+ 
+def replay_recordings(recordings_dir, output_shape, output_dir="visual_predictions",
+                       total_frames=None, **plotter_kwargs):
+    """
+    Offline pass: loads chunks written by PredictionRecorder, in order,
+    and feeds each frame through VisualPredictionPlotter.update() exactly
+    as the training loop would have - so the resulting combined/ and
+    per-field/ folders match what real-time plotting would have produced.
+    Runs after training, so matplotlib's per-frame cost is irrelevant here.
+ 
+    Any extra keyword args (save_separate=True, show_combined=True, etc.)
+    are forwarded straight to VisualPredictionPlotter.update().
+    """
+    chunk_paths = sorted(glob.glob(os.path.join(recordings_dir, "chunk_*.npz")))
+    if not chunk_paths:
+        print(f"No chunks found in {recordings_dir}")
+        return
+ 
+    if total_frames is None:
+        last_chunk = np.load(chunk_paths[-1])
+        total_frames = int(last_chunk["frame_numbers"][-1]) + 1
+ 
+    plotter = VisualPredictionPlotter(output_shape=output_shape)
+    try:
+        for path in chunk_paths:
+            data = np.load(path)
+            for i in range(len(data["frame_numbers"])):
+                plotter.update(
+                    y=data["y"][i],
+                    prior_pred=data["prior_pred"][i],
+                    posterior_pred=data["posterior_pred"][i],
+                    inference_steps_made=int(data["inference_steps"][i]),
+                    frame_number=int(data["frame_numbers"][i]),
+                    total_frames=total_frames,
+                    output_dir=output_dir,
+                    **plotter_kwargs,
+                )
+    finally:
+        plotter.close()
+ 
 
 ##
 ##################### Save videos from saved frames ###########################

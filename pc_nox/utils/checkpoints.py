@@ -63,7 +63,4 @@ def load_metadata(path: str | Path) -> dict:
         if not isinstance(metadata, dict):
             raise TypeError(f"Expected 'metadata' to be a dict, got {type(metadata).__name__}")
 
-        # Explicit check for empty dictionary ({})
-        if not metadata:
-            raise ValueError("Metadata dictionary exists but is empty")
         return metadata

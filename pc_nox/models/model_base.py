@@ -152,13 +152,14 @@ class ModelBase(ABC):
     #           to know any of this on its own -- only the training loop does,
     #           at the moment save_checkpoint() is called. Freeform, caller-
     #           supplied, never affects what the model computes.
-    def save_checkpoint(self, *, path: str | Path | None = None, config=None, metadata=None, opt_state=None, activities=None) -> Path:
+    def save_checkpoint(self, *, path: str | Path | None = None, root: str | Path | None = None, config=None, metadata=None, opt_state=None, activities=None) -> Path:
         """
         Save model checkpoint.
 
         Args:
             config: Dataclass object containing all information necessary to reconstruct the model, such as variables describing network shape.
-            path: Directory to save checkpoint files into.
+            path: Specific directory to save checkpoint files into.
+            root: Directory to make checkpoint dirs in (only used if no explicit path provided).
             metadata: Dictionary containing any other relevant information, such as optim type, learning rates, last frame processed, env type, etc.
             opt_state: OptState of Optax parameter optimiser.
             activities: Latent states, for smooth resumption of inference in temporal models.
@@ -179,8 +180,9 @@ class ModelBase(ABC):
 
         # generate dynamic default path if no path is provided
         if path is None:
+            root = Path(root) if root else Path("checkpoints")
             timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-            path = Path(f"checkpoints/{timestamp}")
+            path = Path(root / timestamp)
         else:
             path = Path(path)
 

@@ -44,13 +44,17 @@ Trade-off Summary
   fused `jax.lax.scan` execution (`make_train_run`).
 """
 
-from pc_nox.utils.visualisation import VisualPredictionPlotter, compile_videos_from_frames, plot_train_energies
+import imageio.v2 as imageio
+raw_frames = imageio.mimread("example_env.mp4", memtest=False) # read this before importing JAX, to avoid os.fork() issues
+import warnings
+warnings.filterwarnings("ignore", category=RuntimeWarning, message=".*os.fork.*") # to ignore compile_videos() warning
+
+from pc_nox.utils.visualisation import compile_videos_from_frames, plot_train_energies, PredictionRecorder, replay_recordings
 from pc_nox.models.tpch import TpchModel, make_train_step
 import jax.random as jr
 import jax.numpy as jnp
 import equinox as eqx
 import optax
-import imageio.v2 as imageio
 import numpy as np
 import time
 
@@ -65,6 +69,11 @@ CHECKPOINT_INTERVAL = 100
 
 # for plotting
 RECORD_ENERGIES = True
+
+# where the raw jax arrays get stored during inference/training
+PREDICTIONS_RECORDING_DIR = "visual_predictions_raw"
+# where the reconstructed visual predictions get saved to
+PREDICTIONS_DIR = "visual_predictions"
 
 # Matching example_env.mp4
 ENV_WIDTH = 16 # pixels
@@ -97,7 +106,6 @@ metadata = {
     "ENV_HEIGHT": ENV_HEIGHT
 }
 
-raw_frames = imageio.mimread("example_env.mp4", memtest=False)
 frames = np.stack(raw_frames)
 if frames.ndim == 4 and frames.shape[-1] in (3, 4):  # Convert RGB(A) to grayscale
     frames = np.mean(frames[..., :3], axis=-1)
@@ -130,7 +138,7 @@ states_prev = [
     for k, size in zip(jr.split(prev_key, 1 + len(HIDDEN_SHAPE)), [CONTROL_WIDTH] + HIDDEN_SHAPE)
 ]
 
-prediction_plotter = VisualPredictionPlotter(output_shape=(ENV_HEIGHT, ENV_WIDTH))
+recorder = PredictionRecorder(output_dir="visual_predictions_raw")
 train_step = make_train_step(param_optim, activity_optim, NUM_INFERENCE_STEPS, control_input)
 energies = []
 
@@ -147,26 +155,18 @@ for i, y in enumerate(frames[0:N_TRAIN_ITERS]):
     if RECORD_ENERGIES:
         energies.append(energy_trace.T)
 
-    print(f"{i}. VFE before inference: {energy_before}")
-    print(f"{i}. VFE after inference: {energy_after}")
-
+    recorder.append(
+    y=y, prior_pred=y_hat_before, posterior_pred=y_hat_after,
+    inference_steps_made=NUM_INFERENCE_STEPS, frame_number=i,
+    )
     if i % CHECKPOINT_INTERVAL == 0 or i == (N_TRAIN_ITERS - 1):
+        print(f"{i}. VFE before inference: {energy_before}")
+        print(f"{i}. VFE after inference: {energy_after}")
         metadata["last_frame_processed"] = i
         model.save_checkpoint(opt_state=param_opt_state, activities=states_curr, metadata=metadata)
-
-    # plot predictions before and after settling
-    prediction_plotter.update(
-        y=y, 
-        prior_pred=y_hat_before, 
-        posterior_pred=y_hat_after, 
-        inference_steps_made=NUM_INFERENCE_STEPS, 
-        frame_number=i, 
-        show_combined=False,
-        save_combined=True,
-        save_separate=False,
-        output_dir="visual_predictions",
-        total_frames=N_TRAIN_ITERS, # for 0 padding in file names
-    )
+        # Flush the prediction recorder to disk for later replaying / reconstruction
+        recorder.flush()
+        print(f"Save raw y predictions to {PREDICTIONS_RECORDING_DIR}")
 
     # Pass settled states as previous states for step t + 1
     states_prev = states_curr
@@ -181,8 +181,7 @@ if total_frames_processed > 0:
     print(f"\nProcessed {total_frames_processed} frames in {int(mins)}m {secs:.2f}s")
     print(f"Average speed: {avg_ms_per_frame:.2f} ms/frame ({fps:.2f} FPS)\n")
 
-prediction_plotter.close()
-
+print("Plotting train energies...")
 plot_train_energies(
     energies, 
     model=model, 
@@ -194,4 +193,14 @@ plot_train_energies(
     display=False,
     grid_threshold=8
     )
-compile_videos_from_frames(output_dir="visual_predictions")
+
+print("Reconstructing and saving prediction plots...")
+# replay and save frames as pngs, needed for compile_videos_from_frames() call below
+replay_recordings(
+    recordings_dir=PREDICTIONS_RECORDING_DIR, 
+    output_shape=(ENV_HEIGHT, ENV_WIDTH),
+    total_frames=len(frames),
+    output_dir=PREDICTIONS_DIR,
+    save_separate=True
+    )
+compile_videos_from_frames(output_dir=PREDICTIONS_DIR)

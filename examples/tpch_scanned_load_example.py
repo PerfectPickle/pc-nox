@@ -1,4 +1,84 @@
-from pc_nox.utils.visualisation import VisualPredictionPlotter, compile_videos_from_frames, plot_train_energies
+"""Block-scanned training of a Temporal Predictive Coding hierarchy using `make_train_run`.
+
+Demonstrates a checkpoint-resuming, block-based execution workflow for continuing
+training of a temporal predictive coding model (`TpchModel`) on sequential video
+data. Unlike the interactive per-frame implementation based on `make_train_step`,
+this script groups consecutive frames into fixed-length scan blocks and executes
+each block through a JIT-compiled `jax.lax.scan`-style training runner. This approach
+reduces Python-side dispatch overhead and improves throughput while retaining
+block-level checkpointing, prediction recording, energy tracking, and post-training
+visualization.
+
+## Key Workflow Phases
+
+1. Checkpoint & Model Restoration
+
+   * Locates the latest `tpch` checkpoint and loads its associated metadata.
+   * Reconstructs the parameter and activity optimizers from the saved configuration.
+   * Restores the trained `TpchModel`, latent activities, and parameter optimizer state.
+   * Resumes processing from the frame immediately following the last frame recorded
+     in the checkpoint metadata.
+
+2. Data Ingestion & Preprocessing
+
+   * Loads the complete input video (`example_env.mp4`) into memory.
+   * Converts RGB/RGBA frames to grayscale and normalizes pixel values to [0.0, 1.0].
+   * Flattens each frame's spatial dimensions into a vector matching the observation
+     layer of the predictive coding hierarchy.
+
+3. Block-Scanned Training
+
+   * Divides the remaining training sequence into fixed-length blocks defined by
+     `SCAN_BLOCK_LENGTH`.
+   * Executes inference and parameter learning for each block through `make_train_run`.
+   * Performs `NUM_INFERENCE_STEPS` activity-settling iterations for every frame
+     within the scanned block.
+   * Carries the final settled activities from each block forward as the initial
+     state for the next block.
+   * Creates a temporary scan runner for the final partial block when fewer than
+     `SCAN_BLOCK_LENGTH` frames remain.
+
+4. Block-Level Recording & Checkpointing
+
+   * Records target observations together with prior and posterior predictions for
+     every frame in each processed block using `PredictionRecorder.append_block`.
+   * Saves a checkpoint after every block containing the updated model, optimizer
+     state, activities, and latest processed-frame metadata.
+   * Flushes recorded prediction data to disk after each block so that recordings
+     remain available for later reconstruction and replay.
+
+5. Energy Tracking & Performance Diagnostics
+
+   * Collects per-frame, per-layer inference energy traces from each scanned block.
+   * Computes and reports mean VFE before settling, mean VFE after settling, and
+     the corresponding energy reduction for each block.
+   * Measures total wall-clock training time, average milliseconds per processed
+     frame, and effective frames per second.
+   * Aggregates recorded energy traces for subsequent layerwise visualization.
+
+6. Post-Training Visualization
+
+   * Generates layerwise training-energy plots from the accumulated inference traces.
+   * Replays raw prediction recordings to reconstruct image-space prediction frames.
+   * Compiles the reconstructed prediction frames into output video files.
+
+## Trade-off Summary
+
+* Pros: Lower Python dispatch overhead than per-frame execution; efficient vectorized
+  block processing; regular checkpointing; prediction recording remains recoverable
+  between blocks; preserves detailed per-frame energy traces within each scanned block.
+* Cons: Less fine-grained Python-side control during execution than `make_train_step`;
+  individual frames inside a scan block cannot be inspected or acted upon until the
+  block completes; prediction and energy data are retained at block granularity
+  during the training loop.
+  """
+
+import imageio.v2 as imageio
+raw_frames = imageio.mimread("example_env.mp4", memtest=False) # read this before importing JAX, to avoid os.fork() issues
+import warnings
+warnings.filterwarnings("ignore", category=RuntimeWarning, message=".*os.fork.*") # to ignore compile_videos() warning
+
+from pc_nox.utils.visualisation import VisualPredictionPlotter, compile_videos_from_frames, plot_train_energies, PredictionRecorder, replay_recordings
 from pc_nox.models.tpch import TpchModel, make_train_step, make_train_run
 from pc_nox.utils.optim_registry import build_optim
 from pc_nox.utils.checkpoints import find_latest_checkpoint, load_metadata
@@ -6,10 +86,8 @@ import jax.random as jr
 import jax.numpy as jnp
 import equinox as eqx
 import optax
-import imageio.v2 as imageio
 import numpy as np
 import time
-
 
 # Number of settling iterations
 NUM_INFERENCE_STEPS = 50
@@ -22,6 +100,11 @@ SCAN_BLOCK_LENGTH = 250
 
 # for plotting
 RECORD_ENERGIES = True
+
+# where the raw jax arrays get stored during inference/training
+PREDICTIONS_RECORDING_DIR = "visual_predictions_raw-load"
+# where the reconstructed visual predictions get saved to
+PREDICTIONS_DIR = "visual_predictions-load"
 
 control_input = None
 
@@ -40,7 +123,6 @@ param_opt_state = loaded_checkpoint.opt_state
 ENV_WIDTH = metadata["ENV_WIDTH"]
 ENV_HEIGHT = metadata["ENV_HEIGHT"]
 
-raw_frames = imageio.mimread("example_env.mp4", memtest=False)
 frames = np.stack(raw_frames)
 if frames.ndim == 4 and frames.shape[-1] in (3, 4):  # Convert RGB(A) to grayscale
     frames = np.mean(frames[..., :3], axis=-1)
@@ -55,7 +137,8 @@ key = jr.PRNGKey(0)
 model_key, data_key = jr.split(key)
 
 
-prediction_plotter = VisualPredictionPlotter(output_shape=(ENV_HEIGHT, ENV_WIDTH))
+
+recorder = PredictionRecorder(output_dir=PREDICTIONS_RECORDING_DIR)
 train_run_block = make_train_run(param_optim, activity_optim, NUM_INFERENCE_STEPS, run_length=SCAN_BLOCK_LENGTH, control_input=control_input)
 all_energy_traces = []
 all_energies_before = []
@@ -68,7 +151,9 @@ END_FRAME_IDX = min(START_FRAME_IDX + N_TRAIN_ITERS, len(frames))
 start_time = time.perf_counter()
 total_frames_processed = 0
 
-for block_start in range(START_FRAME_IDX, len(frames), SCAN_BLOCK_LENGTH):
+
+for block_start in range(START_FRAME_IDX, END_FRAME_IDX, SCAN_BLOCK_LENGTH):
+    print("-----")
     print(f"Now training block starting at index {block_start}...")
     ys_block = frames[block_start : block_start + SCAN_BLOCK_LENGTH]
     current_block_len = len(ys_block)
@@ -88,9 +173,26 @@ for block_start in range(START_FRAME_IDX, len(frames), SCAN_BLOCK_LENGTH):
     )
 
     total_frames_processed += len(ys_block)
+
+    # Record every frame from this block.
+    frame_numbers = np.arange(
+        block_start,
+        block_start + current_block_len,
+    )
+    # Record raw y, y_hat_before,y_hat_after
+    recorder.append_block(
+        y=ys_block,
+        prior_pred=y_before,
+        posterior_pred=y_after,
+        inference_steps_made=NUM_INFERENCE_STEPS,
+        frame_numbers=frame_numbers,
+    )
     # save checkpoint
     metadata["last_frame_processed"] = block_start + len(ys_block) - 1
     model.save_checkpoint(path=f"checkpoints/step_{block_start}", metadata=metadata, opt_state=param_opt_state, activities=states_prev)
+
+    # Flush the prediction recorder to disk for later replaying / reconstruction
+    recorder.flush()
 
     # Energy plotting
     if RECORD_ENERGIES:
@@ -101,20 +203,6 @@ for block_start in range(START_FRAME_IDX, len(frames), SCAN_BLOCK_LENGTH):
         for frame_trace in np.asarray(energy_traces):
             all_energy_traces.append(frame_trace.T)
             
-    n_frames = len(frames)
-    for j, i in enumerate(range(block_start, block_start + SCAN_BLOCK_LENGTH)):
-        prediction_plotter.update(
-            ys_block[j], 
-            y_before[j], 
-            y_after[j], 
-            NUM_INFERENCE_STEPS, 
-            frame_number=i, 
-            show_combined=False,
-            save_combined=True,
-            save_separate=False,
-            total_frames=n_frames,
-            output_dir="visual_predictions4",
-            )
 
     # All calculations happen vectorized
     eb = np.asarray(energies_before)
@@ -127,13 +215,10 @@ for block_start in range(START_FRAME_IDX, len(frames), SCAN_BLOCK_LENGTH):
     print(f"Mean VFE Before: {eb.mean():.4f}")
     print(f"Mean VFE After:  {ea.mean():.4f}")
     print(f"Mean Energy Drop (Δ): {deltas.mean():.4f}")
-    print("-----")
 
 
 # Stop the stopwatch
 total_elapsed = time.perf_counter() - start_time
-
-prediction_plotter.close()
 
 # Concatenate into single 1D arrays of shape (num_blocks * run_length,)
 all_energies_before = np.concatenate(all_energies_before)
@@ -155,7 +240,7 @@ if total_frames_processed > 0:
     print(f"\nProcessed {total_frames_processed} frames in {int(mins)}m {secs:.2f}s")
     print(f"Average speed: {avg_ms_per_frame:.2f} ms/frame ({fps:.2f} FPS)\n")
 
-
+print("Plotting train energies...")
 plot_train_energies(
     all_energy_traces, 
     model=model, 
@@ -165,6 +250,16 @@ plot_train_energies(
     save_individual=True,
     save_overlay=True,
     display=False,
-    grid_threshold=8
+    grid_threshold=8,
+    iteration_offset=START_FRAME_IDX
     )
-compile_videos_from_frames(output_dir="visual_predictions4")
+
+print("Reconstructing and saving prediction plots...")
+# replay and save frames as pngs, needed for compile_videos_from_frames() call below
+replay_recordings(
+    recordings_dir=PREDICTIONS_RECORDING_DIR, 
+    output_shape=(ENV_HEIGHT, ENV_WIDTH),
+    total_frames=len(frames),
+    output_dir=PREDICTIONS_DIR
+    )
+compile_videos_from_frames(output_dir=PREDICTIONS_DIR)

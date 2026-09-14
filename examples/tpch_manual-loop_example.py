@@ -137,7 +137,7 @@ for i, y in enumerate(frames):
     print(f"{i}. VFE before inference: {energy_before}")
     print(f"{i}. VFE after inference: {energy_after_inference}")
 
-    # plot predictions before and after settling
+    # Plot predictions before and after settling. Significant performance hit, better to use PredictionRecorder and plot frames predictions after training / inference.
     prediction_plotter.update(
         y=y, 
         prior_pred=y_hat_before, 

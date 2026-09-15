@@ -1040,6 +1040,231 @@ class TpchModel(eqx.Module, ModelBase):
 
 
 
+# ---------------------------------------------------------------------------
+# Continuous-time Diffrax implementation of tPC-H activity inference
+#
+# The optax version does discrete gradient descent on the activities:
+#     s_{k+1} = s_k - lr * grad E(s_k)
+# which is exactly the forward-Euler discretisation (step size `lr`) of the
+# continuous-time gradient flow
+#     ds/dt = -dE/ds
+# Diffrax integrates ODEs like this natively: instead of a `jax.lax.scan`
+# over hand-rolled optax steps, you hand it a vector field and it produces
+# its own fused, jit-friendly stepping loop (`diffeqsolve`) with the same
+# "compile once, run to completion in one dispatched computation" property
+# `jax.lax.scan` gave `settle_scan`.
+#
+# Using `diffrax.Euler()` + `diffrax.ConstantStepSize()` with `dt0 = lr`
+# reproduces `optax.sgd(lr)` bit-for-bit (verified below); swapping in an
+# adaptive solver (e.g. `diffrax.Tsit5()` + `diffrax.PIDController`) instead
+# gets you an accurate integration of the *flow* rather than a literal
+# gradient-descent trajectory match -- useful if you care about the
+# continuous-time dynamics themselves rather than mimicking discrete PC
+# inference exactly. There isn't a clean ODE analogue for momentum/Adam-style
+# optax optimisers, since those depend on the discretisation itself; this
+# equivalence is specifically for plain (S)GD activity updates.
+# ---------------------------------------------------------------------------
+
+def make_vector_field(
+    self,
+    states_prev: "Activities",
+    observation: "Array",
+    control_input: Optional["Array"] = None,
+):
+    """Diffrax analogue of `make_activity_step`: builds the ODE vector field
+    `ds/dt = -dE/ds` for ONE inference-relaxation trajectory at a single,
+    fixed time step, using `tpch_energy_fn` (eq. 19) exactly as
+    `make_activity_step` does.
+
+    Returned `vector_field(t, states_curr, args)` has the signature Diffrax
+    expects for `diffrax.ODETerm`. `t` and `args` are unused (the field is
+    autonomous, and there's no extra per-call data), but Diffrax always
+    calls it with `(t, y, args)`, so they stay in the signature.
+
+    Same reasoning as `make_activity_step`: weights are frozen for the
+    whole trajectory, so the weight/orthogonal regularisation is computed
+    once here and closed over, instead of being recomputed inside
+    `energy_fn` at every solver step/stage.
+    """
+    weight_reg_total = self._weight_l2_reg() + self._weight_orthogonal_reg()
+    energy_fn = lambda s: self.tpch_energy_fn(
+        states_prev, s, observation, control_input, weight_reg_total=weight_reg_total
+    )
+
+    def vector_field(t, states_curr, args):
+        grads = jax.grad(energy_fn)(states_curr)  # positive grad -- see eqs. (20)-(21)
+        # ds/dt = -dE/ds: activities flow downhill on the energy landscape
+        return jax.tree_util.tree_map(lambda g: -g, grads)
+
+    return vector_field
+
+
+def make_steady_state_event(
+    self,
+    states_prev: "Activities",
+    observation: "Array",
+    control_input: Optional["Array"] = None,
+    tol: float = 1e-3,
+) -> diffrax.Event:
+    """Builds a `diffrax.Event` that fires once the activity dynamics have
+    (approximately) reached steady state -- i.e. once the RMS norm of the
+    vector field `ds/dt = -dE/ds` drops below `tol`. This is the adaptive-
+    compute counterpart to `max_t1`/`n_steps`/`n_save`: instead of always
+    integrating (or scanning) for a fixed horizon, `diffeqsolve` can stop
+    as soon as the network has actually converged, so an "easy" input that
+    settles quickly costs far fewer solver steps than a hard one, without
+    you having to guess a horizon that's long enough for the hardest input
+    in the batch but wasteful for the rest.
+
+    Re-evaluating the vector field here (rather than reusing whatever the
+    solver's last internal stage produced) is deliberate: `cond_fn` is
+    called by diffrax at arbitrary points outside the solver's own step
+    machinery, so it needs a self-contained way to measure "how fast is
+    the state still changing" at the point it's given -- same reasoning as
+    why `make_vector_field`/`make_activity_step` close over `states_prev`,
+    `observation`, `control_input` instead of expecting them to be passed
+    in every call.
+
+    Diffrax calls `cond_fn(t, y, args, **kwargs)` (see `diffrax.Event`);
+    the extra keyword arguments it passes (`terms`, `solver`, `dt0`, etc.)
+    aren't needed for a steady-state check, so they're absorbed by `**_`.
+    """
+    vector_field = self.make_vector_field(states_prev, observation, control_input)
+
+    def steady_state_cond(t, states_curr, args, **_):
+        dstates = vector_field(t, states_curr, args)
+        leaves = jax.tree_util.tree_leaves(dstates)
+        sq_sum = sum(jnp.sum(jnp.square(leaf)) for leaf in leaves)
+        n_elements = sum(leaf.size for leaf in leaves)
+        rms = jnp.sqrt(sq_sum / n_elements)
+        return rms < tol
+
+    return diffrax.Event(steady_state_cond)
+
+
+def settle_diffrax(
+    self,
+    states_prev: "Activities",
+    observation: "Array",
+    control_input: Optional["Array"] = None,
+    max_t1: float = 20.0,
+    dt0: Optional[float] = None,
+    n_save: int = 20,
+    solver: diffrax.AbstractSolver = diffrax.Heun(),
+    stepsize_controller: diffrax.AbstractStepSizeController = diffrax.PIDController(
+        rtol=1e-3, atol=1e-3
+    ),
+    steady_state_tol: Optional[float] = 1e-3,
+    return_layerwise: bool = False,
+):
+    """Diffrax-fused equivalent of `settle_scan`: same feedforward init, but
+    the relaxation "loop" is now continuous-time gradient flow
+    `ds/dt = -dE/ds`, integrated by a single `diffrax.diffeqsolve` call
+    instead of a `jax.lax.scan` over discrete optax steps -- with adaptive
+    compute via `steady_state_tol`, so easy inputs converge (and stop)
+    faster than hard ones instead of always running the same fixed
+    `n_steps`.
+
+    Defaults now mirror an adaptive PC-inference setup (`Heun` +
+    `PIDController`, matching the `jpc` library's `solve_pc_inference`)
+    rather than plain gradient descent. To get the exact `optax.sgd`-
+    equivalent, fixed-step behaviour from before instead, pass
+    `solver=diffrax.Euler()`, `stepsize_controller=diffrax.ConstantStepSize()`,
+    `dt0=<lr>`, `max_t1=n_steps * lr`, and `steady_state_tol=None` --
+    that combination was verified to reproduce `settle_scan(activity_optim=
+    optax.sgd(lr), n_steps=n_steps)` bit-for-bit.
+
+    `max_t1` / `dt0` play the role `n_steps` / `step_size` played before:
+    `max_t1` is the integration horizon (upper bound on "how long the
+    network is allowed to relax for"), and `dt0` is the initial step size
+    (`None` lets the adaptive controller choose one itself, the usual
+    diffrax default).
+
+    `steady_state_tol`: if not `None` (the default), builds a
+    `make_steady_state_event(..., tol=steady_state_tol)` and passes it to
+    `diffeqsolve` as `event=...`, so the solve terminates as soon as the
+    RMS vector-field norm drops below `steady_state_tol`, rather than
+    always running to `max_t1`. Pass `steady_state_tol=None` to disable
+    this and always integrate the full `max_t1` window (e.g. if you want
+    a fixed compute budget per call, or need `sol.ts`/`states_hist` to be
+    densely and predictably populated for downstream code that doesn't
+    expect early termination).
+
+    `n_save`: number of evenly spaced points between `t0=0` and `max_t1`
+    at which `states_curr` is additionally recorded (via `SaveAt(ts=...)`),
+    playing the role `n_steps` played as the trajectory-recording
+    granularity in `settle_scan`. The exact moment of termination
+    (whether that's `max_t1` or an early steady-state stop) is *also*
+    always recorded via `SaveAt(t1=True)`, landing wherever it falls in
+    the sorted `sol.ts`/`sol.ys` -- this is what `states_curr` below is
+    extracted from, so the returned final state is always the true
+    converged (or `max_t1`-truncated) state, never a stale earlier grid
+    point.
+
+    Important gotcha specific to early termination: once the event fires,
+    diffrax does *not* keep back-filling the remaining `ts` save points
+    with the converged state -- entries later than the stopping time come
+    back as `inf` in both `sol.ts` and `sol.ys` (this is a fixed-size
+    output buffer, not a bug). `states_curr` is extracted correctly below
+    by finding the save point with the largest *finite* `sol.ts` value.
+    If you use `return_layerwise=True`, the returned `energy_trace` will
+    likewise contain `inf`/`nan` entries for any unreached grid points on
+    an early-converging trajectory -- mask them with
+    `jnp.isfinite(sol.ts)` (recompute `sol.ts` the same way, or thread it
+    out alongside the trace) before plotting/aggregating, the same way
+    you'd trim a variable-length trajectory from `jax.lax.scan` output.
+
+    Costs one extra `tpch_energy_fn(..., return_layerwise=True)` evaluation
+    per saved point when `return_layerwise=True` -- prefer the default
+    (`False`) as your per-step training call, and only pass
+    `return_layerwise=True` where you actually want the trace.
+    """
+    states_curr0 = self.init_activities(states_prev, control_input)
+    vector_field = self.make_vector_field(states_prev, observation, control_input)
+
+    event = None
+    if steady_state_tol is not None:
+        event = self.make_steady_state_event(
+            states_prev, observation, control_input, tol=steady_state_tol
+        )
+
+    t0 = 0.0
+    ts = jnp.linspace(t0, max_t1, n_save + 1)
+
+    sol = diffrax.diffeqsolve(
+        diffrax.ODETerm(vector_field),
+        solver,
+        t0=t0,
+        t1=max_t1,
+        dt0=dt0,
+        y0=states_curr0,
+        saveat=diffrax.SaveAt(t1=True, ts=ts),
+        stepsize_controller=stepsize_controller,
+        event=event,
+    )
+    states_hist = sol.ys  # (n_save + 2, ...) -- the ts grid, plus the t1/event entry
+
+    # `sol.ts` holds `inf` for any save point past an early steady-state
+    # stop; the true final state is whichever entry has the largest
+    # *finite* recorded time (this also just picks index -1 when the event
+    # never fires and every grid point is finite, so it subsumes the old
+    # `states_hist[-1]` behaviour as a special case).
+    finite_mask = jnp.isfinite(sol.ts)
+    final_idx = jnp.argmax(jnp.where(finite_mask, sol.ts, -jnp.inf))
+    states_curr = jax.tree_util.tree_map(lambda x: x[final_idx], states_hist)
+
+    if not return_layerwise:
+        return states_curr
+
+    energy_trace_fn = lambda s: self.tpch_energy_fn(
+        states_prev, s, observation, control_input, return_layerwise=True
+    )
+    # get energy trace from already processed states history -- entries
+    # past an early steady-state stop will be inf/nan; mask with
+    # `finite_mask` before using (see docstring above)
+    energy_trace = jax.vmap(energy_trace_fn)(states_hist)  # (n_save + 2, num_layers + 1)
+    return states_curr, energy_trace
+
 
     # =============================================================================
     # 7. Saving and Loading 

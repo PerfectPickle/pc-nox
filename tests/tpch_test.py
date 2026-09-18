@@ -1,4 +1,7 @@
-from models.tpch import TpchModel, TpchConfig, TpchControlLayer, TpchHiddenLayer, TpchObservationLayer, make_train_step, make_train_run
+from models.tpch import (
+    TpchModel, TpchConfig, TpchControlLayer, TpchHiddenLayer, TpchObservationLayer,
+    make_train_step, make_train_run, make_train_step_diffrax, make_train_run_diffrax,
+)
 import equinox as eqx
 import jax
 import jax.random as jr
@@ -7,6 +10,7 @@ from jaxtyping import Array, PRNGKeyArray, PyTree
 import pytest
 from typing import Callable, List, Sequence, Tuple, Optional
 import optax
+import diffrax
 
 # =============================================================================
 # manual gradient functions implemented by me, to test energy function correctness
@@ -2370,3 +2374,951 @@ def test_make_train_run_with_ce_loss():
     weight_before = jax.tree_util.tree_leaves(eqx.filter(model, eqx.is_array))[0]
     weight_after = jax.tree_util.tree_leaves(eqx.filter(new_model, eqx.is_array))[0]
     assert not bool(jnp.array_equal(weight_before, weight_after))
+
+
+# =============================================================================
+# N. TpchModel Diffrax methods -- make_vector_field, make_steady_state_event,
+#    settle_diffrax. These are TpchModel methods (like settle_scan), fusing
+#    the relaxation loop into a single diffrax.diffeqsolve call instead of a
+#    jax.lax.scan over discrete optax steps.
+#
+# The strongest test here (N4) is the one the module docstring itself
+# promises: settle_diffrax in Mode 2 (fixed horizon) with solver=Euler(),
+# stepsize_controller=ConstantStepSize(), dt0=lr, max_t1=n_steps*lr,
+# steady_state_tol=None must reproduce settle_scan(optax.sgd(lr),
+# n_steps=n_steps) to floating point precision -- checked directly against
+# settle_scan (and, separately, the plain for-loop settle()) here, completely
+# independent of settle_diffrax's own diffeqsolve internals.
+# =============================================================================
+
+# ---- N1. make_vector_field ---------------------------------------------------
+
+def test_make_vector_field_matches_neg_activity_grad(fx_model, fx_states_prev, fx_control_input, fx_observation):
+    """make_vector_field's ds/dt = -dE/ds is exactly neg_activity_grad's
+    formula -- same computation, just packaged as a diffrax-callable
+    (t, y, args) -> dy/dt instead of a one-shot call."""
+    states_curr = fx_model.init_activities(fx_states_prev, fx_control_input)
+    vector_field = fx_model.make_vector_field(fx_states_prev, fx_observation, fx_control_input)
+    dstates = vector_field(0.0, states_curr, None)
+    ref = fx_model.neg_activity_grad(states_curr, fx_states_prev, fx_observation, fx_control_input)
+    for a, b in zip(dstates, ref):
+        assert_allclose(a, b, "make_vector_field vs neg_activity_grad", atol=1e-5, rtol=1e-5)
+
+
+def test_make_vector_field_shapes_match_states(fx_model, fx_states_prev, fx_control_input, fx_observation):
+    states_curr = fx_model.init_activities(fx_states_prev, fx_control_input)
+    vector_field = fx_model.make_vector_field(fx_states_prev, fx_observation, fx_control_input)
+    dstates = vector_field(0.0, states_curr, None)
+    assert len(dstates) == len(states_curr)
+    for d, s in zip(dstates, states_curr):
+        assert d.shape == s.shape
+
+
+def test_make_vector_field_is_autonomous(fx_model, fx_states_prev, fx_control_input, fx_observation):
+    """The field has no explicit time-dependence -- t is accepted (diffrax's
+    calling convention requires it) but must not change the output."""
+    states_curr = fx_model.init_activities(fx_states_prev, fx_control_input)
+    vector_field = fx_model.make_vector_field(fx_states_prev, fx_observation, fx_control_input)
+    out_t0 = vector_field(0.0, states_curr, None)
+    out_t5 = vector_field(5.0, states_curr, None)
+    for a, b in zip(out_t0, out_t5):
+        assert_allclose(a, b, "vector_field(t=0) vs vector_field(t=5)", atol=0.0, rtol=0.0)
+
+
+def test_make_vector_field_ignores_args(fx_model, fx_states_prev, fx_control_input, fx_observation):
+    states_curr = fx_model.init_activities(fx_states_prev, fx_control_input)
+    vector_field = fx_model.make_vector_field(fx_states_prev, fx_observation, fx_control_input)
+    out_none = vector_field(0.0, states_curr, None)
+    out_other = vector_field(0.0, states_curr, "unused")
+    for a, b in zip(out_none, out_other):
+        assert_allclose(a, b, "vector_field args=None vs args='unused'", atol=0.0, rtol=0.0)
+
+
+# ---- N2. make_steady_state_event ---------------------------------------------
+
+def test_make_steady_state_event_returns_diffrax_event(fx_model, fx_states_prev, fx_control_input, fx_observation):
+    event = fx_model.make_steady_state_event(fx_states_prev, fx_observation, fx_control_input, tol=1e-3)
+    assert isinstance(event, diffrax.Event)
+
+
+def test_steady_state_event_fires_when_tol_exceeds_rms(fx_model, fx_states_prev, fx_control_input, fx_observation):
+    """A tol comfortably above the actual RMS vector-field norm at a point
+    must report 'converged' there; a tol comfortably below it must not --
+    checked against an independently recomputed RMS, not against
+    make_vector_field's own internals."""
+    states_curr = fx_model.init_activities(fx_states_prev, fx_control_input)
+    vector_field = fx_model.make_vector_field(fx_states_prev, fx_observation, fx_control_input)
+    dstates = vector_field(0.0, states_curr, None)
+    leaves = jax.tree_util.tree_leaves(dstates)
+    sq_sum = sum(jnp.sum(l ** 2) for l in leaves)
+    n_elements = sum(l.size for l in leaves)
+    rms = float(jnp.sqrt(sq_sum / n_elements))
+    assert rms > 0.0  # sanity: the fixture point isn't already a fixed point
+
+    loose_event = fx_model.make_steady_state_event(fx_states_prev, fx_observation, fx_control_input, tol=rms * 2)
+    tight_event = fx_model.make_steady_state_event(fx_states_prev, fx_observation, fx_control_input, tol=rms * 0.5)
+    assert bool(loose_event.cond_fn(0.0, states_curr, None)) is True
+    assert bool(tight_event.cond_fn(0.0, states_curr, None)) is False
+
+
+# ---- N3. settle_diffrax -- default output contract ----------------------------
+
+def test_settle_diffrax_default_returns_activities_only(fx_model, fx_states_prev, fx_control_input, fx_observation):
+    """Same contract as settle_scan's default: just states_curr, not a tuple."""
+    result = fx_model.settle_diffrax(fx_states_prev, fx_observation, fx_control_input, max_t1=5.0)
+    assert isinstance(result, list)
+    assert len(result) == len(fx_states_prev)
+    for s, sp in zip(result, fx_states_prev):
+        assert s.shape == sp.shape
+        assert jnp.all(jnp.isfinite(s))
+
+
+# ---- N4. Mode 2 (fixed horizon, fixed step) reproduces settle_scan(sgd) ------
+
+def test_settle_diffrax_euler_mode2_matches_settle_scan_sgd(fx_model, fx_states_prev, fx_control_input, fx_observation):
+    """The exact equivalence settle_diffrax's docstring promises: Euler solver
+    + ConstantStepSize + dt0=lr + max_t1=n_steps*lr + steady_state_tol=None
+    must reproduce settle_scan(optax.sgd(lr), n_steps=n_steps), since both are
+    literally forward-Euler descent on the same energy with the same step."""
+    lr, n_steps = 0.05, 30
+    settled_scan = fx_model.settle_scan(
+        optax.sgd(learning_rate=lr), fx_states_prev, fx_observation, fx_control_input, n_steps=n_steps
+    )
+    settled_diffrax = fx_model.settle_diffrax(
+        fx_states_prev, fx_observation, fx_control_input,
+        max_t1=n_steps * lr, dt0=lr,
+        solver=diffrax.Euler(), stepsize_controller=diffrax.ConstantStepSize(),
+        steady_state_tol=None,
+    )
+    for a, b in zip(settled_scan, settled_diffrax):
+        assert_allclose(a, b, "settle_scan(sgd) vs settle_diffrax(Euler, fixed-step, Mode 2)", atol=1e-5, rtol=1e-5)
+
+
+def test_settle_diffrax_mode2_also_matches_settle_for_loop(fx_model, fx_states_prev, fx_control_input, fx_observation):
+    """Same equivalence, but against the plain Python for-loop settle() (the
+    un-fused ground truth), independent of settle_scan's own scan machinery."""
+    lr, n_steps = 0.05, 30
+    settled = fx_model.settle(fx_states_prev, fx_observation, fx_control_input, n_steps=n_steps, state_lr=lr)
+    settled_diffrax = fx_model.settle_diffrax(
+        fx_states_prev, fx_observation, fx_control_input,
+        max_t1=n_steps * lr, dt0=lr,
+        solver=diffrax.Euler(), stepsize_controller=diffrax.ConstantStepSize(),
+        steady_state_tol=None,
+    )
+    for a, b in zip(settled, settled_diffrax):
+        assert_allclose(a, b, "settle() vs settle_diffrax(Euler, fixed-step, Mode 2)", atol=1e-5, rtol=1e-5)
+
+
+# ---- N5. Mode 1 (event-based) converges towards a lower-energy state --------
+
+def test_settle_diffrax_mode1_reduces_energy_below_feedforward_init(fx_model, fx_states_prev, fx_control_input, fx_observation):
+    init_guess = fx_model.init_activities(fx_states_prev, fx_control_input)
+    energy_before = fx_model.tpch_energy_fn(fx_states_prev, init_guess, fx_observation, fx_control_input)
+
+    settled = fx_model.settle_diffrax(
+        fx_states_prev, fx_observation, fx_control_input, max_t1=20.0, steady_state_tol=1e-3,
+    )
+    energy_after = fx_model.tpch_energy_fn(fx_states_prev, settled, fx_observation, fx_control_input)
+
+    assert jnp.isfinite(energy_after)
+    assert energy_after <= energy_before + 1e-6
+
+
+def test_settle_diffrax_default_kwargs_resolve_to_heun_and_pid(fx_model, fx_states_prev, fx_control_input, fx_observation):
+    """solver=None / stepsize_controller=None must resolve to the documented
+    defaults (Heun + PIDController(rtol=1e-3, atol=1e-3)) -- checked by
+    confirming the implicit-None call agrees exactly with an explicit call
+    using those same objects."""
+    explicit = fx_model.settle_diffrax(
+        fx_states_prev, fx_observation, fx_control_input, max_t1=10.0,
+        solver=diffrax.Heun(), stepsize_controller=diffrax.PIDController(rtol=1e-3, atol=1e-3),
+        steady_state_tol=1e-3,
+    )
+    implicit = fx_model.settle_diffrax(
+        fx_states_prev, fx_observation, fx_control_input, max_t1=10.0, steady_state_tol=1e-3,
+    )
+    for a, b in zip(explicit, implicit):
+        assert_allclose(a, b, "settle_diffrax defaults vs explicit Heun/PIDController", atol=0.0, rtol=0.0)
+
+
+# ---- N6. return_layerwise / ts contract --------------------------------------
+
+def test_settle_diffrax_return_layerwise_shapes(fx_model, fx_states_prev, fx_control_input, fx_observation):
+    n_save = 10
+    states_curr, trace, ts = fx_model.settle_diffrax(
+        fx_states_prev, fx_observation, fx_control_input, max_t1=20.0, n_save=n_save,
+        steady_state_tol=1e-2, return_layerwise=True,
+    )
+    assert trace.shape == (n_save + 2, len(fx_states_prev) + 1)
+    assert ts.shape == (n_save + 2,)
+
+
+def test_settle_diffrax_mode2_ts_are_all_finite(fx_model, fx_states_prev, fx_control_input, fx_observation):
+    """Mode 2 (steady_state_tol=None) always runs the full [0, max_t1]
+    window, so nothing should ever be masked out."""
+    _, trace, ts = fx_model.settle_diffrax(
+        fx_states_prev, fx_observation, fx_control_input, max_t1=5.0, n_save=10,
+        steady_state_tol=None, return_layerwise=True,
+    )
+    assert jnp.all(jnp.isfinite(ts))
+    assert jnp.all(jnp.isfinite(trace))
+
+
+def test_settle_diffrax_mode1_last_finite_entry_matches_states_curr(fx_model, fx_states_prev, fx_control_input, fx_observation):
+    """Whatever the last finite ts entry is (whether the event fired early
+    or max_t1 was reached), that row of the trace must be the exact
+    tpch_energy_fn(return_layerwise=True) breakdown of the returned
+    states_curr -- the contract settle_diffrax's docstring spells out for
+    downstream code (e.g. plot_train_energies) to rely on."""
+    states_curr, trace, ts = fx_model.settle_diffrax(
+        fx_states_prev, fx_observation, fx_control_input, max_t1=20.0, n_save=10,
+        steady_state_tol=0.1, return_layerwise=True,
+    )
+    finite_mask = jnp.isfinite(ts)
+    assert bool(jnp.any(finite_mask))
+    last_idx = int(jnp.argmax(jnp.where(finite_mask, ts, -jnp.inf)))
+    direct = fx_model.tpch_energy_fn(fx_states_prev, states_curr, fx_observation, fx_control_input, return_layerwise=True)
+    assert_allclose(
+        trace[last_idx], direct, "settle_diffrax trace's last finite row vs direct recomputation", atol=1e-4, rtol=1e-4
+    )
+
+
+def test_settle_diffrax_mode1_early_convergence_produces_contiguous_inf_padding(
+    fx_model, fx_states_prev, fx_control_input, fx_observation
+):
+    """A loose enough tol must converge before max_t1, leaving the tail of
+    ts/trace as inf, and that padding must be a contiguous suffix (once a
+    step is non-finite, every later step is too) -- otherwise Mode 1's
+    early-exit story (and plot_train_energies' _trace_valid_length trimming,
+    which assumes exactly this) has nothing to rely on."""
+    _, trace, ts = fx_model.settle_diffrax(
+        fx_states_prev, fx_observation, fx_control_input, max_t1=20.0, n_save=10,
+        steady_state_tol=0.1, return_layerwise=True,
+    )
+    finite = [bool(x) for x in jnp.isfinite(ts)]
+    assert not all(finite)  # actually converged early -- otherwise this test proves nothing
+    first_false = next((i for i, v in enumerate(finite) if not v), len(finite))
+    assert all(finite[:first_false])
+    assert not any(finite[first_false:])
+
+
+# ---- N7. control_input is genuinely used -------------------------------------
+
+def test_settle_diffrax_control_input_actually_affects_result(fx_model, fx_states_prev, fx_observation):
+    control_input_a = jr.normal(jr.key(700), (FX_INPUT_SIZE,))
+    control_input_b = jr.normal(jr.key(701), (FX_INPUT_SIZE,))
+    settled_a = fx_model.settle_diffrax(fx_states_prev, fx_observation, control_input_a, max_t1=10.0, steady_state_tol=1e-2)
+    settled_b = fx_model.settle_diffrax(fx_states_prev, fx_observation, control_input_b, max_t1=10.0, steady_state_tol=1e-2)
+    assert any(not bool(jnp.allclose(a, b, atol=1e-5, rtol=1e-5)) for a, b in zip(settled_a, settled_b))
+
+
+# ---- N8. Edge cases: zero hidden layers, ce loss -----------------------------
+
+def test_settle_diffrax_zero_hidden_layers_edge_case():
+    model = TpchModel(control_layer_size=4, hidden_sizes=[], obs_size=5, key=jr.key(702), input_size=2)
+    states_prev = [jr.normal(jr.key(703), (4,))]
+    control_input = jr.normal(jr.key(704), (2,))
+    observation = jr.normal(jr.key(705), (5,))
+    settled = model.settle_diffrax(states_prev, observation, control_input, max_t1=10.0, steady_state_tol=1e-2)
+    assert len(settled) == 1
+    assert settled[0].shape == (4,)
+    assert jnp.all(jnp.isfinite(settled[0]))
+
+
+def test_settle_diffrax_with_ce_loss():
+    model = TpchModel(
+        control_layer_size=FX_CONTROL_SIZE, hidden_sizes=FX_HIDDEN_SIZES, obs_size=FX_OBS_SIZE,
+        key=jr.key(706), input_size=FX_INPUT_SIZE, loss="ce",
+    )
+    states_prev = _fresh_states_prev(707)
+    control_input = jr.normal(jr.key(708), (FX_INPUT_SIZE,))
+    observation = jax.nn.one_hot(jnp.array(1), FX_OBS_SIZE)
+    settled = model.settle_diffrax(states_prev, observation, control_input, max_t1=10.0, steady_state_tol=1e-2)
+    assert jnp.all(jnp.isfinite(jnp.concatenate(settled)))
+
+
+# =============================================================================
+# O. make_train_step_diffrax -- module-level factory building one fully-jitted
+#    training step that uses settle_diffrax instead of settle_scan for the
+#    inference/settling half. Shares _train_frame_pre / _train_frame_post with
+#    make_train_run_diffrax; the manual-recomposition test below (O2) is what
+#    actually validates the fused version matches its documented behaviour.
+# =============================================================================
+
+def _manual_train_step_diffrax(model, param_optim, param_opt_state, states_prev, y, control_input, settle_kwargs):
+    """Direct (unfused, eager) re-implementation of make_train_step_diffrax's
+    train_step body, built from public TpchModel methods only. Used as an
+    independent ground truth for the tests below."""
+    states_curr_init = model.init_activities(states_prev, control_input)
+    _, y_hat_before = model.predict(states_prev, states_curr_init, control_input)
+    energy_before = model.tpch_energy_fn(states_prev, states_curr_init, y, control_input)
+
+    states_curr = model.settle_diffrax(states_prev, y, control_input, **settle_kwargs)
+
+    _, y_hat_after = model.predict(states_prev, states_curr, control_input)
+    energy_after = model.tpch_energy_fn(states_prev, states_curr, y, control_input)
+
+    grads = model.param_grad(states_prev, states_curr, y, control_input)
+    updates, new_opt_state = param_optim.update(grads, param_opt_state, model)
+    new_model = eqx.apply_updates(model, updates)
+
+    return new_model, new_opt_state, states_curr, y_hat_before, y_hat_after, energy_before, energy_after
+
+
+@pytest.fixture
+def fx_train_step_diffrax_setup(fx_model):
+    """Common setup for make_train_step_diffrax tests: a param optimiser +
+    its initial state, matched to fx_model."""
+    param_optim = optax.adam(learning_rate=1e-3)
+    param_opt_state = param_optim.init(eqx.filter(fx_model, eqx.is_array))
+    return param_optim, param_opt_state
+
+
+# Shared settle_diffrax knobs for the make_train_step_diffrax / make_train_run_diffrax
+# tests below -- an event-based (Mode 1) config with a short-ish horizon, so the
+# tests below stay fast while still exercising real relaxation.
+_DIFFRAX_SETTLE_KWARGS = dict(
+    max_t1=5.0, n_save=10, solver=diffrax.Heun(),
+    stepsize_controller=diffrax.PIDController(rtol=1e-3, atol=1e-3), steady_state_tol=1e-2,
+)
+
+
+# ---- O1. Output contract -----------------------------------------------------
+
+def test_make_train_step_diffrax_default_returns_none_trace_and_ts(
+    fx_model, fx_states_prev, fx_observation, fx_control_input, fx_train_step_diffrax_setup
+):
+    param_optim, param_opt_state = fx_train_step_diffrax_setup
+    train_step = make_train_step_diffrax(param_optim, control_input=fx_control_input, **_DIFFRAX_SETTLE_KWARGS)
+
+    result = train_step(fx_model, param_opt_state, fx_states_prev, fx_observation)
+    assert len(result) == 9
+    model, opt_state, states_curr, y_hat_before, y_hat_after, energy_before, energy_after, energy_trace, ts = result
+    assert energy_trace is None
+    assert ts is None
+    assert len(states_curr) == len(fx_states_prev)
+    assert y_hat_before.shape == fx_observation.shape
+    assert y_hat_after.shape == fx_observation.shape
+    assert jnp.isfinite(energy_before)
+    assert jnp.isfinite(energy_after)
+
+
+def test_make_train_step_diffrax_return_layerwise_true_gives_correctly_shaped_trace(
+    fx_model, fx_states_prev, fx_observation, fx_control_input, fx_train_step_diffrax_setup
+):
+    param_optim, param_opt_state = fx_train_step_diffrax_setup
+    n_save = _DIFFRAX_SETTLE_KWARGS["n_save"]
+    train_step = make_train_step_diffrax(param_optim, control_input=fx_control_input, **_DIFFRAX_SETTLE_KWARGS)
+
+    result = train_step(fx_model, param_opt_state, fx_states_prev, fx_observation, return_layerwise=True)
+    energy_trace, ts = result[-2], result[-1]
+    assert energy_trace is not None and ts is not None
+    assert energy_trace.shape == (n_save + 2, len(fx_states_prev) + 1)
+    assert ts.shape == (n_save + 2,)
+
+
+def test_make_train_step_diffrax_weight_update_actually_changes_weights(
+    fx_model, fx_states_prev, fx_observation, fx_control_input, fx_train_step_diffrax_setup
+):
+    param_optim, param_opt_state = fx_train_step_diffrax_setup
+    train_step = make_train_step_diffrax(param_optim, control_input=fx_control_input, **_DIFFRAX_SETTLE_KWARGS)
+
+    new_model, *_ = train_step(fx_model, param_opt_state, fx_states_prev, fx_observation)
+
+    before_leaves = jax.tree_util.tree_leaves(eqx.filter(fx_model, eqx.is_array))
+    after_leaves = jax.tree_util.tree_leaves(eqx.filter(new_model, eqx.is_array))
+    assert any(not bool(jnp.array_equal(b, a)) for b, a in zip(before_leaves, after_leaves))
+    for leaf in after_leaves:
+        assert jnp.all(jnp.isfinite(leaf))
+
+
+# ---- O2. Manual recomposition -- the strongest correctness check ------------
+
+def test_make_train_step_diffrax_matches_manual_recomposition(
+    fx_model, fx_states_prev, fx_observation, fx_control_input, fx_train_step_diffrax_setup
+):
+    param_optim, param_opt_state = fx_train_step_diffrax_setup
+
+    ref_model, ref_opt_state, ref_states, ref_yb, ref_ya, ref_eb, ref_ea = _manual_train_step_diffrax(
+        fx_model, param_optim, param_opt_state, fx_states_prev, fx_observation, fx_control_input, _DIFFRAX_SETTLE_KWARGS
+    )
+
+    train_step = make_train_step_diffrax(param_optim, control_input=fx_control_input, **_DIFFRAX_SETTLE_KWARGS)
+    fused_model, fused_opt_state, fused_states, fused_yb, fused_ya, fused_eb, fused_ea, _, _ = train_step(
+        fx_model, param_opt_state, fx_states_prev, fx_observation
+    )
+
+    assert_allclose(fused_yb, ref_yb, "y_hat_before: make_train_step_diffrax vs manual", atol=1e-4, rtol=1e-4)
+    assert_allclose(fused_ya, ref_ya, "y_hat_after: make_train_step_diffrax vs manual", atol=1e-4, rtol=1e-4)
+    assert_allclose(fused_eb, ref_eb, "energy_before: make_train_step_diffrax vs manual", atol=1e-4, rtol=1e-4)
+    assert_allclose(fused_ea, ref_ea, "energy_after: make_train_step_diffrax vs manual", atol=1e-4, rtol=1e-4)
+    for f, r in zip(fused_states, ref_states):
+        assert_allclose(f, r, "settled states: make_train_step_diffrax vs manual", atol=1e-4, rtol=1e-4)
+
+    fused_weights = jax.tree_util.tree_leaves(eqx.filter(fused_model, eqx.is_array))
+    ref_weights = jax.tree_util.tree_leaves(eqx.filter(ref_model, eqx.is_array))
+    for f, r in zip(fused_weights, ref_weights):
+        assert_allclose(f, r, "final weights: make_train_step_diffrax vs manual", atol=1e-4, rtol=1e-4)
+
+
+# ---- O3. return_layerwise must not perturb training dynamics ----------------
+
+def test_make_train_step_diffrax_return_layerwise_does_not_change_training_dynamics(
+    fx_model, fx_states_prev, fx_observation, fx_control_input, fx_train_step_diffrax_setup
+):
+    param_optim, param_opt_state = fx_train_step_diffrax_setup
+    train_step = make_train_step_diffrax(param_optim, control_input=fx_control_input, **_DIFFRAX_SETTLE_KWARGS)
+
+    out_false = train_step(fx_model, param_opt_state, fx_states_prev, fx_observation, return_layerwise=False)
+    out_true = train_step(fx_model, param_opt_state, fx_states_prev, fx_observation, return_layerwise=True)
+
+    for i, label in enumerate(
+        ["model", "param_opt_state", "states_curr", "y_hat_before", "y_hat_after", "energy_before", "energy_after"]
+    ):
+        a = jax.tree_util.tree_leaves(out_false[i])
+        b = jax.tree_util.tree_leaves(out_true[i])
+        for la, lb in zip(a, b):
+            assert_allclose(la, lb, f"{label}: return_layerwise False vs True", atol=1e-5, rtol=1e-5)
+
+    assert out_false[-1] is None and out_false[-2] is None
+    assert out_true[-1] is not None and out_true[-2] is not None
+
+
+# ---- O4. Multi-step training-loop integration --------------------------------
+
+def test_make_train_step_diffrax_multi_step_loop_threads_state_correctly(fx_model, fx_control_input, fx_train_step_diffrax_setup):
+    param_optim, param_opt_state = fx_train_step_diffrax_setup
+    train_step = make_train_step_diffrax(param_optim, control_input=fx_control_input, **_DIFFRAX_SETTLE_KWARGS)
+
+    states_prev = _fresh_states_prev(709)
+    ys = jr.normal(jr.key(710), (4, FX_OBS_SIZE))
+
+    model, opt_state = fx_model, param_opt_state
+    for t in range(ys.shape[0]):
+        model, opt_state, states_prev, *_ = train_step(model, opt_state, states_prev, ys[t])
+        for leaf in jax.tree_util.tree_leaves(states_prev):
+            assert jnp.all(jnp.isfinite(leaf))
+
+    weight_leaves = jax.tree_util.tree_leaves(eqx.filter(model, eqx.is_array))
+    for leaf in weight_leaves:
+        assert jnp.all(jnp.isfinite(leaf))
+
+
+# ---- O5. control_input is genuinely used, not silently dropped --------------
+
+def test_make_train_step_diffrax_control_input_actually_affects_predictions(
+    fx_model, fx_states_prev, fx_observation, fx_train_step_diffrax_setup
+):
+    param_optim, param_opt_state = fx_train_step_diffrax_setup
+    control_input = jr.normal(jr.key(711), (FX_INPUT_SIZE,))
+
+    train_step_with = make_train_step_diffrax(param_optim, control_input=control_input, **_DIFFRAX_SETTLE_KWARGS)
+    train_step_without = make_train_step_diffrax(param_optim, control_input=None, **_DIFFRAX_SETTLE_KWARGS)
+
+    _, _, _, y_before_with, *_ = train_step_with(fx_model, param_opt_state, fx_states_prev, fx_observation)
+    _, _, _, y_before_without, *_ = train_step_without(fx_model, param_opt_state, fx_states_prev, fx_observation)
+
+    assert not bool(jnp.allclose(y_before_with, y_before_without, atol=1e-4, rtol=1e-4))
+
+
+# ---- O6. Edge cases: zero hidden layers, ce loss -----------------------------
+
+def test_make_train_step_diffrax_zero_hidden_layers():
+    model = TpchModel(control_layer_size=4, hidden_sizes=[], obs_size=5, key=jr.key(712), input_size=2)
+    param_optim = optax.adam(1e-3)
+    param_opt_state = param_optim.init(eqx.filter(model, eqx.is_array))
+    control_input = jr.normal(jr.key(713), (2,))
+    train_step = make_train_step_diffrax(param_optim, control_input=control_input, **_DIFFRAX_SETTLE_KWARGS)
+
+    states_prev = [jr.normal(jr.key(714), (4,))]
+    y = jr.normal(jr.key(715), (5,))
+    _, _, states_curr, *_ = train_step(model, param_opt_state, states_prev, y, return_layerwise=True)
+    assert len(states_curr) == 1
+
+
+def test_make_train_step_diffrax_with_ce_loss():
+    model = TpchModel(
+        control_layer_size=FX_CONTROL_SIZE, hidden_sizes=FX_HIDDEN_SIZES, obs_size=FX_OBS_SIZE,
+        key=jr.key(716), input_size=FX_INPUT_SIZE, loss="ce",
+    )
+    param_optim = optax.adam(1e-3)
+    param_opt_state = param_optim.init(eqx.filter(model, eqx.is_array))
+    control_input = jr.normal(jr.key(717), (FX_INPUT_SIZE,))
+    train_step = make_train_step_diffrax(param_optim, control_input=control_input, **_DIFFRAX_SETTLE_KWARGS)
+
+    states_prev = _fresh_states_prev(718)
+    y = jax.nn.one_hot(jnp.array(2), FX_OBS_SIZE)
+    new_model, _, _, _, _, energy_before, energy_after, _, _ = train_step(model, param_opt_state, states_prev, y)
+    assert jnp.isfinite(energy_before)
+    assert jnp.isfinite(energy_after)
+
+
+# =============================================================================
+# P. make_train_run_diffrax -- module-level factory building one fully-jitted,
+#    multi-frame training run, fusing settle_diffrax + _train_frame_pre/_post
+#    into a single outer jax.lax.scan (mirroring make_train_run's fusion of
+#    settle_scan). P2 (manual recomposition against make_train_step_diffrax
+#    looped by hand) is what actually validates that fusing settle_diffrax's
+#    diffeqsolve calls inside an outer scan doesn't change anything, matching
+#    the "confirmed rather than assumed" safety argument in the docstring.
+# =============================================================================
+
+@pytest.fixture
+def fx_train_run_diffrax_setup(fx_model):
+    param_optim = optax.adam(learning_rate=1e-3)
+    param_opt_state = param_optim.init(eqx.filter(fx_model, eqx.is_array))
+    return param_optim, param_opt_state
+
+
+# ---- P1. Output contract -----------------------------------------------------
+
+def test_make_train_run_diffrax_default_returns_none_traces(fx_model, fx_control_input, fx_train_run_diffrax_setup):
+    param_optim, param_opt_state = fx_train_run_diffrax_setup
+    run_length = 4
+    train_run = make_train_run_diffrax(param_optim, run_length=run_length, control_input=fx_control_input, **_DIFFRAX_SETTLE_KWARGS)
+
+    states_prev = _fresh_states_prev(719)
+    ys = jr.normal(jr.key(720), (run_length, FX_OBS_SIZE))
+
+    result = train_run(fx_model, param_opt_state, states_prev, ys)
+    assert len(result) == 9
+    model, opt_state, states_curr, y_before, y_after, energies_before, energies_after, energy_traces, ts_traces = result
+    assert energy_traces is None
+    assert ts_traces is None
+    assert len(states_curr) == len(states_prev)
+    assert y_before.shape == (run_length, FX_OBS_SIZE)
+    assert y_after.shape == (run_length, FX_OBS_SIZE)
+    assert energies_before.shape == (run_length,)
+    assert energies_after.shape == (run_length,)
+    assert jnp.all(jnp.isfinite(energies_before))
+    assert jnp.all(jnp.isfinite(energies_after))
+
+
+def test_make_train_run_diffrax_return_layerwise_true_gives_correctly_shaped_traces(fx_model, fx_control_input, fx_train_run_diffrax_setup):
+    param_optim, param_opt_state = fx_train_run_diffrax_setup
+    run_length = 4
+    n_save = _DIFFRAX_SETTLE_KWARGS["n_save"]
+    train_run = make_train_run_diffrax(param_optim, run_length=run_length, control_input=fx_control_input, **_DIFFRAX_SETTLE_KWARGS)
+
+    states_prev = _fresh_states_prev(721)
+    ys = jr.normal(jr.key(722), (run_length, FX_OBS_SIZE))
+
+    *_, energy_traces, ts_traces = train_run(fx_model, param_opt_state, states_prev, ys, return_layerwise=True)
+    assert energy_traces.shape == (run_length, n_save + 2, len(FX_HIDDEN_SIZES) + 2)
+    assert ts_traces.shape == (run_length, n_save + 2)
+
+
+def test_make_train_run_diffrax_weight_update_actually_changes_weights(fx_model, fx_control_input, fx_train_run_diffrax_setup):
+    param_optim, param_opt_state = fx_train_run_diffrax_setup
+    train_run = make_train_run_diffrax(param_optim, run_length=4, control_input=fx_control_input, **_DIFFRAX_SETTLE_KWARGS)
+
+    states_prev = _fresh_states_prev(723)
+    ys = jr.normal(jr.key(724), (4, FX_OBS_SIZE))
+    new_model, *_ = train_run(fx_model, param_opt_state, states_prev, ys)
+
+    before = jax.tree_util.tree_leaves(eqx.filter(fx_model, eqx.is_array))
+    after = jax.tree_util.tree_leaves(eqx.filter(new_model, eqx.is_array))
+    assert any(not bool(jnp.array_equal(b, a)) for b, a in zip(before, after))
+    for leaf in after:
+        assert jnp.all(jnp.isfinite(leaf))
+
+
+# ---- P2. Manual recomposition via make_train_step_diffrax, looped by hand ---
+
+def test_make_train_run_diffrax_matches_make_train_step_diffrax_looped_manually(fx_model, fx_control_input, fx_train_run_diffrax_setup):
+    """make_train_run_diffrax's fused multi-frame scan must agree with
+    calling make_train_step_diffrax (itself already independently verified,
+    O2) once per frame in an ordinary Python loop -- completely independent
+    of make_train_run_diffrax's own internals."""
+    param_optim, param_opt_state = fx_train_run_diffrax_setup
+    run_length = 4
+
+    states_prev = _fresh_states_prev(725)
+    ys = jr.normal(jr.key(726), (run_length, FX_OBS_SIZE))
+
+    train_step = make_train_step_diffrax(param_optim, control_input=fx_control_input, **_DIFFRAX_SETTLE_KWARGS)
+    m, ops, sp = fx_model, param_opt_state, states_prev
+    ref_energies_before, ref_energies_after, ref_y_before, ref_y_after = [], [], [], []
+    for i in range(run_length):
+        m, ops, sp, y_bef, y_aft, e_before, e_after, _, _ = train_step(m, ops, sp, ys[i])
+        ref_energies_before.append(e_before)
+        ref_energies_after.append(e_after)
+        ref_y_before.append(y_bef)
+        ref_y_after.append(y_aft)
+
+    train_run = make_train_run_diffrax(param_optim, run_length=run_length, control_input=fx_control_input, **_DIFFRAX_SETTLE_KWARGS)
+    fused_model, fused_ops, fused_sp, fused_y_before, fused_y_after, fused_energies_before, fused_energies_after, _, _ = train_run(
+        fx_model, param_opt_state, states_prev, ys
+    )
+
+    assert_allclose(fused_energies_before, jnp.stack(ref_energies_before), "energies_before: make_train_run_diffrax vs looped make_train_step_diffrax", atol=1e-4, rtol=1e-4)
+    assert_allclose(fused_energies_after, jnp.stack(ref_energies_after), "energies_after: make_train_run_diffrax vs looped make_train_step_diffrax", atol=1e-4, rtol=1e-4)
+    assert_allclose(fused_y_before, jnp.stack(ref_y_before), "y_hat_before: make_train_run_diffrax vs looped make_train_step_diffrax", atol=1e-4, rtol=1e-4)
+    assert_allclose(fused_y_after, jnp.stack(ref_y_after), "y_hat_after: make_train_run_diffrax vs looped make_train_step_diffrax", atol=1e-4, rtol=1e-4)
+    for f, r in zip(fused_sp, sp):
+        assert_allclose(f, r, "final states: make_train_run_diffrax vs looped make_train_step_diffrax", atol=1e-4, rtol=1e-4)
+
+    fused_weights = jax.tree_util.tree_leaves(eqx.filter(fused_model, eqx.is_array))
+    ref_weights = jax.tree_util.tree_leaves(eqx.filter(m, eqx.is_array))
+    for f, r in zip(fused_weights, ref_weights):
+        assert_allclose(f, r, "final weights: make_train_run_diffrax vs looped make_train_step_diffrax", atol=1e-4, rtol=1e-4)
+
+
+# ---- P3. return_layerwise must not perturb training dynamics ----------------
+
+def test_make_train_run_diffrax_return_layerwise_does_not_change_training_dynamics(fx_model, fx_control_input, fx_train_run_diffrax_setup):
+    param_optim, param_opt_state = fx_train_run_diffrax_setup
+    train_run = make_train_run_diffrax(param_optim, run_length=4, control_input=fx_control_input, **_DIFFRAX_SETTLE_KWARGS)
+
+    states_prev = _fresh_states_prev(727)
+    ys = jr.normal(jr.key(728), (4, FX_OBS_SIZE))
+
+    out_false = train_run(fx_model, param_opt_state, states_prev, ys, return_layerwise=False)
+    out_true = train_run(fx_model, param_opt_state, states_prev, ys, return_layerwise=True)
+
+    for i, label in enumerate(
+        ["model", "param_opt_state", "states_curr", "y_hat_before", "y_hat_after", "energies_before", "energies_after"]
+    ):
+        a = jax.tree_util.tree_leaves(out_false[i])
+        b = jax.tree_util.tree_leaves(out_true[i])
+        for la, lb in zip(a, b):
+            assert_allclose(la, lb, f"{label}: return_layerwise False vs True", atol=1e-5, rtol=1e-5)
+
+    assert out_false[-1] is None and out_false[-2] is None
+    assert out_true[-1] is not None and out_true[-2] is not None
+
+
+# ---- P4. run_length is genuinely wired, not hardcoded ------------------------
+
+def test_make_train_run_diffrax_run_length_matches_scan_length(fx_model, fx_control_input, fx_train_run_diffrax_setup):
+    param_optim, param_opt_state = fx_train_run_diffrax_setup
+    states_prev = _fresh_states_prev(729)
+
+    for run_length in [1, 3, 5]:
+        train_run = make_train_run_diffrax(param_optim, run_length=run_length, control_input=fx_control_input, **_DIFFRAX_SETTLE_KWARGS)
+        ys = jr.normal(jr.fold_in(jr.key(730), run_length), (run_length, FX_OBS_SIZE))
+        _, _, _, y_before, y_after, energies_before, energies_after, _, _ = train_run(fx_model, param_opt_state, states_prev, ys)
+        assert energies_before.shape == (run_length,)
+        assert energies_after.shape == (run_length,)
+        assert y_before.shape == (run_length, FX_OBS_SIZE)
+
+
+# ---- P5. control_input is genuinely used -------------------------------------
+
+def test_make_train_run_diffrax_control_input_actually_affects_predictions(fx_model, fx_train_run_diffrax_setup):
+    param_optim, param_opt_state = fx_train_run_diffrax_setup
+    states_prev = _fresh_states_prev(731)
+    ys = jr.normal(jr.key(732), (3, FX_OBS_SIZE))
+    control_input = jr.normal(jr.key(733), (FX_INPUT_SIZE,))
+
+    train_run_with = make_train_run_diffrax(param_optim, run_length=3, control_input=control_input, **_DIFFRAX_SETTLE_KWARGS)
+    train_run_without = make_train_run_diffrax(param_optim, run_length=3, control_input=None, **_DIFFRAX_SETTLE_KWARGS)
+
+    _, _, _, y_before_with, *_ = train_run_with(fx_model, param_opt_state, states_prev, ys)
+    _, _, _, y_before_without, *_ = train_run_without(fx_model, param_opt_state, states_prev, ys)
+
+    assert not bool(jnp.allclose(y_before_with, y_before_without, atol=1e-4, rtol=1e-4))
+
+
+# ---- P6. Edge cases: zero hidden layers, ce loss -----------------------------
+
+def test_make_train_run_diffrax_zero_hidden_layers():
+    model = TpchModel(control_layer_size=4, hidden_sizes=[], obs_size=5, key=jr.key(734), input_size=2)
+    param_optim = optax.adam(1e-3)
+    param_opt_state = param_optim.init(eqx.filter(model, eqx.is_array))
+    control_input = jr.normal(jr.key(735), (2,))
+    run_length = 4
+    train_run = make_train_run_diffrax(param_optim, run_length=run_length, control_input=control_input, **_DIFFRAX_SETTLE_KWARGS)
+
+    states_prev = [jr.normal(jr.key(736), (4,))]
+    ys = jr.normal(jr.key(737), (run_length, 5))
+    new_model, new_opt_state, states_curr, y_before, y_after, energies_before, energies_after, energy_traces, ts_traces = train_run(
+        model, param_opt_state, states_prev, ys, return_layerwise=True
+    )
+    assert len(states_curr) == 1
+    n_save = _DIFFRAX_SETTLE_KWARGS["n_save"]
+    assert energy_traces.shape == (run_length, n_save + 2, 2)  # control + observation only
+    assert jnp.all(jnp.isfinite(energies_before))
+    assert jnp.all(jnp.isfinite(energies_after))
+
+
+def test_make_train_run_diffrax_with_ce_loss():
+    model = TpchModel(
+        control_layer_size=FX_CONTROL_SIZE, hidden_sizes=FX_HIDDEN_SIZES, obs_size=FX_OBS_SIZE,
+        key=jr.key(738), input_size=FX_INPUT_SIZE, loss="ce",
+    )
+    param_optim = optax.adam(1e-3)
+    param_opt_state = param_optim.init(eqx.filter(model, eqx.is_array))
+    control_input = jr.normal(jr.key(739), (FX_INPUT_SIZE,))
+    run_length = 4
+    train_run = make_train_run_diffrax(param_optim, run_length=run_length, control_input=control_input, **_DIFFRAX_SETTLE_KWARGS)
+
+    states_prev = _fresh_states_prev(740)
+    ys = jax.nn.one_hot(jnp.array([0, 1, 2, 0]), FX_OBS_SIZE)
+
+    new_model, new_opt_state, states_curr, y_before, y_after, energies_before, energies_after, _, _ = train_run(
+        model, param_opt_state, states_prev, ys
+    )
+    assert jnp.all(jnp.isfinite(energies_before))
+    assert jnp.all(jnp.isfinite(energies_after))
+    weight_before = jax.tree_util.tree_leaves(eqx.filter(model, eqx.is_array))[0]
+    weight_after = jax.tree_util.tree_leaves(eqx.filter(new_model, eqx.is_array))[0]
+    assert not bool(jnp.array_equal(weight_before, weight_after))
+
+
+# =============================================================================
+# Q. Additional steady-state criteria for make_steady_state_event/
+#    settle_diffrax: "relative_rms" and "energy_rate", alongside the
+#    original "rms". Motivated by "rms"'s known size-imbalance issue (see
+#    its docstring): pooling every layer's raw elements unweighted means a
+#    wide layer dominates the check regardless of whether it's actually the
+#    one still unsettled. Both new criteria are exercised here against real
+#    hierarchies (including a deliberately size-imbalanced one, mirroring
+#    the case that originally motivated adding them), not just tested
+#    against their own formulas in isolation.
+# =============================================================================
+
+# ---- Q1. dE/dt = -||ds/dt||^2 -- the identity energy_rate's numerator relies on --
+
+def test_energy_rate_identity_matches_autodiff_ground_truth(fx_model, fx_states_prev, fx_control_input, fx_observation):
+    """For gradient flow (ds/dt = -dE/ds), dE/dt is exactly -||ds/dt||^2.
+    Checked via an independent jax.jvp computation of dE/dt that never
+    touches make_steady_state_event or its -||ds/dt||^2 shortcut at all --
+    the two must agree because it's a mathematical identity, not because
+    they're computed the same way."""
+    states_curr = fx_model.init_activities(fx_states_prev, fx_control_input)
+    vector_field = fx_model.make_vector_field(fx_states_prev, fx_observation, fx_control_input)
+    dstates = vector_field(0.0, states_curr, None)
+
+    energy_fn = lambda s: fx_model.tpch_energy_fn(fx_states_prev, s, fx_observation, fx_control_input)
+    _, dE_dt = jax.jvp(energy_fn, (states_curr,), (dstates,))
+
+    sq_norm = sum(jnp.sum(jnp.square(leaf)) for leaf in jax.tree_util.tree_leaves(dstates))
+    assert_allclose(dE_dt, -sq_norm, "dE/dt via autodiff (jvp) vs -||ds/dt||^2", atol=1e-4, rtol=1e-4)
+
+
+# ---- Q2. make_steady_state_event -- relative_rms ------------------------------
+
+def test_relative_rms_requires_rtol_and_atol(fx_model, fx_states_prev, fx_control_input, fx_observation):
+    with pytest.raises(ValueError):
+        fx_model.make_steady_state_event(fx_states_prev, fx_observation, fx_control_input, criterion="relative_rms")
+    with pytest.raises(ValueError):
+        fx_model.make_steady_state_event(
+            fx_states_prev, fx_observation, fx_control_input, criterion="relative_rms", rtol=1e-2
+        )
+    with pytest.raises(ValueError):
+        fx_model.make_steady_state_event(
+            fx_states_prev, fx_observation, fx_control_input, criterion="relative_rms", atol=1e-3
+        )
+
+
+def test_relative_rms_cond_fn_matches_manual_computation(fx_model, fx_states_prev, fx_control_input, fx_observation):
+    states_curr = fx_model.init_activities(fx_states_prev, fx_control_input)
+    rtol, atol = 1e-2, 1e-3
+    event = fx_model.make_steady_state_event(
+        fx_states_prev, fx_observation, fx_control_input, criterion="relative_rms", rtol=rtol, atol=atol,
+    )
+    vector_field = fx_model.make_vector_field(fx_states_prev, fx_observation, fx_control_input)
+    dstates = vector_field(0.0, states_curr, None)
+    d_leaves = jax.tree_util.tree_leaves(dstates)
+    s_leaves = jax.tree_util.tree_leaves(states_curr)
+    sq_sum = sum(
+        jnp.sum(jnp.square(dl / (atol + rtol * jnp.abs(sl)))) for dl, sl in zip(d_leaves, s_leaves)
+    )
+    n_elements = sum(dl.size for dl in d_leaves)
+    manual_rms = float(jnp.sqrt(sq_sum / n_elements))
+
+    assert bool(event.cond_fn(0.0, states_curr, None)) == (manual_rms < 1.0)
+
+
+def test_relative_rms_threshold_is_the_fixed_constant_one(fx_model, fx_states_prev, fx_control_input, fx_observation):
+    """Unlike 'rms' (compared against an arbitrary user-chosen tol),
+    'relative_rms' is always compared against the fixed constant 1.0 by
+    construction -- confirmed here by checking that a near-zero rtol/atol
+    (an almost-impossible-to-satisfy threshold) reports not-converged, and
+    a huge rtol/atol (trivially satisfied) reports converged, at the exact
+    same state."""
+    states_curr = fx_model.init_activities(fx_states_prev, fx_control_input)
+    tiny = fx_model.make_steady_state_event(
+        fx_states_prev, fx_observation, fx_control_input, criterion="relative_rms", rtol=1e-12, atol=1e-12,
+    )
+    huge = fx_model.make_steady_state_event(
+        fx_states_prev, fx_observation, fx_control_input, criterion="relative_rms", rtol=1e6, atol=1e6,
+    )
+    assert bool(tiny.cond_fn(0.0, states_curr, None)) is False
+    assert bool(huge.cond_fn(0.0, states_curr, None)) is True
+
+
+# ---- Q3. make_steady_state_event -- energy_rate --------------------------------
+
+def test_energy_rate_requires_tol(fx_model, fx_states_prev, fx_control_input, fx_observation):
+    with pytest.raises(ValueError):
+        fx_model.make_steady_state_event(
+            fx_states_prev, fx_observation, fx_control_input, criterion="energy_rate", tol=None
+        )
+
+
+def test_energy_rate_cond_fn_matches_manual_computation(fx_model, fx_states_prev, fx_control_input, fx_observation):
+    states_curr = fx_model.init_activities(fx_states_prev, fx_control_input)
+    tol = 1e-2
+    event = fx_model.make_steady_state_event(
+        fx_states_prev, fx_observation, fx_control_input, criterion="energy_rate", tol=tol,
+    )
+    vector_field = fx_model.make_vector_field(fx_states_prev, fx_observation, fx_control_input)
+    dstates = vector_field(0.0, states_curr, None)
+    sq_norm = sum(jnp.sum(jnp.square(leaf)) for leaf in jax.tree_util.tree_leaves(dstates))
+    energy = fx_model.tpch_energy_fn(fx_states_prev, states_curr, fx_observation, fx_control_input)
+    manual = float(sq_norm / (jnp.abs(energy) + 1e-8))
+
+    assert bool(event.cond_fn(0.0, states_curr, None)) == (manual < tol)
+
+
+# ---- Q4. Unknown criterion -----------------------------------------------------
+
+def test_unknown_criterion_raises(fx_model, fx_states_prev, fx_control_input, fx_observation):
+    with pytest.raises(ValueError):
+        fx_model.make_steady_state_event(
+            fx_states_prev, fx_observation, fx_control_input, criterion="not_a_real_criterion", tol=1e-3
+        )
+
+
+# ---- Q5. settle_diffrax wiring: backward compatibility + the new criteria -----
+
+def test_settle_diffrax_default_criterion_is_rms_unchanged(fx_model, fx_states_prev, fx_control_input, fx_observation):
+    """Not passing steady_state_criterion at all must behave exactly as it
+    did before this parameter existed -- explicit regression check."""
+    explicit = fx_model.settle_diffrax(
+        fx_states_prev, fx_observation, fx_control_input, max_t1=10.0,
+        steady_state_tol=1e-2, steady_state_criterion="rms",
+    )
+    implicit = fx_model.settle_diffrax(
+        fx_states_prev, fx_observation, fx_control_input, max_t1=10.0, steady_state_tol=1e-2,
+    )
+    for a, b in zip(explicit, implicit):
+        assert_allclose(a, b, "settle_diffrax default criterion vs explicit criterion='rms'", atol=0.0, rtol=0.0)
+
+
+def test_settle_diffrax_relative_rms_missing_rtol_or_atol_raises(fx_model, fx_states_prev, fx_control_input, fx_observation):
+    with pytest.raises(ValueError):
+        fx_model.settle_diffrax(
+            fx_states_prev, fx_observation, fx_control_input, max_t1=5.0,
+            steady_state_tol=1e-3, steady_state_criterion="relative_rms",
+        )
+
+
+def test_settle_diffrax_relative_rms_and_energy_rate_converge_much_sooner_than_rms_on_wide_hierarchy():
+    """On a hierarchy with a much wider layer (128 units vs the others'
+    8-64), plain 'rms' pooled unweighted across all elements stays
+    dominated by the wide layer and doesn't cross a reasonable tol within
+    the window at all; 'relative_rms' and 'energy_rate', both normalised
+    rather than absolute, cross their own natural thresholds well before
+    max_t1 -- this is the concrete case that motivated adding them, so it's
+    worth checking directly rather than only at the cond_fn-formula level."""
+    model = TpchModel(control_layer_size=8, hidden_sizes=[8, 16, 32, 64, 128], obs_size=128, key=jr.key(800))
+    sizes = [8, 8, 16, 32, 64, 128]
+    states_prev = [jr.normal(k, (n,)) for k, n in zip(jr.split(jr.key(801), len(sizes)), sizes)]
+    observation = jr.normal(jr.key(802), (128,))
+
+    def stop_time(**kwargs):
+        _, _, ts = model.settle_diffrax(
+            states_prev, observation, None, max_t1=20.0, n_save=10, return_layerwise=True, **kwargs
+        )
+        finite = jnp.isfinite(ts)
+        return float(jnp.max(jnp.where(finite, ts, -jnp.inf)))
+
+    t_rms = stop_time(steady_state_tol=1e-3, steady_state_criterion="rms")
+    t_relative = stop_time(
+        steady_state_tol=1e-3, steady_state_criterion="relative_rms",
+        steady_state_rtol=1e-2, steady_state_atol=1e-3,
+    )
+    t_energy = stop_time(steady_state_tol=1e-2, steady_state_criterion="energy_rate")
+
+    assert t_rms >= 19.0  # essentially never converges in this window -- the whole point of the demo
+    assert t_relative < 15.0
+    assert t_relative < t_rms
+    assert t_energy < 5.0
+    assert t_energy < t_relative
+
+
+# ---- Q6. Threading through make_train_step_diffrax / make_train_run_diffrax ---
+# Both wrap settle_diffrax inside @eqx.filter_jit; criterion/rtol/atol are
+# ordinary (non-traced) Python values, so an invalid criterion still raises
+# a plain ValueError at trace time -- used here as direct proof that the
+# kwargs actually reach make_steady_state_event rather than being silently
+# dropped somewhere in the two extra layers of forwarding.
+
+def test_make_train_step_diffrax_threads_steady_state_criterion(
+    fx_model, fx_states_prev, fx_observation, fx_control_input, fx_train_step_diffrax_setup
+):
+    param_optim, param_opt_state = fx_train_step_diffrax_setup
+    train_step = make_train_step_diffrax(
+        param_optim, control_input=fx_control_input, max_t1=5.0,
+        steady_state_tol=1e-3, steady_state_criterion="not_a_real_criterion",
+    )
+    with pytest.raises(ValueError):
+        train_step(fx_model, param_opt_state, fx_states_prev, fx_observation)
+
+
+def test_make_train_step_diffrax_relative_rms_end_to_end(
+    fx_model, fx_states_prev, fx_observation, fx_control_input, fx_train_step_diffrax_setup
+):
+    """Not just that it doesn't crash -- that relative_rms's rtol/atol
+    genuinely reach settle_diffrax's event, by cross-checking against a
+    direct settle_diffrax call with the same kwargs."""
+    param_optim, param_opt_state = fx_train_step_diffrax_setup
+    kwargs = dict(
+        max_t1=10.0, n_save=10, steady_state_tol=1e-3, steady_state_criterion="relative_rms",
+        steady_state_rtol=1e-2, steady_state_atol=1e-3,
+    )
+    train_step = make_train_step_diffrax(param_optim, control_input=fx_control_input, **kwargs)
+    _, _, states_curr_fused, *_ = train_step(
+        fx_model, param_opt_state, fx_states_prev, fx_observation, return_layerwise=True
+    )
+    states_curr_direct = fx_model.settle_diffrax(fx_states_prev, fx_observation, fx_control_input, **kwargs)
+    for f, d in zip(states_curr_fused, states_curr_direct):
+        assert_allclose(f, d, "make_train_step_diffrax(relative_rms) vs direct settle_diffrax(relative_rms)", atol=1e-4, rtol=1e-4)
+
+
+def test_make_train_run_diffrax_threads_steady_state_criterion(fx_model, fx_control_input, fx_train_run_diffrax_setup):
+    param_optim, param_opt_state = fx_train_run_diffrax_setup
+    train_run = make_train_run_diffrax(
+        param_optim, run_length=3, control_input=fx_control_input, max_t1=5.0,
+        steady_state_tol=1e-3, steady_state_criterion="not_a_real_criterion",
+    )
+    states_prev = _fresh_states_prev(741)
+    ys = jr.normal(jr.key(742), (3, FX_OBS_SIZE))
+    with pytest.raises(ValueError):
+        train_run(fx_model, param_opt_state, states_prev, ys)
+
+
+def test_make_train_run_diffrax_energy_rate_end_to_end(fx_train_run_diffrax_setup):
+    """Same cross-check as the relative_rms one above, for energy_rate, on
+    the size-imbalanced hierarchy from Q5, and on a single frame
+    (run_length=1). Single-frame is deliberate, not just simpler: weight
+    updates only happen *after* settling within `_train_frame_post`, so
+    they can never affect the current frame's own settling -- but they
+    *would* make a naive multi-frame fused-vs-looped comparison meaningless
+    unless the manual loop also replicated the weight update each frame
+    (already covered generically, for any criterion, by the P2 test
+    above). Restricting to one frame here isolates exactly what this test
+    is actually checking: that `steady_state_criterion`/`steady_state_tol`
+    reach the settling step unchanged, nothing about weight-update
+    threading."""
+    model = TpchModel(control_layer_size=8, hidden_sizes=[8, 16, 32, 64, 128], obs_size=128, key=jr.key(810))
+    param_optim, _ = fx_train_run_diffrax_setup  # reuse the optimiser; state must match this model instead
+    param_opt_state = param_optim.init(eqx.filter(model, eqx.is_array))
+
+    sizes = [8, 8, 16, 32, 64, 128]
+    states_prev = [jr.normal(k, (n,)) for k, n in zip(jr.split(jr.key(811), len(sizes)), sizes)]
+    y = jr.normal(jr.key(812), (128,))
+
+    kwargs = dict(max_t1=20.0, n_save=10, steady_state_tol=1e-2, steady_state_criterion="energy_rate")
+    train_run = make_train_run_diffrax(param_optim, run_length=1, control_input=None, **kwargs)
+    _, _, states_curr_fused, *_ = train_run(model, param_opt_state, states_prev, y[None])
+
+    states_curr_direct = model.settle_diffrax(states_prev, y, None, **kwargs)
+    for f, d in zip(states_curr_fused, states_curr_direct):
+        assert_allclose(
+            f, d, "make_train_run_diffrax(energy_rate, run_length=1) vs direct settle_diffrax(energy_rate)",
+            atol=1e-4, rtol=1e-4,
+        )

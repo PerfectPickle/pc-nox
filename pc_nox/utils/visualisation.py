@@ -191,6 +191,41 @@ def _add_overlay_colorbar(fig, ax, norm, num_layers, iteration_offset: int = 0):
     return cbar
 
 
+def _trace_valid_length(energies_iter) -> int:
+    """Length of the leading finite-valued prefix of a per-iteration energy
+    trace, shape `(num_layers, time_steps)`.
+
+    `settle_scan` (jax.lax.scan, fixed `n_steps`) always produces a fully
+    finite trace, so this simply returns the full length -- existing
+    plotting is completely unaffected.
+
+    `settle_diffrax` with `steady_state_tol` set produces traces where, if
+    the network converges early, every save point past the point of
+    convergence is `inf` (a fixed-size output buffer left unfilled, not
+    real data -- see `settle_diffrax`'s docstring). Diffrax's `Event`
+    fires once and integration stops for good, so that padding is always
+    a *contiguous suffix*: once a time step is non-finite, every step
+    after it is too. That means "first non-finite column" is exactly the
+    true, valid trace length, and a single `argmax` over a boolean mask
+    finds it without needing to scan step-by-step in Python.
+
+    A column only needs to be non-finite in *some* layer to be treated as
+    invalid -- in practice, once one entry in a diffrax state pytree is
+    `inf`, arithmetic inside the energy function (e.g. `inf - inf`)
+    propagates to `nan`/`inf` in the other layer-energy terms too, but
+    checking "all layers finite" rather than "one specific layer finite"
+    costs nothing and is robust even if that propagation is ever
+    incomplete for some particular energy term.
+    """
+    finite_per_step = np.all(np.isfinite(energies_iter), axis=0)
+    if finite_per_step.all():
+        return energies_iter.shape[1]
+    # `argmax` on a boolean array returns the index of its first `True`;
+    # clamped to >= 1 so a (pathological) invalid-from-t=0 trace still
+    # yields a plottable single point instead of an empty slice.
+    return max(int(np.argmax(~finite_per_step)), 1)
+
+
 def plot_train_energies(
     energies,
     model=None,
@@ -199,6 +234,7 @@ def plot_train_energies(
     colormaps=None,
     color_scheme: str = "qualitative",
     ylabel: str = "Variational Free Energy (VFE)",
+    x_axis_label: str = "Inference iterations",
     separate_layers: bool = False,
     layout: str = "auto",
     grid_threshold: int = 6,
@@ -217,13 +253,14 @@ def plot_train_energies(
     iterations for arbitrary network sizes.
 
     Args:
-    energies: list or np.ndarray. Training energy arrays per iteration. Shape: (num_train_iters, num_layers, time_steps)
+    energies: list or np.ndarray. Training energy arrays per iteration. Shape: (num_train_iters, num_layers, time_steps). Each iteration's trace may be shorter than `time_steps` in practice: any trailing run of non-finite (`inf`/`nan`) values is treated as unfilled buffer padding rather than data, and automatically excluded from plotting -- see `_trace_valid_length`. This is what makes `settle_diffrax`-produced traces (variable length, due to early steady-state termination) work here with no extra handling; `settle_scan`-produced traces (fixed length, always finite) are completely unaffected, since a fully finite trace's "valid length" is just its full length.
     model: ModelBase, optional. If given and `layer_labels` is not, labels are auto-derived via `type(model).layer_labels(model.config)`. Falls back to the generic $\ell_1, \ell_2, ...$ labels silently if the model doesn't implement it, same as `model=None`.
-    t_max: int, optional. Caps how many inference-relaxation steps are plotted per recorded iteration, via `min(that iteration's own trace length, t_max)`. Traces are allowed to have different lengths between recorded iterations; each is handled independently.
+    t_max: int, optional. Caps how many inference-relaxation steps are plotted per recorded iteration, via `min(that iteration's own valid trace length, t_max)`. Traces are allowed to have different lengths between recorded iterations; each is handled independently.
     layer_labels: list of str, optional. Explicit labels for each layer/component. Takes precedence over `model`. Defaults to [r"$\ell_1$", r"$\ell_2$", ...].
     colormaps: list of str or Colormap objects, optional. Explicit colormaps, one per layer. Takes precedence over `color_scheme`, and is honored in every layout (single overlay, column, and grid) -- never silently collapsed to a single global colormap.
     color_scheme: {"qualitative", "procedural"}, optional. Only used when `colormaps` is None. "qualitative" (default) uses a small curated set of hand-picked, distinguishable anchor colors. "procedural" reproduces the original hue-spaced auto-generation.
     ylabel: str, optional. Label for the energy axis. Default "Variational Free Energy (VFE)". Applied to the overlay plot's y-axis and, in facet/grid mode, as a single figure-wide label (`fig.supylabel`) rather than repeated on every subplot.
+    x_axis_label: str, optional. Label for the relaxation/time axis. Default "Inference iterations", matching the original discrete `settle_scan` behaviour. Traces from `settle_diffrax` measure continuous integration time rather than discrete steps, so pass something like "Inference time (t)" in that case. Applied everywhere the old hardcoded "Inference iterations" string was: the overlay axis, the facet/grid figure-wide `supxlabel`, and each standalone per-layer plot from `save_individual`.
     separate_layers: bool, optional. If True, gives each layer its own subplot instead of overlaying everything on one axis. Default False.
     layout: {"auto", "column", "grid"}, optional. Only relevant when `separate_layers=True`. "column" always stacks subplots in a single column (the original facet behavior) -- fine for a handful of layers but becomes an impractically tall image for large networks. "grid" always arranges subplots in a roughly-square grid (e.g. 10x10 for 100 layers), which scales much better. "auto" (default) picks "column" when `num_layers <= grid_threshold` and "grid" otherwise.
     grid_threshold: int, optional. Layer count above which `layout="auto"` switches from column to grid. Default 6.
@@ -286,8 +323,16 @@ def plot_train_energies(
             )
 
     norm = mcolors.Normalize(vmin=0, vmax=max(1, num_iterations - 1))
+    # `_trace_valid_length` trims any trailing inf/nan padding (from an
+    # early-terminated settle_diffrax trace) before `t_max` is applied, so
+    # the two caps compose correctly regardless of which solver produced
+    # a given iteration's trace -- a fully finite (settle_scan) trace's
+    # "valid length" is just its full length, so this is a strict
+    # generalisation of the original `energies_iter.shape[1]`, not a
+    # behaviour change for existing callers.
     trace_lengths = [
-        min(energies_iter.shape[1], t_max) if t_max is not None else energies_iter.shape[1]
+        min(_trace_valid_length(energies_iter), t_max) if t_max is not None
+        else _trace_valid_length(energies_iter)
         for energies_iter in energies
     ]
     iter_positions = list(range(num_iterations))
@@ -325,7 +370,7 @@ def plot_train_energies(
             flat_axes[j].set_visible(False)
 
         used_axes = flat_axes[:num_layers]
-        fig.supxlabel("Inference iterations", fontsize=14)
+        fig.supxlabel(x_axis_label, fontsize=14)
         fig.supylabel(ylabel, fontsize=14)
 
         sm = plt.cm.ScalarMappable(cmap=plt.get_cmap("Greys"), norm=norm)
@@ -337,6 +382,11 @@ def plot_train_energies(
         fig, ax = plt.subplots(figsize=(8, 4))
         _draw_overlay(ax, num_layers, energies, trace_lengths, colormaps, norm, iter_positions,
                       layer_labels, ylabel)
+        # Set explicitly (rather than relying on whatever default
+        # `_draw_overlay` sets internally) so a custom `x_axis_label`
+        # reaches this axis too, without needing to touch `_draw_overlay`
+        # itself. A no-op visually when left at the default text.
+        ax.set_xlabel(x_axis_label, fontsize=14)
         ax.tick_params(axis="both", which="major", labelsize=16)
         _add_overlay_colorbar(fig, ax, norm, num_layers, iteration_offset)
 
@@ -350,6 +400,7 @@ def plot_train_energies(
         overlay_fig, overlay_ax = plt.subplots(figsize=(8, 4))
         _draw_overlay(overlay_ax, num_layers, energies, trace_lengths, colormaps, norm,
                       iter_positions, layer_labels, ylabel)
+        overlay_ax.set_xlabel(x_axis_label, fontsize=14)
         overlay_ax.tick_params(axis="both", which="major", labelsize=16)
         _add_overlay_colorbar(overlay_fig, overlay_ax, norm, num_layers, iteration_offset)
         overlay_fig.savefig(os.path.join(output_dir, "train_energies_overlay.png"),
@@ -364,7 +415,7 @@ def plot_train_energies(
             ind_fig, ind_ax = plt.subplots(figsize=(6, 3.5), layout="constrained")
             _draw_layer_traces(ind_ax, i, energies, trace_lengths, colormaps[i], norm, iter_positions)
             ind_ax.set_title(layer_labels[i], fontsize=13)
-            ind_ax.set_xlabel("Inference iterations", fontsize=12)
+            ind_ax.set_xlabel(x_axis_label, fontsize=12)
             ind_ax.set_ylabel(ylabel, fontsize=12)
             ind_ax.tick_params(axis="both", which="major", labelsize=11)
             fname = f"train_energies_{i+1:03d}_{_sanitize_for_filename(layer_labels[i])}.png"

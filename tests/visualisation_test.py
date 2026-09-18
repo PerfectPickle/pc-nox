@@ -49,6 +49,24 @@ def make_energies(num_iterations=3, num_layers=3, time_steps=5, varying_lengths=
     return energies
 
 
+def make_energies_with_valid_lengths(valid_lengths, num_layers=2, time_steps=6):
+    """Builds a list of (num_layers, time_steps) arrays, each finite up to
+    its own `valid_lengths[i]` and inf-padded from that point on -- the
+    fixed-shape, inf-padded-tail pattern a real `settle_diffrax` trace has
+    on early convergence. This is a different mechanism from
+    `make_energies(varying_lengths=True)` above, which returns genuinely
+    shorter arrays (real ragged data) rather than a fixed-size buffer with
+    unfilled padding, so it doesn't exercise `_trace_valid_length` at all."""
+    energies = []
+    rng = np.random.default_rng(1)
+    for length in valid_lengths:
+        arr = rng.uniform(0.1, 5.0, size=(num_layers, time_steps))
+        if length < time_steps:
+            arr[:, length:] = np.inf
+        energies.append(arr)
+    return energies
+
+
 @pytest.fixture(autouse=True)
 def _close_all_figures_after_test():
     """Prevents figures leaking between tests from masking figure-count assertions."""
@@ -144,6 +162,48 @@ class TestGridDims:
         for n in range(1, 30):
             nrows, ncols = viz._grid_dims(n)
             assert nrows * ncols >= n
+
+
+# --------------------------------------------------------------------------
+# _trace_valid_length
+# --------------------------------------------------------------------------
+
+class TestTraceValidLength:
+
+    def test_fully_finite_trace_returns_full_length(self):
+        energies_iter = np.random.default_rng(0).uniform(0.1, 5.0, size=(3, 6))
+        assert viz._trace_valid_length(energies_iter) == 6
+
+    def test_trailing_inf_suffix_returns_first_non_finite_index(self):
+        energies_iter = np.random.default_rng(0).uniform(0.1, 5.0, size=(3, 6))
+        energies_iter[:, 4:] = np.inf
+        assert viz._trace_valid_length(energies_iter) == 4
+
+    def test_trailing_nan_suffix_is_also_treated_as_invalid(self):
+        """np.isfinite treats nan the same as inf -- settle_diffrax always
+        pads with inf specifically, but the helper itself is agnostic."""
+        energies_iter = np.random.default_rng(0).uniform(0.1, 5.0, size=(3, 6))
+        energies_iter[:, 2:] = np.nan
+        assert viz._trace_valid_length(energies_iter) == 2
+
+    def test_a_single_non_finite_layer_invalidates_the_whole_column(self):
+        """Only one layer needs to go non-finite at a given step for that
+        step to be treated as invalid, matching settle_diffrax's own
+        cross-layer inf padding (every layer's energy is undefined once the
+        integrator has stopped, not just the layer that triggered it)."""
+        energies_iter = np.random.default_rng(0).uniform(0.1, 5.0, size=(3, 6))
+        energies_iter[1, 3:] = np.inf  # only layer index 1 goes non-finite
+        assert viz._trace_valid_length(energies_iter) == 3
+
+    def test_non_finite_from_the_first_step_clamps_to_one(self):
+        """A pathological invalid-from-t=0 trace must still yield a
+        plottable single point instead of an empty (zero-length) slice."""
+        energies_iter = np.full((3, 6), np.inf)
+        assert viz._trace_valid_length(energies_iter) == 1
+
+    def test_single_time_step_trace_returns_one(self):
+        energies_iter = np.random.default_rng(0).uniform(0.1, 5.0, size=(3, 1))
+        assert viz._trace_valid_length(energies_iter) == 1
 
 
 # --------------------------------------------------------------------------
@@ -372,6 +432,134 @@ class TestPlotTrainEnergies:
     def test_explicit_colormaps_accepted_as_strings_and_objects(self):
         cmaps = ["viridis", plt.get_cmap("plasma")]
         viz.plot_train_energies(make_energies(num_layers=2), colormaps=cmaps, display=False)
+
+    # ---- Diffrax-style (inf-padded) traces -----------------------------------
+    # settle_diffrax leaves the unused tail of its fixed-size save buffer as
+    # inf rather than back-filling it (see settle_diffrax's docstring in
+    # tpch.py), so a training loop that records its energy_trace straight
+    # into `energies` hands plot_train_energies fixed-shape arrays with a
+    # trailing inf run on any iteration that converged early. The tests
+    # below exercise exactly that shape, via _trace_valid_length's
+    # integration into plot_train_energies (rather than just the unit tests
+    # on _trace_valid_length itself, above).
+
+    def test_inf_padded_diffrax_style_traces_are_trimmed_before_drawing(self, monkeypatch):
+        """End-to-end: plot_train_energies must run each iteration's trace
+        through _trace_valid_length before handing trace_lengths to the
+        drawing helpers, so an early-converged settle_diffrax iteration
+        (fixed shape, inf-padded tail) is trimmed exactly like a genuinely
+        shorter settle_scan trace would be."""
+        spy = MagicMock(side_effect=viz._draw_layer_traces)
+        monkeypatch.setattr(viz, "_draw_layer_traces", spy)
+
+        time_steps = 6
+        valid_lengths = [time_steps, 4, time_steps]
+        energies = make_energies_with_valid_lengths(valid_lengths, num_layers=2, time_steps=time_steps)
+
+        viz.plot_train_energies(energies, separate_layers=True, display=False)
+
+        # _draw_layer_traces is called once per layer, but trace_lengths (arg
+        # index 3) is the same list every time -- check the first call only.
+        trace_lengths = spy.call_args_list[0].args[3]
+        assert trace_lengths == valid_lengths
+
+    def test_inf_padded_traces_compose_correctly_with_t_max(self, monkeypatch):
+        """t_max must cap the already-trimmed valid length, not the raw
+        (padded) buffer size -- min(valid_length, t_max) per iteration."""
+        spy = MagicMock(side_effect=viz._draw_layer_traces)
+        monkeypatch.setattr(viz, "_draw_layer_traces", spy)
+
+        time_steps = 10
+        valid_lengths = [time_steps, 4, time_steps]
+        energies = make_energies_with_valid_lengths(valid_lengths, num_layers=2, time_steps=time_steps)
+
+        viz.plot_train_energies(energies, t_max=6, separate_layers=True, display=False)
+
+        trace_lengths = spy.call_args_list[0].args[3]
+        assert trace_lengths == [6, 4, 6]
+
+    def test_fully_finite_traces_are_unaffected_by_trimming(self, monkeypatch):
+        """A settle_scan-style fully-finite trace's valid length is just its
+        own full length -- confirms the new trimming logic is a strict
+        generalisation, not a behaviour change, for existing callers."""
+        spy = MagicMock(side_effect=viz._draw_layer_traces)
+        monkeypatch.setattr(viz, "_draw_layer_traces", spy)
+
+        energies = make_energies(num_iterations=3, num_layers=2, time_steps=7)
+        viz.plot_train_energies(energies, separate_layers=True, display=False)
+
+        trace_lengths = spy.call_args_list[0].args[3]
+        assert trace_lengths == [7, 7, 7]
+
+    def test_diffrax_style_traces_do_not_crash_in_overlay_or_grid_layout(self):
+        time_steps = 8
+        valid_lengths = [time_steps, 3, 5, time_steps]
+        energies = make_energies_with_valid_lengths(valid_lengths, num_layers=4, time_steps=time_steps)
+        viz.plot_train_energies(energies, display=False)  # overlay (default)
+        viz.plot_train_energies(energies, separate_layers=True, layout="grid", display=False)
+
+    def test_diffrax_style_traces_do_not_crash_when_saved(self, tmp_path):
+        time_steps = 6
+        valid_lengths = [time_steps, 2, time_steps]
+        energies = make_energies_with_valid_lengths(valid_lengths, num_layers=2, time_steps=time_steps)
+        viz.plot_train_energies(
+            energies, save_plot=True, save_overlay=True, save_individual=True,
+            separate_layers=True, display=False, output_dir=str(tmp_path),
+        )
+        assert os.path.isfile(os.path.join(str(tmp_path), "train_energies.png"))
+
+    # ---- x_axis_label ----------------------------------------------------------
+
+    def test_default_x_axis_label_is_inference_iterations_on_overlay(self, monkeypatch):
+        spy = MagicMock(side_effect=viz._draw_overlay)
+        monkeypatch.setattr(viz, "_draw_overlay", spy)
+
+        viz.plot_train_energies(make_energies(), display=False)
+
+        ax = spy.call_args_list[0].args[0]
+        assert ax.get_xlabel() == "Inference iterations"
+
+    def test_custom_x_axis_label_applied_to_overlay(self, monkeypatch):
+        spy = MagicMock(side_effect=viz._draw_overlay)
+        monkeypatch.setattr(viz, "_draw_overlay", spy)
+
+        viz.plot_train_energies(make_energies(), x_axis_label="Inference time (t)", display=False)
+
+        ax = spy.call_args_list[0].args[0]
+        assert ax.get_xlabel() == "Inference time (t)"
+
+    def test_custom_x_axis_label_applied_to_grid_supxlabel(self, monkeypatch):
+        created = []
+        real_subplots = plt.subplots
+
+        def capturing_subplots(*args, **kwargs):
+            fig, axes = real_subplots(*args, **kwargs)
+            created.append(fig)
+            return fig, axes
+
+        monkeypatch.setattr(plt, "subplots", capturing_subplots)
+
+        viz.plot_train_energies(
+            make_energies(num_layers=2), separate_layers=True,
+            x_axis_label="Inference time (t)", display=False,
+        )
+
+        assert created[0].get_supxlabel() == "Inference time (t)"
+
+    def test_custom_x_axis_label_applied_to_saved_individual_plots(self, monkeypatch, tmp_path):
+        spy = MagicMock(side_effect=viz._draw_layer_traces)
+        monkeypatch.setattr(viz, "_draw_layer_traces", spy)
+
+        viz.plot_train_energies(
+            make_energies(num_layers=2), save_individual=True, x_axis_label="Inference time (t)",
+            display=False, output_dir=str(tmp_path),
+        )
+
+        # separate_layers is left False (overlay main plot), so the only
+        # calls to _draw_layer_traces at all come from the save_individual
+        # export pass -- any of them will do.
+        ind_ax = spy.call_args_list[-1].args[0]
+        assert ind_ax.get_xlabel() == "Inference time (t)"
 
 
 # --------------------------------------------------------------------------

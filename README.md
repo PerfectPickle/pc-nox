@@ -13,7 +13,7 @@ This library aims to provide easy to use [Equinox](https://github.com/patrick-ki
 * **Model Management**: Comprehensive save/load methods, supporting seamless training resumption irrespective of model type or training environment.
 * **Visual Prediction Plotting**: Compare ground truth to pre and post inference predictions in visual environments, with the option to save frames and video. 
 * **Flexible Inference & Training Modes**: Supports both step-by-step manual updates for granular control and debugging, as well as end-to-end jax.lax.scan fusion, step by step or chunk by chunk.
-* **PyHGF Compatability**: Version matches (18/08/26) [pyHGF](https://github.com/ComputationalPsychiatry/pyhgf) shared dependencies for cross compatability. Compatability will be maintained.
+* **PyHGF Compatability**: Version matches [pyHGF](https://github.com/ComputationalPsychiatry/pyhgf) (0.3.2) shared dependencies for cross compatability. Compatability will be maintained.
 
 ## Planned Architectures
 
@@ -42,7 +42,7 @@ conda activate pc-nox
 pip install .
 
 # For CUDA (e.g. 12) usage, upgrade JAX
-pip install "jax[cuda12]>=0.4.26,<0.4.32" "jaxlib>=0.4.26,<0.4.32" "numpy>=2.0,<2.5" --force-reinstall
+pip install "jax[cuda12]>=0.4.38,<0.7" "jaxlib>=0.4.38,<0.7" "numpy>=2.0,<2.5" --force-reinstall
 ```
 
 

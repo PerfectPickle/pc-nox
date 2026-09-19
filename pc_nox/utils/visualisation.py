@@ -11,6 +11,7 @@ import os
 from matplotlib.lines import Line2D
 from matplotlib.collections import LineCollection
 import math
+from typing import Optional
 
 
 
@@ -467,7 +468,6 @@ class VisualPredictionPlotter:
         self.im_y = self.axes[0].imshow(blank, cmap=cmap)
         self.im_prior = self.axes[1].imshow(blank, cmap=cmap)
         self.im_post = self.axes[2].imshow(blank, cmap=cmap)
-        self.axes[1].set_title("Prior (Step 0)")
         for ax in self.axes:
             ax.axis('off')
         # Do layout once up front instead of on every savefig call
@@ -480,7 +480,9 @@ class VisualPredictionPlotter:
         inference_steps_made, frame_number,
         show_combined=False, save_combined=True,
         save_separate=False, output_dir="visual_predictions",
-        total_frames=10000,
+        total_frames=10000, prior_label: Optional[str] = "Prior",
+        posterior_label: Optional[str] = "Posterior",
+        show_steps_made: Optional[bool] = True
     ):
         """
         Updates ground-truth visual output (generative process frame) against
@@ -488,46 +490,60 @@ class VisualPredictionPlotter:
         before and after inference, reusing the existing figure/axes.
 
         Args:
-        y : jax.Array or ArrayLike
-            Ground truth, i.e. current frame
-        prior_pred : jax.Array or ArrayLike
-            Predicted sensory observation / output BEFORE inference
-        posterior_pred : jax.Array or ArrayLike
-            Predicted sensory observation / output AFTER inference
-        inference_steps_made : int
-            Number of inference steps taken to achieve the posterior
-        frame_number : int
-            Index of the current frame, used for the plot title and
-            for constructing output filenames
-        show_combined : bool, optional
-            Whether to draw the figure to its canvas and pause briefly
-            (interactive display). Default True
-        save_combined : bool, optional
-            Whether to save the combined 3-panel figure to disk.
-            Saved under `{output_dir}/combined/frame_{frame_number:0N}.png`.
-            Default True
-        save_separate : bool, optional
-            Whether to additionally save y, prior_pred, and posterior_pred
-            as three separate, borderless images (useful for building an
-            animation/video from a directory of frames later). Each is saved
-            under its own subfolder:
-            `{output_dir}/ground_truth/frame_{frame_number:0N}.png`,
-            `{output_dir}/prior_pred/frame_{frame_number:0N}.png`,
-            `{output_dir}/posterior_pred/frame_{frame_number:0N}.png`.
-            Default False
-        output_dir : str, optional
-            Base directory under which the `combined/` and (if requested)
-            per-array subfolders are created. Default "visual_predictions"
-        total_frames : int, optional
-            Total number of frames you expect to save, used to compute a
-            zero-padding width wide enough to keep filenames sortable
-            lexicographically (e.g. total_frames=1_000_000 -> 6-digit
-            padding: frame_000000.png ... frame_999999.png).
+        y : jax.Array or ArrayLike  
+          Ground truth, i.e. current frame
+        prior_pred : jax.Array or ArrayLike  
+          Predicted sensory observation / output BEFORE inference
+        posterior_pred : jax.Array or ArrayLike  
+          Predicted sensory observation / output AFTER inference
+        inference_steps_made : int  
+          Number of inference steps taken to achieve the posterior
+        frame_number : int  
+          Index of the current frame, used for the plot title and
+          for constructing output filenames
+        show_combined : bool, optional.  
+          Whether to draw the figure to its canvas and pause briefly
+          (interactive display). Default True
+        save_combined : bool, optional.  
+          Whether to save the combined 3-panel figure to disk.
+          Saved under `{output_dir}/combined/frame_{frame_number:0N}.png`.
+          Default True
+        save_separate : bool, optional.  
+          Whether to additionally save y, prior_pred, and posterior_pred
+          as three separate, borderless images (useful for building an
+          animation/video from a directory of frames later). Each is saved
+          under its own subfolder:
+          `{output_dir}/ground_truth/frame_{frame_number:0N}.png`,
+          `{output_dir}/prior_pred/frame_{frame_number:0N}.png`,
+          `{output_dir}/posterior_pred/frame_{frame_number:0N}.png`.
+          Default False
+        output_dir : str, optional  
+          Base directory under which the `combined/` and (if requested)
+          per-array subfolders are created. Default "visual_predictions"
+        total_frames : int, optional  
+          Total number of frames you expect to save, used to compute a
+          zero-padding width wide enough to keep filenames sortable
+          lexicographically (e.g. total_frames=1_000_000 -> 6-digit
+          padding: frame_000000.png ... frame_999999.png).
+        prior_label : str or None, optional  
+          Base text title for the prior prediction panel. Default "Prior"
+        posterior_label : str or None, optional  
+          Base text title for the posterior prediction panel. Default "Posterior"
+        show_steps_made : bool or None, optional  
+          Whether to append inference step count details (e.g., "(Step 0)" 
+          and "(Step N)") to the panel titles. Default True
 
         Returns:
         --------
         None
         """
+        try:
+            inference_steps_made = int(inference_steps_made)
+        except:
+            inference_steps_made = "?"
+        if show_steps_made:
+            prior_label += f" (Step 0)"
+            posterior_label += f" (Step {inference_steps_made})"
         pad_width = len(str(total_frames - 1))
         frame_str = f"frame_{frame_number:0{pad_width}d}.png"
         y_img = np.asarray(y).reshape(self.output_shape)
@@ -542,7 +558,8 @@ class VisualPredictionPlotter:
         self.im_prior.autoscale()
         self.im_post.autoscale()
         self.axes[0].set_title(f"Frame {frame_number}: Ground Truth")
-        self.axes[2].set_title(f"Posterior (Step {inference_steps_made})")
+        self.axes[1].set_title(prior_label)
+        self.axes[2].set_title(posterior_label)
         if save_combined:
             combined_dir = os.path.join(output_dir, "combined")
             os.makedirs(combined_dir, exist_ok=True)

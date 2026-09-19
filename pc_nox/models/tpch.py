@@ -1510,8 +1510,179 @@ class TpchModel(eqx.Module, ModelBase):
 
 
 # =============================================================================
-# 8. lax.scan training helpers
+# 8. lax.scan inference and/or training helpers
 # =============================================================================
+
+def make_eval_step(activity_optim: optax.GradientTransformation, n_infer_steps: int, control_input: Optional[Array] = None):
+    """Builds one fully-jitted eval/inference step (zero weight updates): settle -> log-quantities
+
+    The returned `eval_step` is traced once per distinct `return_layerwise`
+    value on first use, then reused for every subsequent call with that same
+    value -- not re-traced per eval iteration. Pass `return_layerwise=True`
+    on the iterations where you want a per-layer energy trace for
+    `plot_train_energies` (e.g. every `record_every`-th frame); the default
+    `False` path stays on its own, cheaper compiled trace the rest of the
+    time. This costs exactly two compiles total across a whole run (one per
+    value ever passed), not one per iteration.
+
+    Args:
+        activity_optim: Optax transform used for the inference/settling loop,
+            passed straight through to `model.settle_scan`.
+        n_infer_steps: Number of relaxation steps per call, i.e. `settle_scan`'s
+            `n_steps`. Fixed at build time (not a `eval_step` argument)
+            because it becomes `jax.lax.scan`'s `length=` internally, which
+            must be a concrete Python int known at trace time.
+        control_input: Optional control-layer input, constant for the whole
+            eval run and closed over here rather than passed to
+            `eval_step` each call. Pass an actual array instead of `None`
+            if it needs to vary per frame in your setup.
+
+    Returns:
+        eval_step: A function with signature
+            `eval_step(model, states_prev, y, return_layerwise=False)`
+            -> `(states_curr, y_hat_before, y_hat_after,
+            energy_before, energy_after, energy_trace)`, where:
+            - `states_curr`: the settled states, to pass back in as
+                `states_prev` for the next call.
+            - `y_hat_before`, `y_hat_after`: observation-layer predictions
+                from the pre- and post-inference states.
+            - `energy_before`, `energy_after`: scalar total energies at
+                those same two points.
+            - `energy_trace`: per-layer energy breakdown across all
+                `n_infer_steps` relaxation steps (shape `(n_infer_steps,
+                num_layers + 1)`, see `settle_scan`'s docstring for row/column
+                order) if `return_layerwise=True`, else `None`.
+    """
+    @eqx.filter_jit
+    def eval_step(model: TpchModel, states_prev, y, return_layerwise: bool = False):
+        states_curr_init = model.init_activities(states_prev, control_input)
+        _, y_hat_before = model.predict(states_prev, states_curr_init, control_input)
+        energy_before = model.tpch_energy_fn(states_prev, states_curr_init, y, control_input)
+
+        settle_result = model.settle_scan(
+            activity_optim, states_prev, y, control_input, n_steps=n_infer_steps, return_layerwise=return_layerwise
+        )
+        states_curr, energy_trace = settle_result if return_layerwise else (settle_result, None)
+
+        _, y_hat_after = model.predict(states_prev, states_curr, control_input)
+        energy_after = model.tpch_energy_fn(states_prev, states_curr, y, control_input)
+
+        return states_curr, y_hat_before, y_hat_after, energy_before, energy_after, energy_trace
+
+    return eval_step
+
+
+def make_eval_run(activity_optim, n_infer_steps, run_length, control_input=None):
+    """Builds one fully-jitted, multi-frame eval/inference run: settle,
+    repeated for `run_length` consecutive frames, fused into a single
+    `jax.lax.scan` (and hence one JIT compile for the whole block) instead
+    of one `eqx.filter_jit` call per frame the way `make_eval_step` works.
+
+    This is the same underlying computation as calling `make_eval_step`'s
+    `eval_step` in a Python loop `run_length` times, just fused so XLA
+    compiles and executes the whole block as one program -- verified to
+    produce identical energies and settled states.
+
+    Use this for two related patterns:
+      - A fully jitted whole-eval-run: pass `run_length=len(frames)`
+        and call it once. Fastest option, at the cost of no side effects
+        (plotting, checkpointing) until the whole run finishes.
+        `y_hat_before`/`y_hat_after`/`energies_before`/`energies_after`/
+        `energy_traces` are all materialized for every frame
+        simultaneously, but each is cheap per frame (a prediction, a
+        scalar, and a handful of per-layer scalars respectively) --
+        device memory isn't the practical constraint here, the lack of
+        any way to checkpoint or inspect progress mid-run is.
+      - The "goldilocks" pattern: pass `run_length=record_every` and call
+        this repeatedly from an outer Python loop, doing plotting/
+        checkpointing in the gaps between calls (ordinary Python there --
+        `model` is a concrete value at that point, not a tracer). One
+        compile total (traced once, reused every block, same static-
+        argument caching as `make_eval_step`), and memory stays bounded
+        by `run_length` rather than total eval length.
+
+    Args:
+        activity_optim: Optax transform used for the inference/settling
+            loop at every frame, passed straight through to
+            `model.settle_scan`.
+        n_infer_steps: Number of relaxation steps per frame, i.e.
+            `settle_scan`'s `n_steps`. Fixed at build time, same reasoning
+            as `make_eval_step`: it becomes part of a `jax.lax.scan`
+            `length=` internally (inside `settle_scan` itself), which must
+            be a concrete Python int known at trace time.
+        run_length: Number of frames processed per call to the returned
+            `eval_run` -- the length of this function's own outer
+            `jax.lax.scan`. Also fixed at build time and for the same
+            reason. Set to the length of one `ys` block you'll pass in.
+        control_input: Optional control-layer input, constant for every
+            frame in the run and closed over here rather than passed to
+            `eval_run` each call. Pass an actual array instead of `None`
+            if it needs to vary per frame in your setup.
+
+    Returns:
+        eval_run: A function with signature
+            `eval_run(model, states_prev, ys, return_layerwise=False)`
+            -> `(states_curr, y_hat_before,
+            y_hat_after, energies_before, energies_after, energy_traces)`,
+            where `ys` is an array of `run_length` observations (leading
+            axis = `run_length`), and:
+              - `states_curr`: the last frame's settled states, to pass
+                back in as `states_prev` for the next call.
+              - `y_hat_before`, `y_hat_after`: stacked per-frame
+                observation-layer predictions from the pre- and
+                post-inference states, shape `(run_length, obs_size)`.
+              - `energies_before`, `energies_after`: stacked per-frame
+                scalar total energies at those same two points, shape `(run_length,)` each -- exact
+                per-frame analogue of `make_eval_step`'s `energy_before`/
+                `energy_after`, not to be confused with `energy_traces`
+                (below), which measures something related but distinct:
+                `energy_traces[i, 0]` is the energy after the FIRST
+                relaxation step, whereas `energies_before[i]` is measured
+                at zero relaxation steps (the raw feedforward guess) --
+                close but not the same quantity.
+              - `energy_traces`: per-frame, per-relaxation-step layerwise
+                energy breakdown if `return_layerwise=True` (shape
+                `(run_length, n_infer_steps, num_layers + 1)` -- one
+                scalar per layer per step per frame, see
+                `tpch_energy_fn`'s `return_layerwise` docstring for the
+                layer order -- cheap even for a whole eval/inference run, since
+                each entry is a single float, not a full state vector),
+                else `None`. Same call-time-bool pattern as
+                `make_eval_step`: traced once per distinct value passed,
+                cached thereafter, so toggling it doesn't cost a retrace
+                per call. Realistically only useful at goldilocks-sized
+                `run_length` regardless of its own (small) cost, since
+                that's what periodic checkpointing/plotting already
+                requires -- there's no way to interrupt a `scan` mid-run
+                to look at it anyway.
+    """
+    @eqx.filter_jit
+    def eval_run(model: TpchModel, states_prev: Activities, ys: Array, return_layerwise: bool = False):
+        def step(states_prev, y_t):
+            states_curr_init = model.init_activities(states_prev, control_input)
+            _, y_hat_before = model.predict(states_prev, states_curr_init, control_input)
+            energy_before_t = model.tpch_energy_fn(states_prev, states_curr_init, y_t, control_input)
+
+            settle_result = model.settle_scan(
+                activity_optim, states_prev, y_t, control_input, n_steps=n_infer_steps, return_layerwise=return_layerwise
+            )
+            states_curr, energy_trace_t = settle_result if return_layerwise else (settle_result, None)
+
+            _, y_hat_after = model.predict(states_prev, states_curr, control_input)
+            energy_after_t = model.tpch_energy_fn(states_prev, states_curr, y_t, control_input)
+
+            return states_curr, (
+                y_hat_before, y_hat_after, energy_before_t, energy_after_t, energy_trace_t
+            )
+
+        states_curr, (y_hat_before, y_hat_after, energies_before, energies_after, energy_traces) = jax.lax.scan(
+            step, states_prev, xs=ys, length=run_length
+        )
+        return states_curr, y_hat_before, y_hat_after, energies_before, energies_after, energy_traces
+
+    return eval_run
+
+
 
 def make_train_step(param_optim: optax.GradientTransformation, activity_optim: optax.GradientTransformation, n_infer_steps: int, control_input: Optional[Array] = None):
     """Builds one fully-jitted training step: settle -> log-quantities -> weight update.
@@ -2005,3 +2176,211 @@ def make_train_run_diffrax(
         )
 
     return train_run
+
+
+# =============================================================================
+# 10. Diffrax eval (inference-only) helpers
+# =============================================================================
+# Diffrax analogues of `make_eval_step` / `make_eval_run` above: identical to
+# `make_train_step_diffrax` / `make_train_run_diffrax` except that no weight
+# update happens (so there is no `param_optim` / `param_opt_state`, and
+# `model` is not returned). The pre-inference half of the frame is shared
+# outright via `_train_frame_pre` (it never touches weights, so despite the
+# name it is equally an eval helper); `_eval_frame_post` below is the
+# weight-update-free counterpart of `_train_frame_post`.
+# ---------------------------------------------------------------------------
+
+def _eval_frame_post(model, states_prev, states_curr, y, control_input):
+    """Post-inference half of one EVAL frame: prediction/energy of the
+    settled state, and nothing else -- i.e. `_train_frame_post` minus the
+    `param_grad` / optax weight update. Identical for every settling
+    mechanism, for the same reason `_train_frame_post` is.
+    """
+    _, y_hat_after = model.predict(states_prev, states_curr, control_input)
+    energy_after = model.tpch_energy_fn(states_prev, states_curr, y, control_input)
+    return y_hat_after, energy_after
+
+
+def make_eval_step_diffrax(
+    max_t1: float = 20.0,
+    dt0: Optional[float] = None,
+    n_save: int = 20,
+    solver: Optional[diffrax.AbstractSolver] = None,
+    stepsize_controller: Optional[diffrax.AbstractStepSizeController] = None,
+    steady_state_tol: Optional[float] = 1e-3,
+    steady_state_criterion: str = "rms",
+    steady_state_rtol: Optional[float] = None,
+    steady_state_atol: Optional[float] = None,
+    control_input: Optional["Array"] = None,
+):
+    """Diffrax analogue of `make_eval_step`, and the inference-only
+    counterpart of `make_train_step_diffrax`: builds one fully-jitted eval
+    step (zero weight updates) using `model.settle_diffrax` in place of
+    `model.settle_scan` for the inference/settling half.
+
+    There's no `activity_optim` (unlike `make_eval_step`) -- activity
+    relaxation is governed by `solver` / `stepsize_controller` and
+    `steady_state_tol`, exactly as in `make_train_step_diffrax`, whose
+    Args section documents each of those knobs in full. There's also no
+    `param_optim`, since nothing is learned.
+
+    Same call-time-bool compile-caching behaviour as `make_eval_step`: the
+    returned `eval_step` is traced once per distinct `return_layerwise`
+    value on first use, then reused thereafter.
+
+    Args:
+        max_t1, dt0, n_save, solver, stepsize_controller, steady_state_tol,
+        steady_state_criterion, steady_state_rtol, steady_state_atol:
+            Passed straight through to `model.settle_diffrax`, and fixed at
+            build time -- see `make_train_step_diffrax`'s Args (and
+            `settle_diffrax`'s docstring) for what each one does. `None`
+            for `solver` / `stepsize_controller` resolves to
+            `diffrax.Heun()` / `diffrax.PIDController(rtol=1e-3, atol=1e-3)`.
+        control_input: Optional control-layer input, constant for the whole
+            eval run and closed over here rather than passed to
+            `eval_step` each call, same as in `make_eval_step`.
+
+    Returns:
+        eval_step: A function with signature
+            `eval_step(model, states_prev, y, return_layerwise=False)`
+            -> `(states_curr, y_hat_before, y_hat_after, energy_before,
+            energy_after, energy_trace, ts)`, where the first five entries
+            match `make_eval_step`'s `eval_step` exactly (same meaning,
+            same shapes), and:
+            - `energy_trace`: per-layer energy breakdown at each of the
+                `n_save + 2` save points if `return_layerwise=True`, else
+                `None` -- see `settle_diffrax`'s `Returns` for shape and
+                the inf/nan-padding caveat on early-converged frames.
+            - `ts`: the times each row of `energy_trace` was recorded at,
+                shape `(n_save + 2,)`, or `None` if
+                `return_layerwise=False`. Mask both with
+                `jnp.isfinite(ts)` before plotting/aggregating.
+    """
+    if solver is None:
+        solver = diffrax.Heun()
+    if stepsize_controller is None:
+        stepsize_controller = diffrax.PIDController(rtol=1e-3, atol=1e-3)
+
+    @eqx.filter_jit
+    def eval_step(model: "TpchModel", states_prev, y, return_layerwise: bool = False):
+        y_hat_before, energy_before = _train_frame_pre(model, states_prev, y, control_input)
+
+        settle_result = model.settle_diffrax(
+            states_prev, y, control_input,
+            max_t1=max_t1, dt0=dt0, n_save=n_save,
+            solver=solver, stepsize_controller=stepsize_controller,
+            steady_state_tol=steady_state_tol, steady_state_criterion=steady_state_criterion,
+            steady_state_rtol=steady_state_rtol, steady_state_atol=steady_state_atol,
+            return_layerwise=return_layerwise,
+        )
+        if return_layerwise:
+            states_curr, energy_trace, ts = settle_result
+        else:
+            states_curr, energy_trace, ts = settle_result, None, None
+
+        y_hat_after, energy_after = _eval_frame_post(model, states_prev, states_curr, y, control_input)
+
+        return states_curr, y_hat_before, y_hat_after, energy_before, energy_after, energy_trace, ts
+
+    return eval_step
+
+
+def make_eval_run_diffrax(
+    run_length: int,
+    max_t1: float = 20.0,
+    dt0: Optional[float] = None,
+    n_save: int = 20,
+    solver: Optional[diffrax.AbstractSolver] = None,
+    stepsize_controller: Optional[diffrax.AbstractStepSizeController] = None,
+    steady_state_tol: Optional[float] = 1e-3,
+    steady_state_criterion: str = "rms",
+    steady_state_rtol: Optional[float] = None,
+    steady_state_atol: Optional[float] = None,
+    control_input: Optional["Array"] = None,
+):
+    """Diffrax analogue of `make_eval_run`, and the inference-only
+    counterpart of `make_train_run_diffrax`: builds one fully-jitted,
+    multi-frame eval run using `model.settle_diffrax` in place of
+    `model.settle_scan`, `run_length` frames fused into a single outer
+    `jax.lax.scan` (with `states_prev` as the only carry -- the model is
+    frozen, so it is closed over rather than threaded through).
+
+    The safety argument in `make_train_run_diffrax`'s docstring applies
+    here with even less to check: no gradient is ever taken through the
+    settling process (there isn't even a `param_grad` call), so no adjoint
+    machinery is involved, and each frame's `diffeqsolve` still gets its
+    own independent Mode 1 early termination inside the scan.
+
+    Args:
+        run_length: Number of frames processed per call to the returned
+            `eval_run` -- the length of this function's own outer
+            `jax.lax.scan`. Fixed at build time, same reasoning as
+            `make_eval_run`. Set to the length of one `ys` block you'll
+            pass in.
+        max_t1, dt0, n_save, solver, stepsize_controller, steady_state_tol,
+        steady_state_criterion, steady_state_rtol, steady_state_atol:
+            Passed straight through to `model.settle_diffrax` at every
+            frame -- see `make_eval_step_diffrax` /
+            `make_train_step_diffrax` for what each one does.
+        control_input: Optional control-layer input, constant for every
+            frame in the run and closed over here, same as
+            `make_eval_run`.
+
+    Returns:
+        eval_run: A function with signature
+            `eval_run(model, states_prev, ys, return_layerwise=False)`
+            -> `(states_curr, y_hat_before, y_hat_after, energies_before,
+            energies_after, energy_traces, ts_traces)`, where `ys` is an
+            array of `run_length` observations (leading axis =
+            `run_length`), and the first five entries match
+            `make_eval_run`'s `eval_run` exactly (same meaning, same
+            shapes) except:
+              - `energy_traces`: shape `(run_length, n_save + 2,
+                num_layers + 1)` if `return_layerwise=True`, else `None`
+                (middle dimension is `n_save + 2` rather than
+                `n_infer_steps`, per `settle_diffrax`'s docstring).
+              - `ts_traces`: shape `(run_length, n_save + 2)` if
+                `return_layerwise=True`, else `None`. Frame `i`'s
+                `ts_traces[i]` may contain `inf` entries from that
+                frame's own early termination; mask each frame with
+                `jnp.isfinite(ts_traces[i])` before plotting/aggregating.
+    """
+    if solver is None:
+        solver = diffrax.Heun()
+    if stepsize_controller is None:
+        stepsize_controller = diffrax.PIDController(rtol=1e-3, atol=1e-3)
+
+    @eqx.filter_jit
+    def eval_run(model: "TpchModel", states_prev: "Activities", ys: "Array", return_layerwise: bool = False):
+        def step(states_prev, y_t):
+            y_hat_before, energy_before_t = _train_frame_pre(model, states_prev, y_t, control_input)
+
+            settle_result = model.settle_diffrax(
+                states_prev, y_t, control_input,
+                max_t1=max_t1, dt0=dt0, n_save=n_save,
+                solver=solver, stepsize_controller=stepsize_controller,
+                steady_state_tol=steady_state_tol, steady_state_criterion=steady_state_criterion,
+                steady_state_rtol=steady_state_rtol, steady_state_atol=steady_state_atol,
+                return_layerwise=return_layerwise,
+            )
+            if return_layerwise:
+                states_curr, energy_trace_t, ts_t = settle_result
+            else:
+                states_curr, energy_trace_t, ts_t = settle_result, None, None
+
+            y_hat_after, energy_after_t = _eval_frame_post(model, states_prev, states_curr, y_t, control_input)
+
+            return states_curr, (
+                y_hat_before, y_hat_after, energy_before_t, energy_after_t, energy_trace_t, ts_t
+            )
+
+        states_curr, (
+            y_hat_before, y_hat_after, energies_before, energies_after, energy_traces, ts_traces
+        ) = jax.lax.scan(step, states_prev, xs=ys, length=run_length)
+
+        return (
+            states_curr, y_hat_before, y_hat_after,
+            energies_before, energies_after, energy_traces, ts_traces,
+        )
+
+    return eval_run

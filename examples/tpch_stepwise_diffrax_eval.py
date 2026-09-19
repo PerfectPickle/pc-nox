@@ -51,7 +51,7 @@ warnings.filterwarnings("ignore", category=RuntimeWarning, message=".*os.fork.*"
 
 from pc_nox.utils.visualisation import compile_videos_from_frames, plot_train_energies, PredictionRecorder, replay_recordings
 from pc_nox.utils.checkpoints import find_latest_checkpoint, load_metadata
-from pc_nox.models.tpch import TpchModel, make_train_step_diffrax
+from pc_nox.models.tpch import TpchModel, make_eval_step_diffrax
 from pc_nox.utils.optim_registry import build_optim
 from pc_nox.utils.solver_registry import build_solver
 from pc_nox.utils.stepsize_controller_registry import build_stepsize_controller
@@ -65,22 +65,32 @@ import time
 # example_env.mp4 has 2000 frames
 N_TRAIN_ITERS = 1000
 
-# training step interval to save checkpoint at
-CHECKPOINT_INTERVAL = 500
+# training step interval to flush recordings to disk
+FLUSH_INTERVAL = 500
 
 # for plotting
 RECORD_ENERGIES = True
 
+# There's no fixed relaxation-step count with settle_diffrax (unlike settle_scan's
+# NUM_INFERENCE_STEPS): the solver takes an adaptive/event-terminated number of
+# internal steps per frame. n_save is just how many snapshots settle_diffrax saves
+# along the way -- used below purely as a display label, not a literal step count.
+DIFFRAX_N_SAVE = 20
+
 STEADY_STATE_CRITERION = "energy_rate" # How steady state is determined: "rms" (default), "relative_rms", or "energy_rate"
+STEADY_STATE_TOL = 1e-1
 
 # where the raw jax arrays get stored during inference/training
-PREDICTIONS_RECORDING_DIR = "visual_predictions_diff-load_raw"
+PREDICTIONS_RECORDING_DIR = "visual_predictions_diff-load_raw_eval"
 # where the reconstructed visual predictions get saved to
-PREDICTIONS_DIR = "visual_predictions_dif-load"
+PREDICTIONS_DIR = "visual_predictions_dif-load_eval"
 
 # Loading model, activities, and optimisers from saved checkpoint
 latest_checkpoint = find_latest_checkpoint(root="checkpoints/diffrax-save-relative", model_type="tpch")
 metadata = load_metadata(latest_checkpoint)
+
+ENV_WIDTH = metadata["env_width"]
+ENV_HEIGHT = metadata["env_height"]
 
 param_optim = build_optim(metadata["param_optim"]["name"], learning_rate=metadata["param_optim"]["learning_rate"])
 solver = build_solver(metadata["solver_name"])
@@ -107,11 +117,11 @@ frames = frames.reshape(frames.shape[0], -1)
 key = jr.PRNGKey(0)
 model_key, data_key = jr.split(key)
 
-recorder = PredictionRecorder(output_dir="visual_predictions_raw")
-train_step = make_train_step_diffrax(
-    param_optim, solver=solver, 
+recorder = PredictionRecorder(output_dir=PREDICTIONS_RECORDING_DIR)
+eval_step = make_eval_step_diffrax(
+    solver=solver, 
     stepsize_controller=stepsize_controller,
-    steady_state_tol=metadata["steady_state_tol"],
+    steady_state_tol=STEADY_STATE_TOL,
     steady_state_criterion=STEADY_STATE_CRITERION,
     control_input=control_input
     )
@@ -128,26 +138,23 @@ start_time = time.perf_counter()
 total_frames_processed = 0
 
 for i, y in enumerate(frames[START_FRAME_IDX:END_FRAME_IDX], start=START_FRAME_IDX):
-    # full JIT inference and weight update for the current frame
-    model, param_opt_state, states_curr, y_hat_before, y_hat_after, energy_before, energy_after, energy_trace, ts = train_step(
-        model, param_opt_state, states_prev, y, return_layerwise=RECORD_ENERGIES
+    # full JIT Diffrax inference for the current frame
+    states_curr, y_hat_before, y_hat_after, energy_before, energy_after, energy_trace, ts = eval_step(
+        model, states_prev, y, return_layerwise=RECORD_ENERGIES
     )
     total_frames_processed += 1
     if RECORD_ENERGIES:
-        energies.append(energy_trace.T)
+        all_energy_traces.append(energy_trace.T)
 
     recorder.append(
     y=y, prior_pred=y_hat_before, posterior_pred=y_hat_after,
-    inference_steps_made=NUM_INFERENCE_STEPS, frame_number=i,
+    inference_steps_made=DIFFRAX_N_SAVE, frame_number=i,
     )
-    if i % CHECKPOINT_INTERVAL == 0 or i == (N_TRAIN_ITERS - 1):
+    if i % FLUSH_INTERVAL == 0 or i == (END_FRAME_IDX - 1):
         print(f"{i}. VFE before inference: {energy_before}")
         print(f"{i}. VFE after inference: {energy_after}")
-        metadata["last_frame_processed"] = i
-        model.save_checkpoint(opt_state=param_opt_state, activities=states_curr, metadata=metadata)
         # Flush the prediction recorder to disk for later replaying / reconstruction
         recorder.flush()
-        print(f"Save raw y predictions to {PREDICTIONS_RECORDING_DIR}")
 
     # Pass settled states as previous states for step t + 1
     states_prev = states_curr
@@ -162,9 +169,9 @@ if total_frames_processed > 0:
     print(f"\nProcessed {total_frames_processed} frames in {int(mins)}m {secs:.2f}s")
     print(f"Average speed: {avg_ms_per_frame:.2f} ms/frame ({fps:.2f} FPS)\n")
 
-print("Plotting train energies...")
+print("Plotting energies...")
 plot_train_energies(
-    energies, 
+    all_energy_traces, 
     model=model, 
     save_plot=True, 
     separate_layers=True, 
@@ -183,6 +190,7 @@ replay_recordings(
     output_shape=(ENV_HEIGHT, ENV_WIDTH),
     total_frames=len(frames),
     output_dir=PREDICTIONS_DIR,
-    save_separate=True
+    save_separate=True,
+    show_steps_made=False
     )
 compile_videos_from_frames(output_dir=PREDICTIONS_DIR)

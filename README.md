@@ -10,10 +10,19 @@ This library aims to provide easy to use [Equinox](https://github.com/patrick-ki
 
 ## Other Features
 
+* **Flexible Inference & Training Modes**: Supports both fast, fixed-iteration execution fused via jax.lax.scan and adaptive ODE solving via [Diffrax](https://github.com/patrick-kidger/diffrax) - configurable step-by-step or chunk-by-chunk.
 * **Model Management**: Comprehensive save/load methods, supporting seamless training resumption irrespective of model type or training environment.
-* **Visual Prediction Plotting**: Compare ground truth to pre and post inference predictions in visual environments, with the option to save frames and video. 
-* **Flexible Inference & Training Modes**: Supports both step-by-step manual updates for granular control and debugging, as well as end-to-end jax.lax.scan fusion, step by step or chunk by chunk.
-* **PyHGF Compatability**: Version matches [pyHGF](https://github.com/ComputationalPsychiatry/pyhgf) (0.3.2) shared dependencies for cross compatability. Compatability will be maintained.
+* **Visual Prediction Plotting**: Compare ground truth to pre- and post-inference predictions in visual environments, with the option to save frames and video. 
+* **VFE Plotting**: Clear and configurable energy graphs.
+* **PyHGF Compatability**: Version matches [pyHGF](https://github.com/ComputationalPsychiatry/pyhgf) (0.3.2) shared dependencies for cross compatibility. Compatibility will be maintained.
+
+
+
+
+| Visual Predictions Plotting | Energy Graph |
+| :---: | :---: |
+| <img src=".github/images/predictions.gif" alt="Predictions" style="height: 250px; object-fit: contain; "> | <img src=".github/images/energies.png" alt="VFE Plot" style="height: 250px; object-fit: contain;"> |
+
 
 ## Planned Architectures
 
@@ -24,7 +33,6 @@ This library aims to provide easy to use [Equinox](https://github.com/patrick-ki
 ## Planned Features
 
 * **Analytics**: More test metrics and visualisation methods.
-* **Additional Inference Modes**: Inference using ODE solvers.
 
 
 ## Installation
@@ -48,8 +56,8 @@ pip install "jax[cuda12]>=0.4.38,<0.7" "jaxlib>=0.4.38,<0.7" "numpy>=2.0,<2.5" -
 
 ## See Also
 
-* **[JPC](https://github.com/thebuckleylab/jpc)**: Supports other cutting edge PC developments not covered by pc-nox, such as bidirectional PC, ePC, and more.
-* **[pyHGF](https://github.com/ComputationalPsychiatry/pyhgf)**: Rich framework for a variety of cutting edge networks such as the generalised Hierarchical Gaussian Filter.
+* **[JPC](https://github.com/thebuckleylab/jpc)**: A JAX predictive coding library, supporting many other developments not covered by pc-nox, such as bidirectional PC, ePC, and more.
+* **[pyHGF](https://github.com/ComputationalPsychiatry/pyhgf)**: Rich, modular framework for a variety of networks such as the generalised Hierarchical Gaussian Filter.
 
 
 ## References

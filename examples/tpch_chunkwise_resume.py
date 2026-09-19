@@ -90,13 +90,13 @@ import numpy as np
 import time
 
 # Number of settling iterations
-NUM_INFERENCE_STEPS = 50
+NUM_INFERENCE_STEPS = 20
 
 # example_env.mp4 has 2000 frames
-N_TRAIN_ITERS = 500
+N_TRAIN_ITERS = 1000
 
 # how many training iterations to perform per scan block
-SCAN_BLOCK_LENGTH = 250
+SCAN_BLOCK_LENGTH = 500
 
 # for plotting
 RECORD_ENERGIES = True

@@ -337,6 +337,7 @@ replay_recordings(
     output_shape=(ENV_HEIGHT, ENV_WIDTH),
     total_frames=len(frames),
     output_dir=PREDICTIONS_DIR,
-    save_separate=True
+    save_separate=True,
+    show_steps_made=False
     )
 compile_videos_from_frames(output_dir=PREDICTIONS_DIR)

@@ -79,6 +79,26 @@ def _procedural_layer_colormaps(num_layers):
     return colormaps
 
 
+def _apply_iteration_offset(cbar, iteration_offset: int = 0):
+    """
+    Relabels a "training iteration" colorbar's ticks so they show absolute
+    iteration numbers rather than 0-based positions within the recorded
+    window (e.g. when resuming from a checkpoint at iteration 5000, ticks
+    read 5000, 5100, ... instead of 0, 100, ...).
+
+    Only the tick *labels* change; the underlying norm and line colors are
+    untouched. No-op when `iteration_offset` is 0.
+    """
+    if iteration_offset == 0:
+        return cbar
+
+    ticks = cbar.get_ticks()
+    cbar.set_ticks(ticks)  # freeze tick positions before overriding labels
+    cbar.set_ticklabels([f"{int(t + iteration_offset)}" for t in ticks])
+    return cbar
+
+
+
 def _sanitize_for_filename(label):
     """
     Turns a layer label (which may contain LaTeX like r"$\\ell_{3}$", or
@@ -184,10 +204,7 @@ def _add_overlay_colorbar(fig, ax, norm, num_layers, iteration_offset: int = 0):
         cbar.ax.tick_params(labelsize=10)
 
     # Offset iterations legend if desired (e.g. when resuming checkpoints)
-    if iteration_offset != 0:
-        ticks = cbar.get_ticks()
-        cbar.set_ticks(ticks)
-        cbar.set_ticklabels([f"{int(t + iteration_offset)}" for t in ticks])
+    _apply_iteration_offset(cbar, iteration_offset=iteration_offset)
 
     return cbar
 
@@ -269,7 +286,7 @@ def plot_energies(
     share_y: bool, optional. Only relevant when `separate_layers=True`. If True, all subplots share one y-axis range. Default False, because e.g. an observation/output layer's energy can sit at a genuinely different scale than hidden layers -- a shared axis can flatten smaller-magnitude layers into an unreadable line.
     save_plot: bool, optional. Whether to save the main displayed figure (whatever `separate_layers`/`layout` produces) to `{output_dir}/train_energies.png`. Default False.
     save_overlay: bool, optional. If True, additionally renders and saves the single-axis, all-layers overlay to `{output_dir}/train_energies_overlay.png`, even when `separate_layers=True` is used for the main/displayed plot. Lets you keep both the "many small panels" and "everything at a glance" views without calling this function twice. Default False.
-    save_individual: bool, optional. If True, additionally saves each layer as its own standalone PNG under `{output_dir}/individual/`, named after the layer's (sanitized) label, e.g. `train_energies_03_hidden_2.png`. Useful for large networks where you want to inspect one layer at a time without regenerating the whole plot. Default False.
+    save_individual: bool, optional. If True, additionally saves each layer as its own standalone PNG under `{output_dir}/vfe_layerwise`, named after the layer's (sanitized) label, e.g. `train_energies_03_hidden_2.png`. Useful for large networks where you want to inspect one layer at a time without regenerating the whole plot. Default False.
     display: bool, optional. If true, the plot is displayed using plt.show().
     dpi: int, optional. What dpi (resolution) to save the plots at.
     output_dir: str, optional. Directory under which plots are saved, if any of the `save_*` options are True. Default "figures".
@@ -378,7 +395,8 @@ def plot_energies(
         cbar = fig.colorbar(sm, ax=list(used_axes), fraction=0.02, pad=0.02)
         cbar.set_label("Training iteration", fontsize=12, labelpad=12)
         cbar.ax.tick_params(labelsize=10)
-
+        # Offset iterations legend if desired (e.g. when resuming checkpoints)
+        _apply_iteration_offset(cbar, iteration_offset)
     else:
         fig, ax = plt.subplots(figsize=(8, 4))
         _draw_overlay(ax, num_layers, energies, trace_lengths, colormaps, norm, iter_positions,
@@ -415,6 +433,11 @@ def plot_energies(
         for i in range(num_layers):
             ind_fig, ind_ax = plt.subplots(figsize=(6, 3.5), layout="constrained")
             _draw_layer_traces(ind_ax, i, energies, trace_lengths, colormaps[i], norm, iter_positions)
+            sm = plt.cm.ScalarMappable(cmap=plt.get_cmap("Greys"), norm=norm)
+            ind_cbar = ind_fig.colorbar(sm, ax=ind_ax)
+            ind_cbar.set_label("Training iteration", fontsize=11)
+            ind_cbar.ax.tick_params(labelsize=10)
+            _apply_iteration_offset(ind_cbar, iteration_offset)
             ind_ax.set_title(layer_labels[i], fontsize=13)
             ind_ax.set_xlabel(x_axis_label, fontsize=12)
             ind_ax.set_ylabel(ylabel, fontsize=12)
@@ -503,7 +526,7 @@ class VisualPredictionPlotter:
           for constructing output filenames
         show_combined : bool, optional.  
           Whether to draw the figure to its canvas and pause briefly
-          (interactive display). Default True
+          (interactive display). Default False
         save_combined : bool, optional.  
           Whether to save the combined 3-panel figure to disk.
           Saved under `{output_dir}/combined/frame_{frame_number:0N}.png`.

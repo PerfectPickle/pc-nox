@@ -62,8 +62,8 @@ and post-run visualization.
  
 6. Post-Run Visualization
  
-   * Generates layerwise inference-energy plots from the accumulated traces, offset
-     so the horizontal axis reflects absolute frame indices.
+   * Generates layerwise inference-energy plots from the accumulated traces, with
+     the training-iteration colour scale offset so it reflects absolute frame indices.
    * Replays raw prediction recordings to reconstruct image-space prediction frames.
    * Compiles the reconstructed prediction frames into output video files.
  

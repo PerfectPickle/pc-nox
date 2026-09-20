@@ -2,7 +2,7 @@
 Pytest suite for visualisation.py.
 
 Covers: colormap generation helpers, filename sanitizing, grid-dimension
-sizing, the low-level drawing helpers, plot_train_energies (validation,
+sizing, the low-level drawing helpers, plot_energies (validation,
 layout selection, file outputs), VisualPredictionPlotter (state mutation
 and file outputs), PredictionRecorder + replay_recordings (the buffered
 recording / offline-replay pipeline), the natural sort key, and
@@ -287,35 +287,35 @@ class TestDrawOverlay:
 
 
 # --------------------------------------------------------------------------
-# plot_train_energies
+# plot_energies
 # --------------------------------------------------------------------------
 
 class TestPlotTrainEnergies:
 
     def test_invalid_layout_raises(self):
         with pytest.raises(ValueError, match="layout"):
-            viz.plot_train_energies(make_energies(), layout="diagonal", display=False)
+            viz.plot_energies(make_energies(), layout="diagonal", display=False)
 
     def test_invalid_color_scheme_raises(self):
         with pytest.raises(ValueError, match="color_scheme"):
-            viz.plot_train_energies(make_energies(), color_scheme="rainbow", display=False)
+            viz.plot_energies(make_energies(), color_scheme="rainbow", display=False)
 
     def test_layer_labels_length_mismatch_raises(self):
         with pytest.raises(ValueError, match="layer_labels"):
-            viz.plot_train_energies(make_energies(num_layers=3), layer_labels=["a", "b"], display=False)
+            viz.plot_energies(make_energies(num_layers=3), layer_labels=["a", "b"], display=False)
 
     def test_colormaps_length_mismatch_raises(self):
         with pytest.raises(ValueError, match="colormaps"):
-            viz.plot_train_energies(make_energies(num_layers=3), colormaps=["viridis", "plasma"],
+            viz.plot_energies(make_energies(num_layers=3), colormaps=["viridis", "plasma"],
                                      display=False)
 
     def test_runs_without_error_default_args(self):
-        viz.plot_train_energies(make_energies(), display=False)
+        viz.plot_energies(make_energies(), display=False)
 
     def test_default_labels_are_generic_ell(self, tmp_path):
         # Indirect check: individual export file names embed the sanitized label.
         energies = make_energies(num_layers=2)
-        viz.plot_train_energies(energies, save_individual=True, output_dir=str(tmp_path), display=False)
+        viz.plot_energies(energies, save_individual=True, output_dir=str(tmp_path), display=False)
         files = sorted(os.listdir(tmp_path / "vfe_layerwise"))
         assert any("ell_1" in f for f in files)
         assert any("ell_2" in f for f in files)
@@ -328,7 +328,7 @@ class TestPlotTrainEnergies:
             def layer_labels(cls, config):
                 return ["alpha", "beta"]
 
-        viz.plot_train_energies(make_energies(num_layers=2), model=FakeModel(),
+        viz.plot_energies(make_energies(num_layers=2), model=FakeModel(),
                                  save_individual=True, output_dir=str(tmp_path), display=False)
         files = sorted(os.listdir(tmp_path / "vfe_layerwise"))
         assert any("alpha" in f for f in files)
@@ -342,7 +342,7 @@ class TestPlotTrainEnergies:
             def layer_labels(cls, config):
                 raise NotImplementedError
 
-        viz.plot_train_energies(make_energies(num_layers=2), model=FakeModel(),
+        viz.plot_energies(make_energies(num_layers=2), model=FakeModel(),
                                  save_individual=True, output_dir=str(tmp_path), display=False)
         files = sorted(os.listdir(tmp_path / "vfe_layerwise"))
         assert any("ell_1" in f for f in files)
@@ -355,7 +355,7 @@ class TestPlotTrainEnergies:
             def layer_labels(cls, config):
                 return ["should_not_be_used_a", "should_not_be_used_b"]
 
-        viz.plot_train_energies(make_energies(num_layers=2), model=FakeModel(),
+        viz.plot_energies(make_energies(num_layers=2), model=FakeModel(),
                                  layer_labels=["explicit_a", "explicit_b"],
                                  save_individual=True, output_dir=str(tmp_path), display=False)
         files = sorted(os.listdir(tmp_path / "vfe_layerwise"))
@@ -363,34 +363,34 @@ class TestPlotTrainEnergies:
         assert not any("should_not_be_used" in f for f in files)
 
     def test_save_plot_writes_expected_file(self, tmp_path):
-        viz.plot_train_energies(make_energies(), save_plot=True, output_dir=str(tmp_path), display=False)
+        viz.plot_energies(make_energies(), save_plot=True, output_dir=str(tmp_path), display=False)
         assert (tmp_path / "train_energies.png").exists()
 
     def test_save_overlay_writes_expected_file_only_with_separate_layers(self, tmp_path):
         # save_overlay is documented as only taking effect when separate_layers=True
-        viz.plot_train_energies(make_energies(), save_overlay=True, separate_layers=True,
+        viz.plot_energies(make_energies(), save_overlay=True, separate_layers=True,
                                  output_dir=str(tmp_path), display=False)
         assert (tmp_path / "train_energies_overlay.png").exists()
 
     def test_save_overlay_ignored_without_separate_layers(self, tmp_path):
-        viz.plot_train_energies(make_energies(), save_overlay=True, separate_layers=False,
+        viz.plot_energies(make_energies(), save_overlay=True, separate_layers=False,
                                  output_dir=str(tmp_path), display=False)
         assert not (tmp_path / "train_energies_overlay.png").exists()
 
     def test_save_individual_writes_one_file_per_layer(self, tmp_path):
         num_layers = 4
-        viz.plot_train_energies(make_energies(num_layers=num_layers), save_individual=True,
+        viz.plot_energies(make_energies(num_layers=num_layers), save_individual=True,
                                  output_dir=str(tmp_path), display=False)
         files = os.listdir(tmp_path / "vfe_layerwise")
         assert len(files) == num_layers
 
     def test_no_files_written_when_no_save_flag_set(self, tmp_path):
-        viz.plot_train_energies(make_energies(), output_dir=str(tmp_path), display=False)
+        viz.plot_energies(make_energies(), output_dir=str(tmp_path), display=False)
         assert not tmp_path.exists() or os.listdir(tmp_path) == []
 
     def test_all_figures_closed_after_call(self, tmp_path):
         before = len(plt.get_fignums())
-        viz.plot_train_energies(make_energies(num_layers=3), save_overlay=True,
+        viz.plot_energies(make_energies(num_layers=3), save_overlay=True,
                                  save_individual=True, separate_layers=True, display=False,
                                  output_dir=str(tmp_path))
         after = len(plt.get_fignums())
@@ -402,49 +402,49 @@ class TestPlotTrainEnergies:
         monkeypatch.setattr(viz, "_grid_dims", spy)
 
         # below threshold -> column layout, _grid_dims not consulted
-        viz.plot_train_energies(make_energies(num_layers=3), separate_layers=True,
+        viz.plot_energies(make_energies(num_layers=3), separate_layers=True,
                                  layout="auto", grid_threshold=6, display=False)
         assert spy.call_count == 0
 
         # above threshold -> grid layout, _grid_dims consulted
-        viz.plot_train_energies(make_energies(num_layers=8), separate_layers=True,
+        viz.plot_energies(make_energies(num_layers=8), separate_layers=True,
                                  layout="auto", grid_threshold=6, display=False)
         assert spy.call_count == 1
 
     def test_explicit_grid_layout_used_even_for_few_layers(self, monkeypatch):
         spy = MagicMock(side_effect=viz._grid_dims)
         monkeypatch.setattr(viz, "_grid_dims", spy)
-        viz.plot_train_energies(make_energies(num_layers=2), separate_layers=True,
+        viz.plot_energies(make_energies(num_layers=2), separate_layers=True,
                                  layout="grid", display=False)
         assert spy.call_count == 1
 
     def test_explicit_column_layout_used_even_for_many_layers(self, monkeypatch):
         spy = MagicMock(side_effect=viz._grid_dims)
         monkeypatch.setattr(viz, "_grid_dims", spy)
-        viz.plot_train_energies(make_energies(num_layers=12), separate_layers=True,
+        viz.plot_energies(make_energies(num_layers=12), separate_layers=True,
                                  layout="column", display=False)
         assert spy.call_count == 0
 
     def test_t_max_does_not_crash_with_varying_trace_lengths(self):
         energies = make_energies(num_iterations=3, num_layers=2, time_steps=10, varying_lengths=True)
-        viz.plot_train_energies(energies, t_max=3, display=False)
+        viz.plot_energies(energies, t_max=3, display=False)
 
     def test_explicit_colormaps_accepted_as_strings_and_objects(self):
         cmaps = ["viridis", plt.get_cmap("plasma")]
-        viz.plot_train_energies(make_energies(num_layers=2), colormaps=cmaps, display=False)
+        viz.plot_energies(make_energies(num_layers=2), colormaps=cmaps, display=False)
 
     # ---- Diffrax-style (inf-padded) traces -----------------------------------
     # settle_diffrax leaves the unused tail of its fixed-size save buffer as
     # inf rather than back-filling it (see settle_diffrax's docstring in
     # tpch.py), so a training loop that records its energy_trace straight
-    # into `energies` hands plot_train_energies fixed-shape arrays with a
+    # into `energies` hands plot_energies fixed-shape arrays with a
     # trailing inf run on any iteration that converged early. The tests
     # below exercise exactly that shape, via _trace_valid_length's
-    # integration into plot_train_energies (rather than just the unit tests
+    # integration into plot_energies (rather than just the unit tests
     # on _trace_valid_length itself, above).
 
     def test_inf_padded_diffrax_style_traces_are_trimmed_before_drawing(self, monkeypatch):
-        """End-to-end: plot_train_energies must run each iteration's trace
+        """End-to-end: plot_energies must run each iteration's trace
         through _trace_valid_length before handing trace_lengths to the
         drawing helpers, so an early-converged settle_diffrax iteration
         (fixed shape, inf-padded tail) is trimmed exactly like a genuinely
@@ -456,7 +456,7 @@ class TestPlotTrainEnergies:
         valid_lengths = [time_steps, 4, time_steps]
         energies = make_energies_with_valid_lengths(valid_lengths, num_layers=2, time_steps=time_steps)
 
-        viz.plot_train_energies(energies, separate_layers=True, display=False)
+        viz.plot_energies(energies, separate_layers=True, display=False)
 
         # _draw_layer_traces is called once per layer, but trace_lengths (arg
         # index 3) is the same list every time -- check the first call only.
@@ -473,7 +473,7 @@ class TestPlotTrainEnergies:
         valid_lengths = [time_steps, 4, time_steps]
         energies = make_energies_with_valid_lengths(valid_lengths, num_layers=2, time_steps=time_steps)
 
-        viz.plot_train_energies(energies, t_max=6, separate_layers=True, display=False)
+        viz.plot_energies(energies, t_max=6, separate_layers=True, display=False)
 
         trace_lengths = spy.call_args_list[0].args[3]
         assert trace_lengths == [6, 4, 6]
@@ -486,7 +486,7 @@ class TestPlotTrainEnergies:
         monkeypatch.setattr(viz, "_draw_layer_traces", spy)
 
         energies = make_energies(num_iterations=3, num_layers=2, time_steps=7)
-        viz.plot_train_energies(energies, separate_layers=True, display=False)
+        viz.plot_energies(energies, separate_layers=True, display=False)
 
         trace_lengths = spy.call_args_list[0].args[3]
         assert trace_lengths == [7, 7, 7]
@@ -495,14 +495,14 @@ class TestPlotTrainEnergies:
         time_steps = 8
         valid_lengths = [time_steps, 3, 5, time_steps]
         energies = make_energies_with_valid_lengths(valid_lengths, num_layers=4, time_steps=time_steps)
-        viz.plot_train_energies(energies, display=False)  # overlay (default)
-        viz.plot_train_energies(energies, separate_layers=True, layout="grid", display=False)
+        viz.plot_energies(energies, display=False)  # overlay (default)
+        viz.plot_energies(energies, separate_layers=True, layout="grid", display=False)
 
     def test_diffrax_style_traces_do_not_crash_when_saved(self, tmp_path):
         time_steps = 6
         valid_lengths = [time_steps, 2, time_steps]
         energies = make_energies_with_valid_lengths(valid_lengths, num_layers=2, time_steps=time_steps)
-        viz.plot_train_energies(
+        viz.plot_energies(
             energies, save_plot=True, save_overlay=True, save_individual=True,
             separate_layers=True, display=False, output_dir=str(tmp_path),
         )
@@ -514,7 +514,7 @@ class TestPlotTrainEnergies:
         spy = MagicMock(side_effect=viz._draw_overlay)
         monkeypatch.setattr(viz, "_draw_overlay", spy)
 
-        viz.plot_train_energies(make_energies(), display=False)
+        viz.plot_energies(make_energies(), display=False)
 
         ax = spy.call_args_list[0].args[0]
         assert ax.get_xlabel() == "Inference iterations"
@@ -523,7 +523,7 @@ class TestPlotTrainEnergies:
         spy = MagicMock(side_effect=viz._draw_overlay)
         monkeypatch.setattr(viz, "_draw_overlay", spy)
 
-        viz.plot_train_energies(make_energies(), x_axis_label="Inference time (t)", display=False)
+        viz.plot_energies(make_energies(), x_axis_label="Inference time (t)", display=False)
 
         ax = spy.call_args_list[0].args[0]
         assert ax.get_xlabel() == "Inference time (t)"
@@ -539,7 +539,7 @@ class TestPlotTrainEnergies:
 
         monkeypatch.setattr(plt, "subplots", capturing_subplots)
 
-        viz.plot_train_energies(
+        viz.plot_energies(
             make_energies(num_layers=2), separate_layers=True,
             x_axis_label="Inference time (t)", display=False,
         )
@@ -550,7 +550,7 @@ class TestPlotTrainEnergies:
         spy = MagicMock(side_effect=viz._draw_layer_traces)
         monkeypatch.setattr(viz, "_draw_layer_traces", spy)
 
-        viz.plot_train_energies(
+        viz.plot_energies(
             make_energies(num_layers=2), save_individual=True, x_axis_label="Inference time (t)",
             display=False, output_dir=str(tmp_path),
         )

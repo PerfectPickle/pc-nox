@@ -28,8 +28,8 @@ visualization.
 
 3. Block-Scanned Training
 
-   * Divides the remaining training sequence into fixed-length blocks defined by
-     `SCAN_BLOCK_LENGTH`.
+   * Divides the next `N_TRAIN_ITERS` frames (capped at the end of the video) into
+     fixed-length blocks defined by `SCAN_BLOCK_LENGTH`.
    * Executes inference and parameter learning for each block through `make_train_run`.
    * Performs `NUM_INFERENCE_STEPS` activity-settling iterations for every frame
      within the scanned block.
@@ -73,12 +73,15 @@ visualization.
   during the training loop.
   """
 
+from pathlib import Path
 import imageio.v2 as imageio
-raw_frames = imageio.mimread("example_env.mp4", memtest=False) # read this before importing JAX, to avoid os.fork() issues
+video_path = Path(__file__).resolve().parent.parent / "example_env.mp4"
+raw_frames = imageio.mimread(str(video_path), memtest=False) # read this before importing JAX, to avoid os.fork() issues
+
 import warnings
 warnings.filterwarnings("ignore", category=RuntimeWarning, message=".*os.fork.*") # to ignore compile_videos() warning
 
-from pc_nox.utils.visualisation import VisualPredictionPlotter, compile_videos_from_frames, plot_train_energies, PredictionRecorder, replay_recordings
+from pc_nox.utils.visualisation import VisualPredictionPlotter, compile_videos_from_frames, plot_energies, PredictionRecorder, replay_recordings
 from pc_nox.models.tpch import TpchModel, make_train_step, make_train_run
 from pc_nox.utils.optim_registry import build_optim
 from pc_nox.utils.checkpoints import find_latest_checkpoint, load_metadata
@@ -102,14 +105,16 @@ SCAN_BLOCK_LENGTH = 500
 RECORD_ENERGIES = True
 
 # where the raw jax arrays get stored during inference/training
-PREDICTIONS_RECORDING_DIR = "visual_predictions_raw-load"
+PREDICTIONS_RECORDING_DIR = "visual_predictions_raw"
 # where the reconstructed visual predictions get saved to
-PREDICTIONS_DIR = "visual_predictions-load"
+PREDICTIONS_DIR = "visual_predictions"
+
+CHECKPOINT_ROOT = "checkpoints/scan"
 
 control_input = None
 
 # Loading model, activities, and optimisers from saved checkpoint
-latest_checkpoint = find_latest_checkpoint(model_type="tpch")
+latest_checkpoint = find_latest_checkpoint(root=CHECKPOINT_ROOT, model_type="tpch")
 metadata = load_metadata(latest_checkpoint)
 
 param_optim = build_optim(metadata["param_optim"]["name"], learning_rate=metadata["param_optim"]["learning_rate"])
@@ -189,7 +194,7 @@ for block_start in range(START_FRAME_IDX, END_FRAME_IDX, SCAN_BLOCK_LENGTH):
     )
     # save checkpoint
     metadata["last_frame_processed"] = block_start + len(ys_block) - 1
-    model.save_checkpoint(path=f"checkpoints/step_{block_start}", metadata=metadata, opt_state=param_opt_state, activities=states_prev)
+    model.save_checkpoint(root=CHECKPOINT_ROOT, metadata=metadata, opt_state=param_opt_state, activities=states_prev)
 
     # Flush the prediction recorder to disk for later replaying / reconstruction
     recorder.flush()
@@ -198,7 +203,7 @@ for block_start in range(START_FRAME_IDX, END_FRAME_IDX, SCAN_BLOCK_LENGTH):
     if RECORD_ENERGIES:
         # energy_traces is (SCAN_BLOCK_LENGTH, NUM_INFERENCE_STEPS, num_layers+1) --
         # one entry per FRAME in this block, not one entry for the whole block.
-        # plot_train_energies wants one (num_layers, time_steps) array per
+        # plot_energies wants one (num_layers, time_steps) array per
         # recorded iteration, so unpack the block and transpose each frame.
         for frame_trace in np.asarray(energy_traces):
             all_energy_traces.append(frame_trace.T)
@@ -224,8 +229,8 @@ total_elapsed = time.perf_counter() - start_time
 all_energies_before = np.concatenate(all_energies_before)
 all_energies_after = np.concatenate(all_energies_after)
 
-eb = np.asarray(energies_before)
-ea = np.asarray(energies_after)
+eb = np.asarray(all_energies_before)
+ea = np.asarray(all_energies_after)
 deltas = eb - ea
 
 print(f"\n--- Overall VFE stats ---")
@@ -240,13 +245,13 @@ if total_frames_processed > 0:
     print(f"\nProcessed {total_frames_processed} frames in {int(mins)}m {secs:.2f}s")
     print(f"Average speed: {avg_ms_per_frame:.2f} ms/frame ({fps:.2f} FPS)\n")
 
-print("Plotting train energies...")
-plot_train_energies(
+print("Plotting energies...")
+plot_energies(
     all_energy_traces, 
     model=model, 
     save_plot=True, 
     separate_layers=True, 
-    output_dir="figures-load",
+    output_dir="figures",
     save_individual=True,
     save_overlay=True,
     display=False,

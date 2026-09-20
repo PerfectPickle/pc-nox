@@ -1,41 +1,50 @@
 """Frame-by-frame training of a Temporal Predictive Coding hierarchy using `make_train_step`.
-
+ 
 Demonstrates an interactive, per-step execution workflow for training a 
 temporal predictive coding model (`TpchModel`) on sequential video data. 
 Unlike fused block-scan implementations, this script executes a single JIT-compiled 
 training step within an outer Python loop. This approach prioritizes fine-grained 
 introspection, real-time logging, interactive visualization, and frequent 
 checkpointing over maximum XLA execution speed.
-
+ 
 Key Workflow Phases
 -------------------
 1. Data Ingestion & Preprocessing
-   - Reads input video (`example_env.mp4`) frame-by-frame.
+   - Loads the complete input video (`example_env.mp4`) into memory (before JAX is
+     imported, to avoid os.fork() issues).
    - Converts RGB frames to grayscale and normalizes pixel values to [0.0, 1.0].
-
+   - Flattens each frame's spatial dimensions into a vector matching the observation
+     layer of the predictive coding hierarchy.
+ 
 2. Model & Optimizer Initialization
-   - Instantiates a `TpchModel` hierarchy matched to environmental dimensions.
+   - Instantiates a fresh `TpchModel` hierarchy matched to environmental dimensions.
    - Configures separate Optax Adam optimizers for structural weight parameters 
      (`param_optim`) and latent activity relaxation (`activity_optim`).
+   - Draws a random set of initial "previous" activities for the first time step.
    - Constructs the JIT-compiled step function via `make_train_step`.
-
+ 
 3. Per-Step Iterative Training Loop
    - Loops over frame sequences in Python, executing `train_step` on each iteration.
    - Settles internal activities over `NUM_INFERENCE_STEPS` relaxation steps.
    - Updates model parameters based on settled state errors.
    - Carries settled states (`states_curr`) forward to initialize activities for 
      the subsequent time step (`states_prev`).
-
+ 
 4. In-Loop Introspection & Artifact Generation
-   - Logs Variational Free Energy (VFE) before and after activity settling.
+   - Logs Variational Free Energy (VFE) before and after activity settling at each
+     checkpoint interval and on the final frame.
    - Optionally records per-layer energy traces per relaxation step.
-   - Renders visual reconstructions (prior vs. posterior predictions) per frame.
-   - Saves model checkpoints and optimizer states at defined intervals.
-
+   - Records the target observation together with the prior and posterior
+     predictions for every frame via `PredictionRecorder`.
+   - At each checkpoint interval (and on the final frame), saves the model,
+     optimizer state, settled activities and metadata as a checkpoint, and flushes
+     the recorded predictions to disk.
+ 
 5. Post-Training Diagnostics
    - Plots layerwise energy traces across the entire training trajectory.
-   - Compiles generated visual prediction frames into output video files.
-
+   - Replays the raw prediction recordings to reconstruct image-space prediction frames.
+   - Compiles the reconstructed prediction frames into output video files.
+ 
 Trade-off Summary
 -----------------
 - Pros: Direct access to intermediate states per frame; effortless integration with 
@@ -44,12 +53,15 @@ Trade-off Summary
   fused `jax.lax.scan` execution (`make_train_run`).
 """
 
+from pathlib import Path
 import imageio.v2 as imageio
-raw_frames = imageio.mimread("example_env.mp4", memtest=False) # read this before importing JAX, to avoid os.fork() issues
+video_path = Path(__file__).resolve().parent.parent / "example_env.mp4"
+raw_frames = imageio.mimread(str(video_path), memtest=False) # read this before importing JAX, to avoid os.fork() issues
+
 import warnings
 warnings.filterwarnings("ignore", category=RuntimeWarning, message=".*os.fork.*") # to ignore compile_videos() warning
 
-from pc_nox.utils.visualisation import compile_videos_from_frames, plot_train_energies, PredictionRecorder, replay_recordings
+from pc_nox.utils.visualisation import compile_videos_from_frames, plot_energies, PredictionRecorder, replay_recordings
 from pc_nox.models.tpch import TpchModel, make_train_step
 import jax.random as jr
 import jax.numpy as jnp
@@ -74,6 +86,8 @@ RECORD_ENERGIES = True
 PREDICTIONS_RECORDING_DIR = "visual_predictions_raw"
 # where the reconstructed visual predictions get saved to
 PREDICTIONS_DIR = "visual_predictions"
+
+CHECKPOINT_ROOT = "checkpoints/scan"
 
 # Matching example_env.mp4
 ENV_WIDTH = 16 # pixels
@@ -126,9 +140,9 @@ model = TpchModel(
         # weight_decay=weight_decay, this is where regularisation can be enabled, disabled by default.
     )
 
-param_optim = optax.adam(learning_rate=1e-3)
+param_optim = optax.adam(learning_rate=PARAM_LR)
 param_opt_state = param_optim.init(eqx.filter(model, eqx.is_array))
-activity_optim = optax.adam(learning_rate=0.01)
+activity_optim = optax.adam(learning_rate=ACTIVITY_LR)
 
 
 # one random "previous states" tuple and one time step of data
@@ -138,7 +152,7 @@ states_prev = [
     for k, size in zip(jr.split(prev_key, 1 + len(HIDDEN_SHAPE)), [CONTROL_WIDTH] + HIDDEN_SHAPE)
 ]
 
-recorder = PredictionRecorder(output_dir="visual_predictions_raw")
+recorder = PredictionRecorder(output_dir=PREDICTIONS_RECORDING_DIR)
 train_step = make_train_step(param_optim, activity_optim, NUM_INFERENCE_STEPS, control_input)
 energies = []
 
@@ -163,7 +177,7 @@ for i, y in enumerate(frames[0:N_TRAIN_ITERS]):
         print(f"{i}. VFE before inference: {energy_before}")
         print(f"{i}. VFE after inference: {energy_after}")
         metadata["last_frame_processed"] = i
-        model.save_checkpoint(opt_state=param_opt_state, activities=states_curr, metadata=metadata)
+        model.save_checkpoint(root=CHECKPOINT_ROOT, opt_state=param_opt_state, activities=states_curr, metadata=metadata)
         # Flush the prediction recorder to disk for later replaying / reconstruction
         recorder.flush()
 
@@ -180,8 +194,8 @@ if total_frames_processed > 0:
     print(f"\nProcessed {total_frames_processed} frames in {int(mins)}m {secs:.2f}s")
     print(f"Average speed: {avg_ms_per_frame:.2f} ms/frame ({fps:.2f} FPS)\n")
 
-print("Plotting train energies...")
-plot_train_energies(
+print("Plotting energies...")
+plot_energies(
     energies, 
     model=model, 
     save_plot=True, 

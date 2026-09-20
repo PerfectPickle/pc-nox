@@ -227,7 +227,7 @@ def _trace_valid_length(energies_iter) -> int:
     return max(int(np.argmax(~finite_per_step)), 1)
 
 
-def plot_train_energies(
+def plot_energies(
     energies,
     model=None,
     t_max=None,

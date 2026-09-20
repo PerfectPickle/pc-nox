@@ -24,7 +24,8 @@ block-level checkpointing, prediction recording, and energy tracking.
      (`param_optim`). There's no separate activity optimizer here (unlike the
      settle_scan example): with `settle_diffrax`, activity relaxation is governed
      by the diffrax `solver` / `stepsize_controller` / `steady_state_tol` instead.
-   * Constructs the JIT-compiled block runner via `make_train_run_diffrax`.
+   * Constructs the JIT-compiled block runner via `make_train_run_diffrax`
+   * Draws a random set of initial "previous" activities for the first block..
 
 3. Block-Scanned Training
 
@@ -42,8 +43,8 @@ block-level checkpointing, prediction recording, and energy tracking.
 
    * Records target observations together with prior and posterior predictions for
      every frame in each processed block using `PredictionRecorder.append_block`.
-   * Saves a checkpoint after every block containing the updated model and
-     optimizer state.
+   * Saves a checkpoint after every block containing the updated model, optimizer
+     state, activities, and latest processed-frame metadata.
    * Flushes recorded prediction data to disk after each block so that recordings
      remain available for later reconstruction and replay.
 
@@ -51,7 +52,7 @@ block-level checkpointing, prediction recording, and energy tracking.
 
    * Collects per-frame, per-layer inference energy traces from each scanned block.
      Frames that reach steady state before `max_t1` leave an inf-padded tail in
-     their trace, which `plot_train_energies` trims automatically.
+     their trace, which `plot_energies` trims automatically.
    * Computes and reports mean VFE before settling, mean VFE after settling, and
      the corresponding energy reduction for each block, and overall.
    * Measures total wall-clock training time, average milliseconds per processed
@@ -77,12 +78,15 @@ block-level checkpointing, prediction recording, and energy tracking.
   training loop.
 """
 
+from pathlib import Path
 import imageio.v2 as imageio
-raw_frames = imageio.mimread("example_env.mp4", memtest=False) # read this before importing JAX, to avoid os.fork() issues
+video_path = Path(__file__).resolve().parent.parent / "example_env.mp4"
+raw_frames = imageio.mimread(str(video_path), memtest=False) # read this before importing JAX, to avoid os.fork() issues
+
 import warnings
 warnings.filterwarnings("ignore", category=RuntimeWarning, message=".*os.fork.*") # to ignore compile_videos() warning
 
-from pc_nox.utils.visualisation import compile_videos_from_frames, plot_train_energies, PredictionRecorder, replay_recordings
+from pc_nox.utils.visualisation import compile_videos_from_frames, plot_energies, PredictionRecorder, replay_recordings
 from pc_nox.models.tpch import TpchModel, make_train_run_diffrax
 from pc_nox.utils.optim_registry import build_optim
 from pc_nox.utils.solver_registry import build_solver
@@ -94,6 +98,7 @@ import optax
 import numpy as np
 import time
 
+
 # example_env.mp4 has 2000 frames
 N_TRAIN_ITERS = 1000
 
@@ -104,9 +109,11 @@ SCAN_BLOCK_LENGTH = 500
 RECORD_ENERGIES = True
 
 # where the raw jax arrays get stored during inference/training
-PREDICTIONS_RECORDING_DIR = "visual_predictions_raw-diffrax_save"
+PREDICTIONS_RECORDING_DIR = "visual_predictions_raw"
 # where the reconstructed visual predictions get saved to
-PREDICTIONS_DIR = "visual_predictions-diffrax_save"
+PREDICTIONS_DIR = "visual_predictions"
+
+CHECKPOINT_ROOT = "checkpoints/diffrax"
 
 # Matching example_env.mp4
 ENV_WIDTH = 16 # pixels
@@ -224,7 +231,7 @@ for block_start in range(START_FRAME_IDX, END_FRAME_IDX, SCAN_BLOCK_LENGTH):
     if current_block_len < SCAN_BLOCK_LENGTH:
         active_train_run = make_train_run_diffrax(
             param_optim, run_length=current_block_len, control_input=control_input,
-            solver=DIFFRAX_SOLVER, stepsize_controller=DIFFRAX_STEP_SIZE_CONTROLLER, n_save=DIFFRAX_N_SAVE,
+            solver=solver, stepsize_controller=stepsize_controller, n_save=DIFFRAX_N_SAVE,
             steady_state_tol=STEADY_STATE_TOL, steady_state_criterion=STEADY_STATE_CRITERION,
             steady_state_atol=STEADY_STATE_ATOL, steady_state_rtol=STEADY_STATE_RTOL
         )
@@ -234,7 +241,7 @@ for block_start in range(START_FRAME_IDX, END_FRAME_IDX, SCAN_BLOCK_LENGTH):
     # JIT compiled inference + learning for current block
     # make_train_run_diffrax returns 9 values (make_train_run's 8, plus ts_traces --
     # the per-frame integration-time grid corresponding to energy_traces). ts_traces
-    # isn't needed here: plot_train_energies trims each frame's inf-padded tail on
+    # isn't needed here: plot_energies trims each frame's inf-padded tail on
     # its own, from the energy values alone.
     model, param_opt_state, states_prev, y_before, y_after, energies_before, energies_after, energy_traces, ts_traces = active_train_run(
         model, param_opt_state, states_prev, ys_block, return_layerwise=True
@@ -258,7 +265,7 @@ for block_start in range(START_FRAME_IDX, END_FRAME_IDX, SCAN_BLOCK_LENGTH):
     # save checkpoint
     last_frame_processed = block_start + len(ys_block) - 1
     metadata["last_frame_processed"] = last_frame_processed
-    model.save_checkpoint(path=f"checkpoints/diffrax-save-relative/step_{last_frame_processed}", metadata=metadata, opt_state=param_opt_state, activities=states_prev)
+    model.save_checkpoint(root=CHECKPOINT_ROOT, metadata=metadata, opt_state=param_opt_state, activities=states_prev)
 
     # Flush the prediction recorder to disk for later replaying / reconstruction
     recorder.flush()
@@ -267,7 +274,7 @@ for block_start in range(START_FRAME_IDX, END_FRAME_IDX, SCAN_BLOCK_LENGTH):
     if RECORD_ENERGIES:
         # energy_traces is (SCAN_BLOCK_LENGTH, NUM_INFERENCE_STEPS, num_layers+1) --
         # one entry per FRAME in this block, not one entry for the whole block.
-        # plot_train_energies wants one (num_layers, time_steps) array per
+        # plot_energies wants one (num_layers, time_steps) array per
         # recorded iteration, so unpack the block and transpose each frame.
         for frame_trace in np.asarray(energy_traces):
             all_energy_traces.append(frame_trace.T)
@@ -309,13 +316,13 @@ print(f"Mean VFE Before: {eb.mean():.4f}")
 print(f"Mean VFE After:  {ea.mean():.4f}")
 print(f"Mean Energy Drop (Δ): {deltas.mean():.4f}\n")
 
-print("Plotting train energies...")
-plot_train_energies(
+print("Plotting energies...")
+plot_energies(
     all_energy_traces, 
     model=model, 
     save_plot=True, 
     separate_layers=True, 
-    output_dir="figures-diffrax-save",
+    output_dir="figures",
     save_individual=True,
     save_overlay=True,
     display=False,

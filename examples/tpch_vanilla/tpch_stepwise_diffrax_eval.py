@@ -1,55 +1,85 @@
-"""Frame-by-frame training of a Temporal Predictive Coding hierarchy using `make_train_step` and diffrax ODE solver for inference.
-# TODO Update docstirng
-Demonstrates an interactive, per-step execution workflow for training a 
-temporal predictive coding model (`TpchModel`) on sequential video data. 
-Unlike fused block-scan implementations, this script executes a single JIT-compiled 
-training step within an outer Python loop. This approach prioritizes fine-grained 
-introspection, real-time logging, interactive visualization, and frequent 
-checkpointing over maximum XLA execution speed.
-
+"""Frame-by-frame evaluation of a trained Temporal Predictive Coding hierarchy using `make_eval_step_diffrax` and a diffrax ODE solver for inference.
+ 
+Demonstrates an interactive, per-step, inference-only execution workflow for running
+a trained temporal predictive coding model (`TpchModel`) on sequential video data.
+The model is restored from a checkpoint and its weights are held frozen. For each
+frame, activity relaxation is performed by `diffrax.diffeqsolve` (via
+`model.settle_diffrax`) rather than by a fixed number of discrete optimizer steps,
+so no activity optimizer is involved. The script executes a single JIT-compiled
+evaluation step within an outer Python loop, prioritizing fine-grained
+introspection and real-time logging over maximum XLA execution speed.
+ 
 Key Workflow Phases
 -------------------
-1. Data Ingestion & Preprocessing
-   - Reads input video (`example_env.mp4`) frame-by-frame.
+1. Checkpoint & Model Restoration
+   - Locates the latest `tpch` checkpoint and loads its associated metadata.
+   - Reads the environment dimensions (`env_width`, `env_height`) from the metadata.
+   - Reconstructs the parameter optimizer, diffrax solver, and stepsize controller
+     from the saved configuration.
+   - Restores the trained `TpchModel` and latent activities. The saved optimizer
+     state is loaded alongside them but is not used, since no learning takes place.
+   - Resumes processing from the frame immediately following the last frame recorded
+     in the checkpoint metadata.
+ 
+2. Data Ingestion & Preprocessing
+   - Loads the complete input video (`example_env.mp4`) into memory (before JAX is
+     imported, to avoid os.fork() issues).
    - Converts RGB frames to grayscale and normalizes pixel values to [0.0, 1.0].
-
-2. Model & Optimizer Initialization
-   - Instantiates a `TpchModel` hierarchy matched to environmental dimensions.
-   - Configures separate Optax Adam optimizers for structural weight parameters 
-     (`param_optim`) and latent activity relaxation (`activity_optim`).
-   - Constructs the JIT-compiled step function via `make_train_step`.
-
-3. Per-Step Iterative Training Loop
-   - Loops over frame sequences in Python, executing `train_step` on each iteration.
-   - Settles internal activities over `NUM_INFERENCE_STEPS` relaxation steps.
-   - Updates model parameters based on settled state errors.
-   - Carries settled states (`states_curr`) forward to initialize activities for 
+   - Flattens each frame's spatial dimensions into a vector matching the observation
+     layer of the predictive coding hierarchy.
+ 
+3. Evaluation Step Construction
+   - Constructs the JIT-compiled step function via `make_eval_step_diffrax`.
+   - The steady-state criterion and tolerance that terminate relaxation
+     (`STEADY_STATE_CRITERION`, `STEADY_STATE_TOL`) are set at the top of this script
+     rather than restored from the checkpoint.
+   - There is no fixed relaxation-step count: the solver takes an adaptive,
+     event-terminated number of internal steps per frame. `DIFFRAX_N_SAVE` is only
+     used as a display label for the number of saved snapshots.
+ 
+4. Per-Step Iterative Evaluation Loop
+   - Loops over frame sequences in Python, executing `eval_step` on each iteration.
+   - Settles internal activities for each frame by integrating the relaxation ODE
+     until steady state (or the integration horizon).
+   - Leaves model parameters untouched; no weight updates are performed.
+   - Carries settled states (`states_curr`) forward to initialize activities for
      the subsequent time step (`states_prev`).
-
-4. In-Loop Introspection & Artifact Generation
-   - Logs Variational Free Energy (VFE) before and after activity settling.
-   - Optionally records per-layer energy traces per relaxation step.
-   - Renders visual reconstructions (prior vs. posterior predictions) per frame.
-   - Saves model checkpoints and optimizer states at defined intervals.
-
-5. Post-Training Diagnostics
-   - Plots layerwise energy traces across the entire training trajectory.
-   - Compiles generated visual prediction frames into output video files.
-
+ 
+5. In-Loop Introspection & Artifact Generation
+   - Logs Variational Free Energy (VFE) before and after activity settling at each
+     flush interval and on the final frame.
+   - Optionally records per-layer energy traces per frame. Frames that reach steady
+     state early leave an inf-padded tail in their trace, which `plot_energies`
+     trims automatically.
+   - Records the target observation together with the prior and posterior
+     predictions for every frame via `PredictionRecorder`.
+   - Flushes the recorded predictions to disk at each flush interval and on the
+     final frame. No checkpoints are written.
+ 
+6. Post-Run Diagnostics
+   - Plots layerwise energy traces across all evaluated frames, labelling the
+     relaxation axis as continuous integration time.
+   - Replays the raw prediction recordings to reconstruct image-space prediction frames.
+   - Compiles the reconstructed prediction frames into output video files.
+ 
 Trade-off Summary
 -----------------
-- Pros: Direct access to intermediate states per frame; effortless integration with 
-  Python-side visualizers, loggers, and conditional stopping logic.
-- Cons: Incurs Python loop overhead between JIT step dispatches compared to 
-  fused `jax.lax.scan` execution (`make_train_run`).
+- Pros: Direct access to intermediate states per frame; effortless integration with
+  Python-side visualizers, loggers, and conditional stopping logic; adaptive
+  per-frame relaxation instead of a fixed iteration count; no learning overhead.
+- Cons: Incurs Python loop overhead between JIT step dispatches compared to fused
+  block execution (`make_train_run_diffrax`).
 """
 
+from pathlib import Path
 import imageio.v2 as imageio
-raw_frames = imageio.mimread("example_env.mp4", memtest=False) # read this before importing JAX, to avoid os.fork() issues
+video_path = Path(__file__).resolve().parent.parent / "example_env.mp4"
+raw_frames = imageio.mimread(str(video_path), memtest=False) # read this before importing JAX, to avoid os.fork() issues
+
 import warnings
 warnings.filterwarnings("ignore", category=RuntimeWarning, message=".*os.fork.*") # to ignore compile_videos() warning
 
-from pc_nox.utils.visualisation import compile_videos_from_frames, plot_train_energies, PredictionRecorder, replay_recordings
+from pc_nox.utils.visualisation import compile_videos_from_frames, plot_energies, PredictionRecorder, replay_recordings
 from pc_nox.utils.checkpoints import find_latest_checkpoint, load_metadata
 from pc_nox.models.tpch import TpchModel, make_eval_step_diffrax
 from pc_nox.utils.optim_registry import build_optim
@@ -81,12 +111,14 @@ STEADY_STATE_CRITERION = "energy_rate" # How steady state is determined: "rms" (
 STEADY_STATE_TOL = 1e-1
 
 # where the raw jax arrays get stored during inference/training
-PREDICTIONS_RECORDING_DIR = "visual_predictions_diff-load_raw_eval"
+PREDICTIONS_RECORDING_DIR = "visual_predictions_raw"
 # where the reconstructed visual predictions get saved to
-PREDICTIONS_DIR = "visual_predictions_dif-load_eval"
+PREDICTIONS_DIR = "visual_predictions"
+
+CHECKPOINT_ROOT = "checkpoints/diffrax"
 
 # Loading model, activities, and optimisers from saved checkpoint
-latest_checkpoint = find_latest_checkpoint(root="checkpoints/diffrax-save-relative", model_type="tpch")
+latest_checkpoint = find_latest_checkpoint(root=CHECKPOINT_ROOT, model_type="tpch")
 metadata = load_metadata(latest_checkpoint)
 
 ENV_WIDTH = metadata["env_width"]
@@ -170,7 +202,7 @@ if total_frames_processed > 0:
     print(f"Average speed: {avg_ms_per_frame:.2f} ms/frame ({fps:.2f} FPS)\n")
 
 print("Plotting energies...")
-plot_train_energies(
+plot_energies(
     all_energy_traces, 
     model=model, 
     save_plot=True, 

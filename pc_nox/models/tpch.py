@@ -715,7 +715,7 @@ class TpchModel(eqx.Module, ModelBase):
         `_activity_reg_by_layer`. `jnp.sum(...)` of this array exactly
         equals the summed-scalar output (`return_layerwise=False`) on the
         same inputs. Mainly for diagnostics/plotting (e.g.
-        `plot_train_energies`), not for the inference/learning gradients,
+        `plot_energies`), not for the inference/learning gradients,
         which always use the summed scalar.
 
         Args:
@@ -971,7 +971,7 @@ class TpchModel(eqx.Module, ModelBase):
         energy_trace)` instead, with `energy_trace` shape (n_steps,
         num_layers+1) -- see `tpch_energy_fn`'s `return_layerwise` docstring
         for the layer order -- for diagnostics/plotting (e.g.
-        `plot_train_energies`). Same pattern as `return_layerwise` on
+        `plot_energies`). Same pattern as `return_layerwise` on
         `tpch_energy_fn` itself: one function, a bool flag decides what
         comes back out, rather than a second near-duplicate method to
         maintain. `return_layerwise` is a plain Python bool (resolved at
@@ -1401,7 +1401,7 @@ class TpchModel(eqx.Module, ModelBase):
               length trajectory from any other early-terminating solve. This
               is deliberately returned explicitly (rather than leaving the
               caller to reconstruct it) so downstream code -- e.g.
-              `plot_train_energies` -- can tell which points in the trace
+              `plot_energies` -- can tell which points in the trace
               actually occurred without re-deriving that from `energy_trace`
               itself.
         """
@@ -1520,7 +1520,7 @@ def make_eval_step(activity_optim: optax.GradientTransformation, n_infer_steps: 
     value on first use, then reused for every subsequent call with that same
     value -- not re-traced per eval iteration. Pass `return_layerwise=True`
     on the iterations where you want a per-layer energy trace for
-    `plot_train_energies` (e.g. every `record_every`-th frame); the default
+    `plot_energies` (e.g. every `record_every`-th frame); the default
     `False` path stays on its own, cheaper compiled trace the rest of the
     time. This costs exactly two compiles total across a whole run (one per
     value ever passed), not one per iteration.
@@ -1691,7 +1691,7 @@ def make_train_step(param_optim: optax.GradientTransformation, activity_optim: o
     value on first use, then reused for every subsequent call with that same
     value -- not re-traced per training iteration. Pass `return_layerwise=True`
     on the iterations where you want a per-layer energy trace for
-    `plot_train_energies` (e.g. every `record_every`-th frame); the default
+    `plot_energies` (e.g. every `record_every`-th frame); the default
     `False` path stays on its own, cheaper compiled trace the rest of the
     time. This costs exactly two compiles total across a whole run (one per
     value ever passed), not one per iteration.

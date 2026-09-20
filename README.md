@@ -1,4 +1,7 @@
-# pc-nox
+<p align="center">
+  <img src=".github/images/logo.png" alt="Predictions" width="250">
+</p>
+<h1 align="center">pc-nox: Deep and Temporal Predictive Coding</h1>
 
 This library aims to provide easy to use [Equinox](https://github.com/patrick-kidger/equinox) ([JAX](https://github.com/jax-ml/jax)) implementations of cutting edge Predictive Coding (PC) variants, and experimental fusion architectures, with an emphasis on deep and temporal models. Development is done with the goal of supporting modular functionality within larger continual learning meta-architectures.
 
@@ -13,15 +16,16 @@ This library aims to provide easy to use [Equinox](https://github.com/patrick-ki
 * **Flexible Inference & Training Modes**: Supports both fast, fixed-iteration execution fused via jax.lax.scan and adaptive ODE solving via [Diffrax](https://github.com/patrick-kidger/diffrax) - configurable step-by-step or chunk-by-chunk.
 * **Model Management**: Comprehensive save/load methods, supporting seamless training resumption irrespective of model type or training environment.
 * **Visual Prediction Plotting**: Compare ground truth to pre- and post-inference predictions in visual environments, with the option to save frames and video. 
-* **VFE Plotting**: Clear and configurable energy graphs.
+* **VFE Plotting**: Clear and configurable layerwise energy graphs.
 * **PyHGF Compatability**: Version matches [pyHGF](https://github.com/ComputationalPsychiatry/pyhgf) (0.3.2) shared dependencies for cross compatibility. Compatibility will be maintained.
+
 
 
 
 
 | Visual Predictions Plotting | Energy Graph |
 | :---: | :---: |
-| <img src=".github/images/predictions.gif" alt="Predictions" style="height: 250px; object-fit: contain; "> | <img src=".github/images/energies.png" alt="VFE Plot" style="height: 250px; object-fit: contain;"> |
+| <img src=".github/images/predictions.gif" alt="Predictions" height="250"> | <img src=".github/images/energies.png" alt="VFE Plot" height="250"> |
 
 
 ## Planned Architectures
@@ -29,10 +33,6 @@ This library aims to provide easy to use [Equinox](https://github.com/patrick-ki
 * **tPC-E ([Ng-Kee-Kwong et al., 2026](https://www.biorxiv.org/content/10.64898/2026.07.09.737423v1))**: Temporal Predictive Coding with eligibility traces.
 * **PCN-HEP ([Mohammadi & Ororbia, 2026](https://arxiv.org/abs/2606.22744))**: PCN with Highway Error Propagation.
 * **Meta-PCN ([Ha et al., 2026](https://openreview.net/forum?id=kE5jJUHl9i))**: PCN with meta-prediction errors and weight regularization.
-
-## Planned Features
-
-* **Analytics**: More test metrics and visualisation methods.
 
 
 ## Installation

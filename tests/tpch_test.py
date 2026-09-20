@@ -2570,7 +2570,7 @@ def test_settle_diffrax_mode1_last_finite_entry_matches_states_curr(fx_model, fx
     or max_t1 was reached), that row of the trace must be the exact
     tpch_energy_fn(return_layerwise=True) breakdown of the returned
     states_curr -- the contract settle_diffrax's docstring spells out for
-    downstream code (e.g. plot_train_energies) to rely on."""
+    downstream code (e.g. plot_energies) to rely on."""
     states_curr, trace, ts = fx_model.settle_diffrax(
         fx_states_prev, fx_observation, fx_control_input, max_t1=20.0, n_save=10,
         steady_state_tol=0.1, return_layerwise=True,
@@ -2590,7 +2590,7 @@ def test_settle_diffrax_mode1_early_convergence_produces_contiguous_inf_padding(
     """A loose enough tol must converge before max_t1, leaving the tail of
     ts/trace as inf, and that padding must be a contiguous suffix (once a
     step is non-finite, every later step is too) -- otherwise Mode 1's
-    early-exit story (and plot_train_energies' _trace_valid_length trimming,
+    early-exit story (and plot_energies' _trace_valid_length trimming,
     which assumes exactly this) has nothing to rely on."""
     _, trace, ts = fx_model.settle_diffrax(
         fx_states_prev, fx_observation, fx_control_input, max_t1=20.0, n_save=10,

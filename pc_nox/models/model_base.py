@@ -122,7 +122,7 @@ class ModelBase(ABC):
         Human-readable label for each entry of the per-layer energy array
         returned by an energy fn's `return_layerwise=True` mode (e.g.
         `TpchModel.tpch_energy_fn`). Order must match that array exactly.
-        Used by e.g. `plot_train_energies` to auto-label plots when a model
+        Used by e.g. `plot_energies` to auto-label plots when a model
         is passed in, instead of falling back to generic layer numbers.
 
         Optional -- raises by default, same as `zero_activities`. Implement

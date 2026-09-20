@@ -77,7 +77,10 @@ CONTROL_WIDTH = 8
 HIDDEN_SHAPE = [8, 16, 32, 64, 128] # # width, from highest layer to lowest, inlcuding output / sensory layer
 OBS_WIDTH = ENV_WIDTH * ENV_HEIGHT
 
-raw_frames = imageio.mimread("example_env.mp4", memtest=False)
+from pathlib import Path
+video_path = Path(__file__).resolve().parent.parent / "example_env.mp4"
+raw_frames = imageio.mimread(str(video_path), memtest=False) # read this before importing JAX, to avoid os.fork() issues
+
 frames = np.stack(raw_frames)
 if frames.ndim == 4 and frames.shape[-1] in (3, 4):  # Convert RGB(A) to grayscale
     frames = np.mean(frames[..., :3], axis=-1)

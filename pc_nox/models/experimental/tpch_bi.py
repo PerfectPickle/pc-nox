@@ -73,7 +73,7 @@ in the calling code that loops over a batch of sequences.
 
 
 import equinox as eqx
-from .model_base import ModelBase, ACT_FN_REGISTRY, Activities, Predictions
+from ..model_base import ModelBase, ACT_FN_REGISTRY, Activities, Predictions
 import jax
 import jax.numpy as jnp
 import jax.random as jr
@@ -830,8 +830,9 @@ class TpchModel(eqx.Module, ModelBase):
                 observation if i == len(self.hidden_layers) - 1
                 else states_curr[i + 2]
             )
-            backward_predictions.append(
+            backward_predictions.append(layer.act_fn(
                 layer.W_child_curr(child_curr)
+                )
             )
 
         # Each latent layer receives one forward and one backward error.

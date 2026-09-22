@@ -59,7 +59,7 @@ import jax.random as jr
 import optax
 from jaxtyping import Array, PRNGKeyArray, PyTree
 
-from .. import inference
+from .. import inference, regularisers
 from ..model_base import ACT_FN_REGISTRY, Activities, ModelBase, Predictions
 from .config import TpchConfig, scopes_overlap
 from .layers import TpchControlLayer, TpchHiddenLayer, TpchObservationLayer
@@ -321,15 +321,16 @@ class TpchModel(eqx.Module, ModelBase):
         else:  # "all", validated in __init__
             return self._all_weights()
 
-    # extra energy (penalty) from L2 weight decay / regularisation
+    # extra energy (penalty) from L2 weight decay / regularisation.
+    # The arithmetic itself (`regularisers.l2_reg` etc.) is generic --
+    # every variant wants the same Frobenius-norm / Gram-matrix / L1-L2
+    # math. Only *which weights are selected* (`_weights_for_scope`,
+    # above) is tPC-H-specific, and stays here.
     def _weight_l2_reg(self) -> Array:
         """0.5 * weight_decay * sum ||W||_F^2 (squared Frobenius norm) over
         `weight_decay_scope` weights."""
-        if self.config.weight_decay <= 0.0:
-            return jnp.asarray(0.0)
         weights = self._weights_for_scope(self.config.weight_decay_scope)
-        sq_norm = sum(jnp.sum(W ** 2) for W in weights)
-        return 0.5 * self.config.weight_decay * sq_norm
+        return regularisers.l2_reg(weights, self.config.weight_decay)
 
     def _weight_orthogonal_reg(self) -> Array:
         """0.5 * orthogonal_penalty * sum ||I - W^T W||_F^2 (or W W^T for a
@@ -338,32 +339,15 @@ class TpchModel(eqx.Module, ModelBase):
         contracting its input, which is particularly useful on recurrent
         weights to keep the state dynamics well-conditioned over time.
         """
-        if self.config.orthogonal_penalty <= 0.0:
-            return jnp.asarray(0.0)
         weights = self._weights_for_scope(self.config.orthogonal_scope)
-        reg = jnp.asarray(0.0)
-        for W in weights:
-            # eqx.nn.Linear weights have shape (out_features, in_features).
-            # Use whichever of W^T @ W or W @ W^T is smaller, both to save
-            # compute and because only the smaller one can equal identity.
-            out_dim, in_dim = W.shape
-            dim = min(out_dim, in_dim)
-            gram = (W.T @ W) if in_dim <= out_dim else (W @ W.T)
-            reg = reg + jnp.sum((jnp.eye(dim) - gram) ** 2)
-        return 0.5 * self.config.orthogonal_penalty * reg
+        return regularisers.orthogonal_reg(weights, self.config.orthogonal_penalty)
 
     def _activity_reg(self, states_curr: Activities) -> Array:
         """0.5 * activity_decay * sum ||z||_p^p over every current state,
         with p=1 (sparsity-promoting) or p=2 (soft bound on activity norm)
         depending on `activity_reg_type`.
         """
-        if self.config.activity_decay <= 0.:
-            return jnp.asarray(0.0)
-        if self.config.activity_reg_type == "l1":
-            reg = sum(jnp.sum(jnp.abs(state)) for state in states_curr)
-        else:  # l2
-            reg = sum(jnp.sum(state ** 2) for state in states_curr)
-        return 0.5 * self.config.activity_decay * reg
+        return regularisers.activity_reg(states_curr, self.config.activity_decay, self.config.activity_reg_type)
 
     # -------------------------------------------------------------------
     # Layerwise regularisation (for `return_layerwise=True`) -- additive to
@@ -414,39 +398,16 @@ class TpchModel(eqx.Module, ModelBase):
         same order as `layer_labels()`. `jnp.sum(...)` of this exactly
         equals `_weight_l2_reg()`'s scalar (same terms, just partitioned).
         """
-        num_groups = len(self.hidden_layers) + 2
-        if self.config.weight_decay <= 0.:
-            return jnp.zeros(num_groups)
         groups = self._weight_groups_for_scope(self.config.weight_decay_scope)
-        per_layer = [
-            0.5 * self.config.weight_decay * sum(jnp.sum(W ** 2) for W in group)
-            if group else jnp.asarray(0.0)
-            for group in groups
-        ]
-        return jnp.stack(per_layer)
+        return regularisers.l2_reg_by_group(groups, self.config.weight_decay)
 
     def _weight_orthogonal_reg_by_layer(self) -> Array:
         """Per-layer breakdown of `_weight_orthogonal_reg()`, same Gram-matrix
         convention (narrow-side identity) applied per matrix, grouped by
         owning layer instead of summed across the whole scope.
         """
-        num_groups = len(self.hidden_layers) + 2
-        if self.config.orthogonal_penalty <= 0.:
-            return jnp.zeros(num_groups)
         groups = self._weight_groups_for_scope(self.config.orthogonal_scope)
-        per_layer = []
-        for group in groups:
-            if not group:
-                per_layer.append(jnp.asarray(0.0))
-                continue
-            reg = jnp.asarray(0.0)
-            for W in group:
-                out_dim, in_dim = W.shape
-                dim = min(out_dim, in_dim)
-                gram = (W.T @ W) if in_dim <= out_dim else (W @ W.T)
-                reg = reg + jnp.sum((jnp.eye(dim) - gram) ** 2)
-            per_layer.append(0.5 * self.config.orthogonal_penalty * reg)
-        return jnp.stack(per_layer)
+        return regularisers.orthogonal_reg_by_group(groups, self.config.orthogonal_penalty)
 
     def _activity_reg_by_layer(self, states_curr: Activities) -> Array:
         """Per-layer breakdown of the activity-regularisation term: shape
@@ -455,13 +416,7 @@ class TpchModel(eqx.Module, ModelBase):
         this with the weight-reg breakdowns above must pad with one
         trailing zero themselves (see `tpch_energy_fn`).
         """
-        if self.config.activity_decay <= 0.:
-            return jnp.zeros(len(states_curr))
-        if self.config.activity_reg_type == "l1":
-            per_layer = [0.5 * self.config.activity_decay * jnp.sum(jnp.abs(s)) for s in states_curr]
-        else:
-            per_layer = [0.5 * self.config.activity_decay * jnp.sum(s ** 2) for s in states_curr]
-        return jnp.stack(per_layer)
+        return regularisers.activity_reg_by_layer(states_curr, self.config.activity_decay, self.config.activity_reg_type)
 
     # =========================================================================
     # Free energy -- eq. (19), generalised to an arbitrary number of layers

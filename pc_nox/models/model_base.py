@@ -88,6 +88,39 @@ class ModelBase(ABC):
         """
         ...
     
+
+    def postprocess_params(self) -> "ModelBase":
+        """
+        Optional post-update weight transform, applied AFTER every optax
+        parameter update (`optim.update` + `eqx.apply_updates`), before the
+        updated model is handed back to the caller. Concrete default is the
+        identity (`return self`): most models -- including every current
+        one -- have nothing to do here, and get zero behaviour change.
+
+        This exists for updates that are NOT expressible as a term inside
+        an energy function -- e.g. variance-based weight normalisation
+        (rescaling W by a function of its own current values after the
+        gradient step), spectral clipping, or any other constraint applied
+        directly to the weights rather than shaped via a gradient penalty.
+        Compare to `weight_decay`/`orthogonal_penalty` (see e.g.
+        `TpchConfig`), which shape the GRADIENT by adding a term to the
+        energy before it's differentiated -- those stay inside the energy
+        function; this hook is for transforms that don't fit that mould.
+
+        A model that wants this overrides it, e.g.:
+
+            def postprocess_params(self):
+                new_weights = [normalise(W) for W in self._all_weights()]
+                return eqx.tree_at(lambda m: m._all_weights(), self, new_weights)
+
+        Called unconditionally by the training runners (see
+        `runners_temporal.py`) right after `eqx.apply_updates`, so it's
+        always safe to call regardless of whether a given model overrides
+        it.
+        """
+        return self
+
+
     @classmethod
     @abstractmethod
     def from_config(cls, config, *, key) -> "ModelBase":

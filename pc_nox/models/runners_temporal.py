@@ -182,6 +182,7 @@ def make_train_step(param_optim: optax.GradientTransformation, activity_optim: o
         grads = model.param_grad(states_prev, states_curr, y, control_input)
         updates, param_opt_state = param_optim.update(grads, param_opt_state, model)
         model = eqx.apply_updates(model, updates)
+        model = model.postprocess_params()
 
         return model, param_opt_state, states_curr, y_hat_before, y_hat_after, energy_before, energy_after, energy_trace
 
@@ -221,6 +222,7 @@ def make_train_run(param_optim, activity_optim, n_infer_steps, run_length, contr
             grads = model.param_grad(states_prev, states_curr, y_t, control_input)
             updates, param_opt_state = param_optim.update(grads, param_opt_state, model)
             model = eqx.apply_updates(model, updates)
+            model = model.postprocess_params()
 
             return (model, param_opt_state, states_curr), (
                 y_hat_before, y_hat_after, energy_before_t, energy_after_t, energy_trace_t
@@ -270,6 +272,7 @@ def _train_frame_post(model, param_optim, param_opt_state, states_prev, states_c
     grads = model.param_grad(states_prev, states_curr, y, control_input)
     updates, param_opt_state = param_optim.update(grads, param_opt_state, model)
     model = eqx.apply_updates(model, updates)
+    model = model.postprocess_params()
 
     return model, param_opt_state, y_hat_after, energy_after
 

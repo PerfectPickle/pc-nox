@@ -62,7 +62,9 @@ import warnings
 warnings.filterwarnings("ignore", category=RuntimeWarning, message=".*os.fork.*") # to ignore compile_videos() warning
 
 from pc_nox.utils.visualisation import compile_videos_from_frames, plot_energies, PredictionRecorder, replay_recordings
-from pc_nox.models.tpch import TpchModel, make_train_step
+from pc_nox.models.experimental.tpch_phasic.model import KPCHModel
+from pc_nox.models.runners_temporal import make_train_step
+from pc_nox.utils.optim_registry import build_optim
 import jax.random as jr
 import jax.numpy as jnp
 import equinox as eqx
@@ -83,20 +85,18 @@ CHECKPOINT_INTERVAL = 1000
 RECORD_ENERGIES = True
 
 # where the raw jax arrays get stored during inference/training
-PREDICTIONS_RECORDING_DIR = "visual_predictions_raw"
+PREDICTIONS_RECORDING_DIR = "visual_predictions-phasic_raw"
 # where the reconstructed visual predictions get saved to
-PREDICTIONS_DIR = "visual_predictions"
+PREDICTIONS_DIR = "visual_predictions-phasic"
 
-CHECKPOINT_ROOT = "checkpoints/scan"
+CHECKPOINT_ROOT = "checkpoints-phasic"
 
 # Matching example_env.mp4
 ENV_WIDTH = 16 # pixels
 ENV_HEIGHT = 8 # pixels
 ENV_COLOUR_CHANNELS = 1
 CONTROL_WIDTH = 8
-CONTROL_ALPHA = None#0.5
 HIDDEN_SHAPE = [8, 16, 32, 64, 128] # # width, from highest layer to lowest, including output / sensory layer
-HIDDEN_ALPHAS = None#[0.5, 0.5, 0.5, 0.45, 0.25]
 OBS_WIDTH = ENV_WIDTH * ENV_HEIGHT * ENV_COLOUR_CHANNELS
 
 control_input = None
@@ -109,9 +109,9 @@ activity_decay = 0.00001
 activity_reg_type: str = "l1"
 
 # Not stored on model.config, so must be added to metadata to be saved
-PARAM_OPTIM_NAME = "adam"
+PARAM_OPTIM_NAME = "sgd"
 PARAM_LR = 0.001
-ACTIVITY_OPTIM_NAME = "adam"
+ACTIVITY_OPTIM_NAME = "sgd"
 ACTIVITY_LR = 0.01
 
 metadata = {
@@ -134,19 +134,16 @@ frames = frames.reshape(frames.shape[0], -1)
 key = jr.PRNGKey(0)
 model_key, data_key = jr.split(key)
 
-model = TpchModel(
+model = KPCHModel(
         control_layer_size=CONTROL_WIDTH,
         hidden_sizes=HIDDEN_SHAPE,
         obs_size=OBS_WIDTH,
         key=model_key,
-        control_alpha=CONTROL_ALPHA,
-        hidden_alphas=HIDDEN_ALPHAS,
-        # weight_decay=weight_decay, this is where regularisation can be enabled, disabled by default.
     )
 
-param_optim = optax.adam(learning_rate=PARAM_LR)
+param_optim = build_optim(PARAM_OPTIM_NAME, learning_rate=PARAM_LR)
 param_opt_state = param_optim.init(eqx.filter(model, eqx.is_array))
-activity_optim = optax.adam(learning_rate=ACTIVITY_LR)
+activity_optim = build_optim(ACTIVITY_OPTIM_NAME, learning_rate=ACTIVITY_LR)
 
 
 # one random "previous states" tuple and one time step of data

@@ -62,7 +62,8 @@ import warnings
 warnings.filterwarnings("ignore", category=RuntimeWarning, message=".*os.fork.*") # to ignore compile_videos() warning
 
 from pc_nox.utils.visualisation import compile_videos_from_frames, plot_energies, PredictionRecorder, replay_recordings
-from pc_nox.models.tpch import TpchModel, make_train_step
+from pc_nox.models.experimental.tpch_stuartlandau.model import SLPCHModel, make_train_step
+from pc_nox.utils.optim_registry import build_optim
 import jax.random as jr
 import jax.numpy as jnp
 import equinox as eqx
@@ -71,7 +72,7 @@ import numpy as np
 import time
 
 # Number of settling iterations
-NUM_INFERENCE_STEPS = 20
+NUM_INFERENCE_STEPS = 500
 
 # example_env.mp4 has 2000 frames
 N_TRAIN_ITERS = 2000
@@ -87,16 +88,14 @@ PREDICTIONS_RECORDING_DIR = "visual_predictions_raw"
 # where the reconstructed visual predictions get saved to
 PREDICTIONS_DIR = "visual_predictions"
 
-CHECKPOINT_ROOT = "checkpoints/scan"
+CHECKPOINT_ROOT = "checkpoints"
 
 # Matching example_env.mp4
 ENV_WIDTH = 16 # pixels
 ENV_HEIGHT = 8 # pixels
 ENV_COLOUR_CHANNELS = 1
 CONTROL_WIDTH = 8
-CONTROL_ALPHA = None#0.5
 HIDDEN_SHAPE = [8, 16, 32, 64, 128] # # width, from highest layer to lowest, including output / sensory layer
-HIDDEN_ALPHAS = None#[0.5, 0.5, 0.5, 0.45, 0.25]
 OBS_WIDTH = ENV_WIDTH * ENV_HEIGHT * ENV_COLOUR_CHANNELS
 
 control_input = None
@@ -109,9 +108,9 @@ activity_decay = 0.00001
 activity_reg_type: str = "l1"
 
 # Not stored on model.config, so must be added to metadata to be saved
-PARAM_OPTIM_NAME = "adam"
+PARAM_OPTIM_NAME = "sgd"
 PARAM_LR = 0.001
-ACTIVITY_OPTIM_NAME = "adam"
+ACTIVITY_OPTIM_NAME = "sgd"
 ACTIVITY_LR = 0.01
 
 metadata = {
@@ -134,19 +133,21 @@ frames = frames.reshape(frames.shape[0], -1)
 key = jr.PRNGKey(0)
 model_key, data_key = jr.split(key)
 
-model = TpchModel(
+model = SLPCHModel(
         control_layer_size=CONTROL_WIDTH,
         hidden_sizes=HIDDEN_SHAPE,
         obs_size=OBS_WIDTH,
         key=model_key,
-        control_alpha=CONTROL_ALPHA,
-        hidden_alphas=HIDDEN_ALPHAS,
+        adapt_omega=True, # adapt omega is not working at all
+        omega_adapt_rate=2,
+        omega_decay_rate=0.6
+
         # weight_decay=weight_decay, this is where regularisation can be enabled, disabled by default.
     )
 
-param_optim = optax.adam(learning_rate=PARAM_LR)
+param_optim = build_optim(PARAM_OPTIM_NAME, learning_rate=PARAM_LR)
 param_opt_state = param_optim.init(eqx.filter(model, eqx.is_array))
-activity_optim = optax.adam(learning_rate=ACTIVITY_LR)
+activity_optim = build_optim(ACTIVITY_OPTIM_NAME, learning_rate=ACTIVITY_LR)
 
 
 # one random "previous states" tuple and one time step of data
@@ -164,11 +165,14 @@ energies = []
 start_time = time.perf_counter()
 total_frames_processed = 0
 
+omega_prev = None
+
 for i, y in enumerate(frames[0:N_TRAIN_ITERS]):
     # full JIT inference and weight update for the current frame
-    model, param_opt_state, states_curr, y_hat_before, y_hat_after, energy_before, energy_after, energy_trace = train_step(
-        model, param_opt_state, states_prev, y, return_layerwise=RECORD_ENERGIES
+    model, param_opt_state, states_curr, omega_curr, y_hat_before, y_hat_after, energy_before, energy_after, energy_trace = train_step(
+        model, param_opt_state, states_prev, y, omega_prev=omega_prev, return_layerwise=RECORD_ENERGIES
     )
+    omega_prev=omega_curr
     total_frames_processed += 1
     if RECORD_ENERGIES:
         energies.append(energy_trace.T)

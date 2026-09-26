@@ -61,8 +61,43 @@ from jaxtyping import Array, PRNGKeyArray, PyTree
 
 from .. import inference, regularisers
 from ..model_base import ACT_FN_REGISTRY, Activities, ModelBase, Predictions
+from .. import eligibility
 from .config import TpchConfig, scopes_overlap
-from .layers import TpchControlLayer, TpchHiddenLayer, TpchObservationLayer
+from .layers import TpchControlLayer, TpchHeterogeneousObservationLayer, TpchHiddenLayer, TpchObservationLayer
+
+
+class EligibilityState(eqx.Module):
+    """Carries one leaky-integrated eligibility trace per weight of every
+    LEAKY layer (`alpha is not None`) in a `TpchModel` -- see
+    `..eligibility` for the underlying math and `TpchModel.
+    zero_eligibility_state`/`update_eligibility_state`/`param_grad_traced`
+    for how it's built, advanced, and consumed.
+
+    A non-leaky layer contributes `None` for its slot -- a genuinely
+    empty pytree subtree, not a placeholder array -- since it has nothing
+    to trace (see `TpchControlLayer`/`TpchHiddenLayer`'s docstrings for
+    why leak and trace go together, and why the observation layer, never
+    leaky, is excluded entirely). WHICH layers are leaky is a static,
+    config-level property fixed at model-construction time, so this
+    structure's shape never changes across a training run -- safe to
+    carry through `jax.lax.scan` (see `runners_temporal.
+    make_train_step_traced`).
+
+    Attributes:
+        e_A: Trace of the control layer's own previous state (for W_rec /
+            "A"), or None if the control layer isn't leaky.
+        e_B: Trace of the control input (for W_in / "B"), or None if the
+            control layer isn't leaky or has no input pathway.
+        e_hidden: One (e_P, e_Q, e_R) tuple per hidden layer, in the same
+            order as `TpchModel.hidden_layers` -- traces of that layer's
+            own previous state, its parent's previous state, and its
+            parent's CURRENT state, respectively (see `TpchHiddenLayer`'s
+            docstring for why W_parent_curr/R is traced too). All three
+            None for a non-leaky hidden layer.
+    """
+    e_A: Optional[Array]
+    e_B: Optional[Array]
+    e_hidden: List[Tuple[Optional[Array], Optional[Array], Optional[Array]]]
 
 
 # =============================================================================
@@ -113,7 +148,7 @@ class TpchModel(eqx.Module, ModelBase):
 
     control_layer: TpchControlLayer
     hidden_layers: List[TpchHiddenLayer]
-    observation_layer: TpchObservationLayer
+    observation_layer: eqx.Module  # TpchObservationLayer by default; any layer implementing predict/energy/weights (e.g. TpchHeterogeneousObservationLayer) is accepted -- see `observation_layer=` below
 
     def __init__(
         self,
@@ -130,7 +165,14 @@ class TpchModel(eqx.Module, ModelBase):
         orthogonal_scope: str = "rec",
         activity_decay: float = 0.0,
         activity_reg_type: str = "l1",
+        control_alpha: Optional[float] = None,  # tPC-E leak rate for the control layer; None = disabled (default, unchanged behaviour)
+        hidden_alphas: Optional[Sequence[Optional[float]]] = None,  # tPC-E leak rate per hidden layer, same order/length as hidden_sizes; None (default) disables leaky integration for every hidden layer
+        trace_mode: str = "readout",  # 'readout' (default) or 'accumulate' -- see TpchConfig.trace_mode docstring
+        observation_layer: Optional[eqx.Module] = None,  # pre-built layer for full flexibility beyond what observation_groups (below) can express; must implement predict/energy/weights. KNOWN LIMITATION: from_config cannot reconstruct an observation_layer passed this way -- checkpointing a model built with this argument will not round-trip. Prefer observation_groups when it fits (it round-trips correctly).
+        observation_groups=None,  # Sequence[Tuple[name: str, size: int, loss: 'mse'|'ce']] -- builds a TpchHeterogeneousObservationLayer with these groups (sizes must sum to obs_size) and, unlike observation_layer=, is stored in config and reconstructed correctly by from_config/load_checkpoint. Mutually exclusive with observation_layer=.
     ):
+        if observation_layer is not None and observation_groups is not None:
+            raise ValueError("pass at most one of observation_layer= and observation_groups=, not both")
         if loss not in ("mse", "ce"):
             raise ValueError(f"loss must be 'mse' or 'ce', got {loss!r}")
         if weight_decay_scope not in ("all", "rec", "ff"):
@@ -139,6 +181,12 @@ class TpchModel(eqx.Module, ModelBase):
             raise ValueError(f"orthogonal_scope must be 'all', 'rec' or 'ff', got {orthogonal_scope!r}")
         if activity_reg_type not in ("l1", "l2"):
             raise ValueError(f"activity_reg_type must be 'l1' or 'l2', got {activity_reg_type!r}")
+        if trace_mode not in ("readout", "accumulate"):
+            raise ValueError(f"trace_mode must be 'readout' or 'accumulate', got {trace_mode!r}")
+        if hidden_alphas is not None and len(hidden_alphas) != len(hidden_sizes):
+            raise ValueError(f"hidden_alphas must have one entry per hidden layer: got {len(hidden_alphas)} for {len(hidden_sizes)} hidden layers")
+        if observation_groups is not None and sum(size for _, size, _ in observation_groups) != obs_size:
+            raise ValueError(f"observation_groups sizes must sum to obs_size ({obs_size}), got {sum(size for _, size, _ in observation_groups)}")
 
         # If weight_decay and orthogonal_penalty can touch the same weights,
         # they pull those weights' singular values in opposite directions
@@ -174,6 +222,10 @@ class TpchModel(eqx.Module, ModelBase):
             orthogonal_scope=orthogonal_scope,
             activity_decay=activity_decay,
             activity_reg_type=activity_reg_type,
+            control_alpha=control_alpha,
+            hidden_alphas=tuple(hidden_alphas) if hidden_alphas is not None else None,
+            trace_mode=trace_mode,
+            observation_groups=tuple(tuple(g) for g in observation_groups) if observation_groups is not None else None,
         )
 
         try:
@@ -188,21 +240,35 @@ class TpchModel(eqx.Module, ModelBase):
         key_control, *hidden_keys, key_obs = jr.split(key, 2 + n_hidden)
 
         self.control_layer = TpchControlLayer(
-            state_size=control_layer_size, input_size=input_size, act_fn=act_fn_callable, key=key_control
+            state_size=control_layer_size, input_size=input_size, act_fn=act_fn_callable,
+            alpha=control_alpha, key=key_control
         )
 
         hidden_layers = []
         parent_size = control_layer_size  # the first hidden layer's parent is the control layer
-        for size, hkey in zip(hidden_sizes, hidden_keys):
+        alphas = hidden_alphas if hidden_alphas is not None else [None] * len(hidden_sizes)
+        for size, hkey, halpha in zip(hidden_sizes, hidden_keys, alphas):
             hidden_layers.append(
-                TpchHiddenLayer(state_size=size, parent_size=parent_size, act_fn=act_fn_callable, key=hkey)
+                TpchHiddenLayer(state_size=size, parent_size=parent_size, act_fn=act_fn_callable, alpha=halpha, key=hkey)
             )
             parent_size = size  # each subsequent hidden layer's parent is the one above it
         self.hidden_layers = hidden_layers
 
         # the observation layer's parent is the lowest hidden layer (or the
-        # control layer itself, if there are no hidden layers at all)
-        self.observation_layer = TpchObservationLayer(obs_size=obs_size, parent_size=parent_size, key=key_obs)
+        # control layer itself, if there are no hidden layers at all).
+        # Three ways to get an observation layer, in order of precedence:
+        # a caller-supplied instance (observation_layer=, full flexibility,
+        # not config-serialisable), a group spec (observation_groups=,
+        # builds a TpchHeterogeneousObservationLayer, config-serialisable),
+        # or the default homogeneous TpchObservationLayer.
+        if observation_layer is not None:
+            self.observation_layer = observation_layer
+        elif observation_groups is not None:
+            self.observation_layer = TpchHeterogeneousObservationLayer(
+                parent_size=parent_size, group_specs=observation_groups, key=key_obs
+            )
+        else:
+            self.observation_layer = TpchObservationLayer(obs_size=obs_size, parent_size=parent_size, loss=loss, key=key_obs)
 
     def predict(
         self,
@@ -292,7 +358,7 @@ class TpchModel(eqx.Module, ModelBase):
             weights.append(self.control_layer.W_in.weight)
         for layer in self.hidden_layers:
             weights += [layer.W_parent_prev.weight, layer.W_parent_curr.weight]
-        weights.append(self.observation_layer.W_parent.weight)
+        weights += self.observation_layer.weights()
         return weights
 
     def _all_weights(self) -> List[Array]:
@@ -306,7 +372,7 @@ class TpchModel(eqx.Module, ModelBase):
                 layer.W_parent_prev.weight,
                 layer.W_parent_curr.weight,
             ]
-        weights.append(self.observation_layer.W_parent.weight)
+        weights += self.observation_layer.weights()
         return weights
 
     def _weights_for_scope(self, scope: str) -> List[Array]:
@@ -376,7 +442,8 @@ class TpchModel(eqx.Module, ModelBase):
                 (i, False, layer.W_parent_prev.weight),
                 (i, False, layer.W_parent_curr.weight),
             ]
-        entries.append((len(self.hidden_layers) + 1, False, self.observation_layer.W_parent.weight))
+        obs_layer_idx = len(self.hidden_layers) + 1
+        entries += [(obs_layer_idx, False, W) for W in self.observation_layer.weights()]
         return entries
 
     def _weight_groups_for_scope(self, scope: str) -> List[List[Array]]:
@@ -477,11 +544,15 @@ class TpchModel(eqx.Module, ModelBase):
             error = state - prediction
             layer_energies.append(0.5 * jnp.sum(error ** 2))
 
-        if self.config.loss == "mse":
-            y_error = observation - y_hat
-            obs_energy = 0.5 * jnp.sum(y_error ** 2)
-        else:  # "ce", validated in __init__
-            obs_energy = -jnp.sum(observation * jax.nn.log_softmax(y_hat))
+        # Observation-term energy is delegated to the observation layer
+        # itself (`.energy(y_hat, observation)`) rather than switched on
+        # `self.config.loss` inline, so a variant observation layer (e.g.
+        # TpchHeterogeneousObservationLayer, with a different loss per
+        # node group) can override it without touching this method. For
+        # the default TpchObservationLayer this computes exactly the same
+        # mse/ce switch that used to live here -- `loss=` is threaded into
+        # both `self.config` and the layer at construction time.
+        obs_energy = self.observation_layer.energy(y_hat, observation)
         layer_energies.append(obs_energy)
 
         if return_layerwise:
@@ -811,6 +882,250 @@ class TpchModel(eqx.Module, ModelBase):
         )
 
     # =========================================================================
+    # Eligibility traces (tPC-E) -- see ..eligibility for the underlying
+    # math, EligibilityState (above) for the carried structure, and the
+    # module-level derivation this implements: delta_l = f'(pre_l) * eps_l,
+    # traced grad = -outer(delta_l, trace) -- NO extra alpha_l multiplier;
+    # alpha is already fully accounted for inside the trace's own
+    # recurrence (confirmed against the tPC-E paper's S4 appendix). Only
+    # weights of LEAKY layers (alpha is not None) are traced; every other
+    # weight gets exactly the ordinary `param_grad` gradient. When NO
+    # layer is leaky, `param_grad_traced` is mathematically identical to
+    # `param_grad` -- this is not a special case in the code, it falls
+    # out because the traced-replacement loops below simply have nothing
+    # to replace.
+    # =========================================================================
+
+    def zero_eligibility_state(self, control_input_example: Optional[Array] = None) -> EligibilityState:
+        """Builds a zero-initialised `EligibilityState` matching this
+        model's leaky layers -- call once at the start of a sequence.
+
+        Trace SHAPE depends on `self.config.trace_mode`: vector-shaped
+        (matching the traced input) for `"readout"`, or matrix-shaped
+        (matching the weight itself) for `"accumulate"` -- see
+        `..eligibility`'s module docstring for why these differ.
+
+        `control_input_example`: only needed to size W_in's trace, and
+        only if the control layer is BOTH leaky and has an input pathway
+        -- pass any correctly-shaped array (e.g. `jnp.zeros(config.input_size)`
+        or a real control_input from your data); raises if required and omitted.
+        """
+        accumulate = self.config.trace_mode == "accumulate"
+
+        e_A = None
+        e_B = None
+        if self.control_layer.alpha is not None:
+            own_size = self.control_layer.W_rec.weight.shape[0]
+            e_A = eligibility.zero_matrix_trace_like(own_size, own_size) if accumulate else jnp.zeros(own_size)
+            if self.control_layer.has_input:
+                if control_input_example is None:
+                    raise ValueError(
+                        "control layer is leaky and has an input pathway (W_in) -- "
+                        "pass control_input_example= to size its trace"
+                    )
+                e_B = (
+                    eligibility.zero_matrix_trace_like(own_size, control_input_example.shape[0])
+                    if accumulate else jnp.zeros_like(control_input_example)
+                )
+
+        e_hidden = []
+        for layer in self.hidden_layers:
+            if layer.alpha is None:
+                e_hidden.append((None, None, None))
+            else:
+                own_size = layer.W_rec.weight.shape[0]
+                parent_size = layer.W_parent_prev.weight.shape[1]
+                if accumulate:
+                    e_hidden.append((
+                        eligibility.zero_matrix_trace_like(own_size, own_size),
+                        eligibility.zero_matrix_trace_like(own_size, parent_size),
+                        eligibility.zero_matrix_trace_like(own_size, parent_size),
+                    ))
+                else:
+                    parent = jnp.zeros(parent_size)
+                    e_hidden.append((jnp.zeros(own_size), parent, jnp.zeros_like(parent)))
+
+        return EligibilityState(e_A=e_A, e_B=e_B, e_hidden=e_hidden)
+
+    def update_eligibility_state(
+        self,
+        eligibility_state: EligibilityState,
+        states_prev: Activities,
+        states_curr: Activities,
+        control_input: Optional[Array] = None,
+    ) -> EligibilityState:
+        """Advances every trace by one step. Call AFTER settling THIS
+        frame, not before: W_parent_curr's trace (e_R) needs this frame's
+        settled parent state (`states_curr`), which only exists once
+        inference has run -- see `runners_temporal.make_train_step_traced`
+        for the exact ordering (settle -> update_eligibility_state ->
+        param_grad_traced, all within the same frame).
+
+        Branches on `self.config.trace_mode`:
+        `"readout"` (eqs. 32-33, `..eligibility.trace_update`): the raw
+        traced input alone is accumulated, no `f'` involved here at all.
+        `"accumulate"` (`..eligibility.matrix_trace_update`): THIS step's
+        own `f'(pre)` is folded in via an outer product before decaying --
+        needs this layer's pre-activation, computed once and shared across
+        every weight that layer's leaky prediction feeds.
+        """
+        accumulate = self.config.trace_mode == "accumulate"
+
+        e_A_new = None
+        e_B_new = None
+        if self.control_layer.alpha is not None:
+            if accumulate:
+                pre_s = self.control_layer.pre_activation(states_prev[0], control_input)
+                deriv_s = eligibility.elementwise_deriv(self.control_layer.act_fn, pre_s)
+                e_A_new = eligibility.matrix_trace_update(eligibility_state.e_A, deriv_s, states_prev[0], self.control_layer.alpha)
+                if self.control_layer.has_input and control_input is not None:
+                    e_B_new = eligibility.matrix_trace_update(eligibility_state.e_B, deriv_s, control_input, self.control_layer.alpha)
+            else:
+                e_A_new = eligibility.trace_update(eligibility_state.e_A, states_prev[0], self.control_layer.alpha)
+                if self.control_layer.has_input and control_input is not None:
+                    e_B_new = eligibility.trace_update(eligibility_state.e_B, control_input, self.control_layer.alpha)
+
+        e_hidden_new = []
+        for i, layer in enumerate(self.hidden_layers):
+            if layer.alpha is None:
+                e_hidden_new.append((None, None, None))
+                continue
+            e_P, e_Q, e_R = eligibility_state.e_hidden[i]
+            own_prev = states_prev[i + 1]
+            parent_prev = states_prev[i]
+            parent_curr = states_curr[i]  # THIS frame's settled parent state -- matches predict()'s indexing
+
+            if accumulate:
+                pre_l = layer.pre_activation(own_prev, parent_prev, parent_curr)
+                deriv_l = eligibility.elementwise_deriv(layer.act_fn, pre_l)
+                e_hidden_new.append((
+                    eligibility.matrix_trace_update(e_P, deriv_l, own_prev, layer.alpha),
+                    eligibility.matrix_trace_update(e_Q, deriv_l, parent_prev, layer.alpha),
+                    eligibility.matrix_trace_update(e_R, deriv_l, parent_curr, layer.alpha),
+                ))
+            else:
+                e_hidden_new.append((
+                    eligibility.trace_update(e_P, own_prev, layer.alpha),
+                    eligibility.trace_update(e_Q, parent_prev, layer.alpha),
+                    eligibility.trace_update(e_R, parent_curr, layer.alpha),
+                ))
+
+        return EligibilityState(e_A=e_A_new, e_B=e_B_new, e_hidden=e_hidden_new)
+
+    def param_grad_traced(
+        self,
+        eligibility_state: EligibilityState,
+        states_prev: Activities,
+        states_curr: Activities,
+        observation: Array,
+        control_input: Optional[Array] = None,
+    ) -> PyTree:
+        """Weight gradient using eligibility traces in place of
+        instantaneous correlations for every leaky-integrated weight, in
+        the SAME sign convention as `param_grad` (dF_t/d(weights) --
+        subtract, don't add, to descend). Reduces to exactly `param_grad`
+        when no layer is leaky, and (verified numerically) to the same
+        result regardless of `self.config.trace_mode` when every leaky
+        layer has `alpha=1` -- the two modes only diverge for alpha<1
+        spanning several steps.
+
+        `"readout"` mode: grad_W = -outer(f'(pre_l) * eps_l, e_W), with
+        `e_W` vector-shaped and NO separate alpha_l multiplier -- alpha is
+        already fully accounted for inside the trace's own recurrence
+        (see `..eligibility.trace_update`; confirmed against the tPC-E
+        paper's own S4 appendix, eq. 81-82: the trace is built to
+        approximate the WHOLE local derivative term directly, not to
+        stand in for the raw traced input inside a formula that still
+        separately multiplies by alpha -- an earlier version of this
+        method incorrectly did the latter, which silently over-shrunk
+        every traced weight's update by a factor of alpha_l, including
+        failing the paper's own explicit alpha=1 sanity check).
+
+        `"accumulate"` mode: grad_W = -(eps_l[:, None] * e_W), with `e_W`
+        already matrix-shaped and already carrying `f'` baked in at every
+        accumulation step -- no separate `f'` here at all. See
+        `..eligibility.traced_weight_grad_from_matrix`.
+
+        `f'(pre_l) * eps_l` (the delta_l used in "readout" mode) IS
+        needed and IS correct in either mode: unlike the paper's own
+        worked example (which moves the nonlinearity to the observation
+        readout specifically to avoid this), tPC-H-style layers keep f
+        inside z_hat_t itself, so its derivative genuinely appears in the
+        local gradient through the chain rule -- see tPC-HE.md.
+
+        Every non-leaky weight -- including the observation layer's,
+        which is never leaky -- gets exactly `param_grad`'s ordinary
+        gradient, unmodified. Regularisation gradients (weight_decay/
+        orthogonal_penalty) are added on top for every weight regardless
+        of tracing, since they don't depend on states_prev/states_curr/
+        traces at all -- no tracing question for them.
+        """
+        accumulate = self.config.trace_mode == "accumulate"
+
+        # 1. Regularisation-only gradient -- exact, via autodiff, since
+        # these terms depend only on the weights themselves.
+        reg_grad = eqx.filter_grad(lambda m: m._weight_l2_reg() + m._weight_orthogonal_reg())(self)
+
+        # 2. Ordinary (non-traced) correlation-term gradient for EVERY
+        # weight -- already exactly correct for every weight that won't
+        # be replaced below (weight_reg_total=0 isolates just the
+        # correlation term, so it can be added to reg_grad cleanly rather
+        # than double-counting).
+        correlation_grad = eqx.filter_grad(
+            lambda m: m.tpch_energy_fn(states_prev, states_curr, observation, control_input, weight_reg_total=jnp.asarray(0.0))
+        )(self)
+
+        predictions, y_hat = self.predict(states_prev, states_curr, control_input, observation)
+        errors = [states_curr[i] - predictions[i] for i in range(len(states_curr))]  # errors[0]=eps_s, errors[1:]=hidden layers' eps
+
+        where_fns = []
+        replacements = []
+
+        if self.control_layer.alpha is not None:
+            if accumulate:
+                grad_factor_s = errors[0]  # f' already baked into the trace; nothing more to compute here
+                grad_fn = eligibility.traced_weight_grad_from_matrix
+            else:
+                pre_s = self.control_layer.pre_activation(states_prev[0], control_input)
+                grad_factor_s = eligibility.elementwise_deriv(self.control_layer.act_fn, pre_s) * errors[0]
+                grad_fn = eligibility.traced_weight_grad
+
+            where_fns.append(lambda g: g.control_layer.W_rec.weight)
+            replacements.append(-grad_fn(grad_factor_s, eligibility_state.e_A))
+            if self.control_layer.has_input and eligibility_state.e_B is not None:
+                where_fns.append(lambda g: g.control_layer.W_in.weight)
+                replacements.append(-grad_fn(grad_factor_s, eligibility_state.e_B))
+
+        for i, layer in enumerate(self.hidden_layers):
+            if layer.alpha is None:
+                continue
+            e_P, e_Q, e_R = eligibility_state.e_hidden[i]
+
+            if accumulate:
+                grad_factor_l = errors[i + 1]
+                grad_fn = eligibility.traced_weight_grad_from_matrix
+            else:
+                own_prev = states_prev[i + 1]
+                parent_prev = states_prev[i]
+                parent_curr = states_curr[i]
+                pre_l = layer.pre_activation(own_prev, parent_prev, parent_curr)
+                grad_factor_l = eligibility.elementwise_deriv(layer.act_fn, pre_l) * errors[i + 1]
+                grad_fn = eligibility.traced_weight_grad
+
+            where_fns.append(lambda g, i=i: g.hidden_layers[i].W_rec.weight)
+            replacements.append(-grad_fn(grad_factor_l, e_P))
+            where_fns.append(lambda g, i=i: g.hidden_layers[i].W_parent_prev.weight)
+            replacements.append(-grad_fn(grad_factor_l, e_Q))
+            where_fns.append(lambda g, i=i: g.hidden_layers[i].W_parent_curr.weight)
+            replacements.append(-grad_fn(grad_factor_l, e_R))
+
+        if where_fns:
+            combined_where = lambda g: tuple(fn(g) for fn in where_fns)
+            correlation_grad = eqx.tree_at(combined_where, correlation_grad, replace=tuple(replacements))
+
+        return jax.tree_util.tree_map(lambda a, b: a + b, correlation_grad, reg_grad)
+
+    # =========================================================================
     # Saving and loading
     # =========================================================================
 
@@ -833,6 +1148,10 @@ class TpchModel(eqx.Module, ModelBase):
             orthogonal_scope=config.orthogonal_scope,
             activity_decay=config.activity_decay,
             activity_reg_type=config.activity_reg_type,
+            control_alpha=config.control_alpha,
+            hidden_alphas=config.hidden_alphas,
+            trace_mode=config.trace_mode,
+            observation_groups=config.observation_groups,
         )
 
     @classmethod

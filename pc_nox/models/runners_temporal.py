@@ -75,18 +75,20 @@ def make_eval_step(activity_optim: optax.GradientTransformation, n_infer_steps: 
             `n_steps`. Fixed at build time because it becomes `jax.lax.scan`'s
             `length=` internally, which must be a concrete Python int known
             at trace time.
-        control_input: Optional control-layer input, constant for the whole
-            eval run and closed over here rather than passed to `eval_step`
-            each call.
+        control_input: Optional control-layer input, used as the DEFAULT for
+            every call to `eval_step` that doesn't pass its own -- pass a
+            fresh `control_input=` to `eval_step` itself (keyword-only) to
+            override it for one call, e.g. when driving a frame-varying
+            sequence from a plain Python loop.
 
     Returns:
         eval_step: A function with signature
-            `eval_step(model, states_prev, y, return_layerwise=False)`
+            `eval_step(model, states_prev, y, return_layerwise=False, *, control_input=<factory default>)`
             -> `(states_curr, y_hat_before, y_hat_after,
             energy_before, energy_after, energy_trace)`.
     """
     @eqx.filter_jit
-    def eval_step(model, states_prev, y, return_layerwise: bool = False):
+    def eval_step(model, states_prev, y, return_layerwise: bool = False, *, control_input=control_input):
         states_curr_init = model.init_activities(states_prev, control_input, y)
         _, y_hat_before = model.predict(states_prev, states_curr_init, control_input, y)
         energy_before = model.energy_fn(states_prev, states_curr_init, y, control_input)
@@ -117,35 +119,46 @@ def make_eval_run(activity_optim, n_infer_steps, run_length, control_input=None)
         run_length: Number of frames processed per call to the returned
             `eval_run`. Fixed at build time, same reasoning.
         control_input: Optional control-layer input, constant for every
-            frame and closed over here.
+            frame -- used ONLY when the returned `eval_run` is called
+            without its own `control_inputs=` (see below).
 
     Returns:
         eval_run: A function with signature
-            `eval_run(model, states_prev, ys, return_layerwise=False)`
+            `eval_run(model, states_prev, ys, return_layerwise=False, *, control_inputs=None)`
             -> `(states_curr, y_hat_before, y_hat_after, energies_before,
             energies_after, energy_traces)`.
+
+            `control_inputs`, if given, is an Array with a leading axis of
+            length `run_length` (one control input per frame, scanned
+            alongside `ys`) -- overrides the factory-level constant
+            `control_input` for this call. Omit it (the default) to keep
+            using that constant for every frame, exactly as before this
+            parameter existed.
     """
     @eqx.filter_jit
-    def eval_run(model, states_prev: Activities, ys: Array, return_layerwise: bool = False):
-        def step(states_prev, y_t):
-            states_curr_init = model.init_activities(states_prev, control_input, y_t)
-            _, y_hat_before = model.predict(states_prev, states_curr_init, control_input, y_t)
-            energy_before_t = model.energy_fn(states_prev, states_curr_init, y_t, control_input)
+    def eval_run(model, states_prev: Activities, ys: Array, return_layerwise: bool = False, *, control_inputs=None):
+        def step(states_prev, xy_t):
+            y_t, control_input_t = xy_t
+            ci = control_input_t if control_input_t is not None else control_input  # per-frame if given, else the factory-level constant
+
+            states_curr_init = model.init_activities(states_prev, ci, y_t)
+            _, y_hat_before = model.predict(states_prev, states_curr_init, ci, y_t)
+            energy_before_t = model.energy_fn(states_prev, states_curr_init, y_t, ci)
 
             settle_result = model.settle_scan(
-                activity_optim, states_prev, y_t, control_input, n_steps=n_infer_steps, return_layerwise=return_layerwise
+                activity_optim, states_prev, y_t, ci, n_steps=n_infer_steps, return_layerwise=return_layerwise
             )
             states_curr, energy_trace_t = settle_result if return_layerwise else (settle_result, None)
 
-            _, y_hat_after = model.predict(states_prev, states_curr, control_input, y_t)
-            energy_after_t = model.energy_fn(states_prev, states_curr, y_t, control_input)
+            _, y_hat_after = model.predict(states_prev, states_curr, ci, y_t)
+            energy_after_t = model.energy_fn(states_prev, states_curr, y_t, ci)
 
             return states_curr, (
                 y_hat_before, y_hat_after, energy_before_t, energy_after_t, energy_trace_t
             )
 
         states_curr, (y_hat_before, y_hat_after, energies_before, energies_after, energy_traces) = jax.lax.scan(
-            step, states_prev, xs=ys, length=run_length
+            step, states_prev, xs=(ys, control_inputs), length=run_length
         )
         return states_curr, y_hat_before, y_hat_after, energies_before, energies_after, energy_traces
 
@@ -161,12 +174,13 @@ def make_train_step(param_optim: optax.GradientTransformation, activity_optim: o
 
     Returns:
         train_step: A function with signature
-            `train_step(model, param_opt_state, states_prev, y, return_layerwise=False)`
+            `train_step(model, param_opt_state, states_prev, y, return_layerwise=False, *, control_input=<factory default>)`
             -> `(model, param_opt_state, states_curr, y_hat_before, y_hat_after,
-            energy_before, energy_after, energy_trace)`.
+            energy_before, energy_after, energy_trace)`. `control_input`
+            override works exactly as in `make_eval_step`'s `eval_step`.
     """
     @eqx.filter_jit
-    def train_step(model, param_opt_state, states_prev, y, return_layerwise: bool = False):
+    def train_step(model, param_opt_state, states_prev, y, return_layerwise: bool = False, *, control_input=control_input):
         states_curr_init = model.init_activities(states_prev, control_input, y)
         _, y_hat_before = model.predict(states_prev, states_curr_init, control_input, y)
         energy_before = model.energy_fn(states_prev, states_curr_init, y, control_input)
@@ -198,28 +212,32 @@ def make_train_run(param_optim, activity_optim, n_infer_steps, run_length, contr
 
     Returns:
         train_run: A function with signature
-            `train_run(model, param_opt_state, states_prev, ys, return_layerwise=False)`
+            `train_run(model, param_opt_state, states_prev, ys, return_layerwise=False, *, control_inputs=None)`
             -> `(model, param_opt_state, states_curr, y_hat_before,
             y_hat_after, energies_before, energies_after, energy_traces)`.
+            `control_inputs` (per-frame Array, leading axis length
+            `run_length`) works exactly as in `make_eval_run`'s `eval_run`.
     """
     @eqx.filter_jit
-    def train_run(model, param_opt_state, states_prev: Activities, ys: Array, return_layerwise: bool = False):
-        def step(carry, y_t):
+    def train_run(model, param_opt_state, states_prev: Activities, ys: Array, return_layerwise: bool = False, *, control_inputs=None):
+        def step(carry, xy_t):
             model, param_opt_state, states_prev = carry
+            y_t, control_input_t = xy_t
+            ci = control_input_t if control_input_t is not None else control_input  # per-frame if given, else the factory-level constant
 
-            states_curr_init = model.init_activities(states_prev, control_input, y_t)
-            _, y_hat_before = model.predict(states_prev, states_curr_init, control_input, y_t)
-            energy_before_t = model.energy_fn(states_prev, states_curr_init, y_t, control_input)
+            states_curr_init = model.init_activities(states_prev, ci, y_t)
+            _, y_hat_before = model.predict(states_prev, states_curr_init, ci, y_t)
+            energy_before_t = model.energy_fn(states_prev, states_curr_init, y_t, ci)
 
             settle_result = model.settle_scan(
-                activity_optim, states_prev, y_t, control_input, n_steps=n_infer_steps, return_layerwise=return_layerwise
+                activity_optim, states_prev, y_t, ci, n_steps=n_infer_steps, return_layerwise=return_layerwise
             )
             states_curr, energy_trace_t = settle_result if return_layerwise else (settle_result, None)
 
-            _, y_hat_after = model.predict(states_prev, states_curr, control_input, y_t)
-            energy_after_t = model.energy_fn(states_prev, states_curr, y_t, control_input)
+            _, y_hat_after = model.predict(states_prev, states_curr, ci, y_t)
+            energy_after_t = model.energy_fn(states_prev, states_curr, y_t, ci)
 
-            grads = model.param_grad(states_prev, states_curr, y_t, control_input)
+            grads = model.param_grad(states_prev, states_curr, y_t, ci)
             updates, param_opt_state = param_optim.update(grads, param_opt_state, model)
             model = eqx.apply_updates(model, updates)
             model = model.postprocess_params()
@@ -229,7 +247,7 @@ def make_train_run(param_optim, activity_optim, n_infer_steps, run_length, contr
             )
 
         (model, param_opt_state, states_curr), (y_hat_before, y_hat_after, energies_before, energies_after, energy_traces) = jax.lax.scan(
-            step, (model, param_opt_state, states_prev), xs=ys, length=run_length
+            step, (model, param_opt_state, states_prev), xs=(ys, control_inputs), length=run_length
         )
         return model, param_opt_state, states_curr, y_hat_before, y_hat_after, energies_before, energies_after, energy_traces
 
@@ -310,9 +328,10 @@ def make_train_step_diffrax(
 
     Returns:
         train_step: A function with signature
-            `train_step(model, param_opt_state, states_prev, y, return_layerwise=False)`
+            `train_step(model, param_opt_state, states_prev, y, return_layerwise=False, *, control_input=<factory default>)`
             -> `(model, param_opt_state, states_curr, y_hat_before,
             y_hat_after, energy_before, energy_after, energy_trace, ts)`.
+            `control_input` override works exactly as in `make_eval_step`'s `eval_step`.
     """
     if solver is None:
         solver = diffrax.Heun()
@@ -320,7 +339,7 @@ def make_train_step_diffrax(
         stepsize_controller = diffrax.PIDController(rtol=1e-3, atol=1e-3)
 
     @eqx.filter_jit
-    def train_step(model, param_opt_state, states_prev, y, return_layerwise: bool = False):
+    def train_step(model, param_opt_state, states_prev, y, return_layerwise: bool = False, *, control_input=control_input):
         y_hat_before, energy_before = _train_frame_pre(model, states_prev, y, control_input)
 
         settle_result = model.settle_diffrax(
@@ -368,10 +387,11 @@ def make_train_run_diffrax(
 
     Returns:
         train_run: A function with signature
-            `train_run(model, param_opt_state, states_prev, ys, return_layerwise=False)`
+            `train_run(model, param_opt_state, states_prev, ys, return_layerwise=False, *, control_inputs=None)`
             -> `(model, param_opt_state, states_curr, y_hat_before,
             y_hat_after, energies_before, energies_after, energy_traces,
-            ts_traces)`.
+            ts_traces)`. `control_inputs` (per-frame Array, leading axis
+            length `run_length`) works exactly as in `make_eval_run`'s `eval_run`.
     """
     if solver is None:
         solver = diffrax.Heun()
@@ -379,14 +399,16 @@ def make_train_run_diffrax(
         stepsize_controller = diffrax.PIDController(rtol=1e-3, atol=1e-3)
 
     @eqx.filter_jit
-    def train_run(model, param_opt_state, states_prev: "Activities", ys: "Array", return_layerwise: bool = False):
-        def step(carry, y_t):
+    def train_run(model, param_opt_state, states_prev: "Activities", ys: "Array", return_layerwise: bool = False, *, control_inputs=None):
+        def step(carry, xy_t):
             model, param_opt_state, states_prev = carry
+            y_t, control_input_t = xy_t
+            ci = control_input_t if control_input_t is not None else control_input  # per-frame if given, else the factory-level constant
 
-            y_hat_before, energy_before_t = _train_frame_pre(model, states_prev, y_t, control_input)
+            y_hat_before, energy_before_t = _train_frame_pre(model, states_prev, y_t, ci)
 
             settle_result = model.settle_diffrax(
-                states_prev, y_t, control_input,
+                states_prev, y_t, ci,
                 max_t1=max_t1, dt0=dt0, n_save=n_save,
                 solver=solver, stepsize_controller=stepsize_controller,
                 steady_state_tol=steady_state_tol, steady_state_criterion=steady_state_criterion,
@@ -399,7 +421,7 @@ def make_train_run_diffrax(
                 states_curr, energy_trace_t, ts_t = settle_result, None, None
 
             model, param_opt_state, y_hat_after, energy_after_t = _train_frame_post(
-                model, param_optim, param_opt_state, states_prev, states_curr, y_t, control_input
+                model, param_optim, param_opt_state, states_prev, states_curr, y_t, ci
             )
 
             return (model, param_opt_state, states_curr), (
@@ -408,7 +430,7 @@ def make_train_run_diffrax(
 
         (model, param_opt_state, states_curr), (
             y_hat_before, y_hat_after, energies_before, energies_after, energy_traces, ts_traces
-        ) = jax.lax.scan(step, (model, param_opt_state, states_prev), xs=ys, length=run_length)
+        ) = jax.lax.scan(step, (model, param_opt_state, states_prev), xs=(ys, control_inputs), length=run_length)
 
         return (
             model, param_opt_state, states_curr, y_hat_before, y_hat_after,
@@ -435,9 +457,10 @@ def make_eval_step_diffrax(
 
     Returns:
         eval_step: A function with signature
-            `eval_step(model, states_prev, y, return_layerwise=False)`
+            `eval_step(model, states_prev, y, return_layerwise=False, *, control_input=<factory default>)`
             -> `(states_curr, y_hat_before, y_hat_after, energy_before,
-            energy_after, energy_trace, ts)`.
+            energy_after, energy_trace, ts)`. `control_input` override
+            works exactly as in `make_eval_step`'s `eval_step`.
     """
     if solver is None:
         solver = diffrax.Heun()
@@ -445,7 +468,7 @@ def make_eval_step_diffrax(
         stepsize_controller = diffrax.PIDController(rtol=1e-3, atol=1e-3)
 
     @eqx.filter_jit
-    def eval_step(model, states_prev, y, return_layerwise: bool = False):
+    def eval_step(model, states_prev, y, return_layerwise: bool = False, *, control_input=control_input):
         y_hat_before, energy_before = _train_frame_pre(model, states_prev, y, control_input)
 
         settle_result = model.settle_diffrax(
@@ -486,9 +509,11 @@ def make_eval_run_diffrax(
 
     Returns:
         eval_run: A function with signature
-            `eval_run(model, states_prev, ys, return_layerwise=False)`
+            `eval_run(model, states_prev, ys, return_layerwise=False, *, control_inputs=None)`
             -> `(states_curr, y_hat_before, y_hat_after, energies_before,
-            energies_after, energy_traces, ts_traces)`.
+            energies_after, energy_traces, ts_traces)`. `control_inputs`
+            (per-frame Array, leading axis length `run_length`) works
+            exactly as in `make_eval_run`'s `eval_run`.
     """
     if solver is None:
         solver = diffrax.Heun()
@@ -496,12 +521,15 @@ def make_eval_run_diffrax(
         stepsize_controller = diffrax.PIDController(rtol=1e-3, atol=1e-3)
 
     @eqx.filter_jit
-    def eval_run(model, states_prev: "Activities", ys: "Array", return_layerwise: bool = False):
-        def step(states_prev, y_t):
-            y_hat_before, energy_before_t = _train_frame_pre(model, states_prev, y_t, control_input)
+    def eval_run(model, states_prev: "Activities", ys: "Array", return_layerwise: bool = False, *, control_inputs=None):
+        def step(states_prev, xy_t):
+            y_t, control_input_t = xy_t
+            ci = control_input_t if control_input_t is not None else control_input  # per-frame if given, else the factory-level constant
+
+            y_hat_before, energy_before_t = _train_frame_pre(model, states_prev, y_t, ci)
 
             settle_result = model.settle_diffrax(
-                states_prev, y_t, control_input,
+                states_prev, y_t, ci,
                 max_t1=max_t1, dt0=dt0, n_save=n_save,
                 solver=solver, stepsize_controller=stepsize_controller,
                 steady_state_tol=steady_state_tol, steady_state_criterion=steady_state_criterion,
@@ -513,7 +541,7 @@ def make_eval_run_diffrax(
             else:
                 states_curr, energy_trace_t, ts_t = settle_result, None, None
 
-            y_hat_after, energy_after_t = _eval_frame_post(model, states_prev, states_curr, y_t, control_input)
+            y_hat_after, energy_after_t = _eval_frame_post(model, states_prev, states_curr, y_t, ci)
 
             return states_curr, (
                 y_hat_before, y_hat_after, energy_before_t, energy_after_t, energy_trace_t, ts_t
@@ -521,7 +549,7 @@ def make_eval_run_diffrax(
 
         states_curr, (
             y_hat_before, y_hat_after, energies_before, energies_after, energy_traces, ts_traces
-        ) = jax.lax.scan(step, states_prev, xs=ys, length=run_length)
+        ) = jax.lax.scan(step, states_prev, xs=(ys, control_inputs), length=run_length)
 
         return (
             states_curr, y_hat_before, y_hat_after,
@@ -529,3 +557,127 @@ def make_eval_run_diffrax(
         )
 
     return eval_run
+
+
+# =============================================================================
+# Eligibility-traced training (tPC-E) -- NEW functions, not modifications
+# to the ones above: models without any leaky layer are completely
+# unaffected by anything in this section, and models WITH leaky layers
+# still work with the plain (non-traced) runners above (using
+# `param_grad`, the ordinary instantaneous gradient) if that's what's
+# wanted -- tracing is opt-in per training run, not forced by a model
+# having leaky layers.
+#
+# The only structural difference from `make_train_step`/`make_train_run`:
+# an `EligibilityState` (see `tpch/model.py`) is threaded through the
+# carry alongside `states_prev`, updated once per frame via
+# `model.update_eligibility_state` AFTER that frame's settling (see that
+# method's docstring for why the ordering matters), and
+# `model.param_grad_traced` is called instead of `model.param_grad`.
+# Everything else -- init, predict, energy logging, the optax weight
+# update -- is identical to the plain scan-based runners.
+# =============================================================================
+
+def make_train_step_traced(
+    param_optim: optax.GradientTransformation,
+    activity_optim: optax.GradientTransformation,
+    n_infer_steps: int,
+    control_input: Optional[Array] = None,
+):
+    """Eligibility-traced analogue of `make_train_step`.
+
+    Returns:
+        train_step: A function with signature
+            `train_step(model, param_opt_state, eligibility_state, states_prev, y, return_layerwise=False, *, control_input=<factory default>)`
+            -> `(model, param_opt_state, eligibility_state, states_curr,
+            y_hat_before, y_hat_after, energy_before, energy_after, energy_trace)`.
+            `control_input` override works exactly as in `make_eval_step`'s `eval_step`.
+    """
+    @eqx.filter_jit
+    def train_step(model, param_opt_state, eligibility_state, states_prev, y, return_layerwise: bool = False, *, control_input=control_input):
+        states_curr_init = model.init_activities(states_prev, control_input, y)
+        _, y_hat_before = model.predict(states_prev, states_curr_init, control_input, y)
+        energy_before = model.energy_fn(states_prev, states_curr_init, y, control_input)
+
+        settle_result = model.settle_scan(
+            activity_optim, states_prev, y, control_input, n_steps=n_infer_steps, return_layerwise=return_layerwise
+        )
+        states_curr, energy_trace = settle_result if return_layerwise else (settle_result, None)
+
+        _, y_hat_after = model.predict(states_prev, states_curr, control_input, y)
+        energy_after = model.energy_fn(states_prev, states_curr, y, control_input)
+
+        # Update traces AFTER settling, using THIS frame's settled
+        # states_curr (needed for the W_parent_curr / e_R traces) -- see
+        # `update_eligibility_state`'s docstring.
+        eligibility_state = model.update_eligibility_state(eligibility_state, states_prev, states_curr, control_input)
+
+        grads = model.param_grad_traced(eligibility_state, states_prev, states_curr, y, control_input)
+        updates, param_opt_state = param_optim.update(grads, param_opt_state, model)
+        model = eqx.apply_updates(model, updates)
+        model = model.postprocess_params()
+
+        return model, param_opt_state, eligibility_state, states_curr, y_hat_before, y_hat_after, energy_before, energy_after, energy_trace
+
+    return train_step
+
+
+def make_train_run_traced(
+    param_optim: optax.GradientTransformation,
+    activity_optim: optax.GradientTransformation,
+    n_infer_steps: int,
+    run_length: int,
+    control_input: Optional[Array] = None,
+):
+    """Eligibility-traced analogue of `make_train_run`: `run_length`
+    frames fused into one `jax.lax.scan`, `eligibility_state` carried
+    alongside `model`/`param_opt_state`/`states_prev`.
+
+    Returns:
+        train_run: A function with signature
+            `train_run(model, param_opt_state, eligibility_state, states_prev, ys, return_layerwise=False, *, control_inputs=None)`
+            -> `(model, param_opt_state, eligibility_state, states_curr,
+            y_hat_before, y_hat_after, energies_before, energies_after, energy_traces)`.
+            `control_inputs` (per-frame Array, leading axis length
+            `run_length`) works exactly as in `make_eval_run`'s `eval_run`
+            -- and is the more natural way to feed tPC-E a genuinely
+            varying (e.g. spike-then-quiet) control-input sequence, since
+            the whole point of tracing is to test credit assignment
+            across such sequences.
+    """
+    @eqx.filter_jit
+    def train_run(model, param_opt_state, eligibility_state, states_prev: Activities, ys: Array, return_layerwise: bool = False, *, control_inputs=None):
+        def step(carry, xy_t):
+            model, param_opt_state, eligibility_state, states_prev = carry
+            y_t, control_input_t = xy_t
+            ci = control_input_t if control_input_t is not None else control_input  # per-frame if given, else the factory-level constant
+
+            states_curr_init = model.init_activities(states_prev, ci, y_t)
+            _, y_hat_before = model.predict(states_prev, states_curr_init, ci, y_t)
+            energy_before_t = model.energy_fn(states_prev, states_curr_init, y_t, ci)
+
+            settle_result = model.settle_scan(
+                activity_optim, states_prev, y_t, ci, n_steps=n_infer_steps, return_layerwise=return_layerwise
+            )
+            states_curr, energy_trace_t = settle_result if return_layerwise else (settle_result, None)
+
+            _, y_hat_after = model.predict(states_prev, states_curr, ci, y_t)
+            energy_after_t = model.energy_fn(states_prev, states_curr, y_t, ci)
+
+            eligibility_state = model.update_eligibility_state(eligibility_state, states_prev, states_curr, ci)
+            grads = model.param_grad_traced(eligibility_state, states_prev, states_curr, y_t, ci)
+            updates, param_opt_state = param_optim.update(grads, param_opt_state, model)
+            model = eqx.apply_updates(model, updates)
+            model = model.postprocess_params()
+
+            return (model, param_opt_state, eligibility_state, states_curr), (
+                y_hat_before, y_hat_after, energy_before_t, energy_after_t, energy_trace_t
+            )
+
+        (model, param_opt_state, eligibility_state, states_curr), (
+            y_hat_before, y_hat_after, energies_before, energies_after, energy_traces
+        ) = jax.lax.scan(step, (model, param_opt_state, eligibility_state, states_prev), xs=(ys, control_inputs), length=run_length)
+
+        return model, param_opt_state, eligibility_state, states_curr, y_hat_before, y_hat_after, energies_before, energies_after, energy_traces
+
+    return train_run

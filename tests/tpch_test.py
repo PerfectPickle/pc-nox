@@ -1,8 +1,12 @@
-from models.tpch import (
-    TpchModel, TpchConfig, TpchControlLayer, TpchHiddenLayer, TpchObservationLayer,
+from pc_nox.models.tpch.model import (
+    TpchModel,  TpchControlLayer, TpchHiddenLayer, TpchObservationLayer, TpchHeterogeneousObservationLayer
+)
+from pc_nox.engine.runners_temporal import (
     make_train_step, make_train_run, make_train_step_diffrax, make_train_run_diffrax,
     make_eval_step, make_eval_run, make_eval_step_diffrax, make_eval_run_diffrax,
 )
+from pc_nox.models.tpch.config import TpchConfig
+
 import equinox as eqx
 import jax
 import jax.random as jr
@@ -12,6 +16,7 @@ import pytest
 from typing import Callable, List, Sequence, Tuple, Optional
 import optax
 import diffrax
+import warnings
 
 # =============================================================================
 # manual gradient functions implemented by me, to test energy function correctness
@@ -1341,8 +1346,6 @@ def test_overlapping_weight_and_orthogonal_regularisation_warns_at_collapse_thre
 def test_non_overlapping_weight_and_orthogonal_regularisation_does_not_warn():
     """The same coefficients are harmless when the two regularisers operate on
     disjoint parameter sets."""
-    import warnings
-
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         _regularised_model(

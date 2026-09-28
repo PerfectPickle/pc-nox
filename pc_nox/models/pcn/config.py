@@ -8,13 +8,13 @@ static hierarchy is just a chain of layer widths from input to output,
 """
 
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Tuple, Union
 
 
 @dataclass(frozen=True)
 class PcnConfig:
     layer_sizes: Tuple[int, ...]  # (input_size, hidden_1, ..., hidden_k, output_size); len >= 2
-    act_fn: str = "tanh"  # Activation function name (registry key), applied at every layer except the output readout
+    act_fn: Union[str, Tuple[str, ...]] = "tanh"   # one name, or one per layer (len = len(layer_sizes) - 1)
     loss: str = "mse"  # Output-layer loss ('mse' | 'ce')
     weight_decay: float = 0.0
     orthogonal_penalty: float = 0.0

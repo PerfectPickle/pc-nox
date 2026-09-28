@@ -28,9 +28,10 @@ import jax.random as jr
 import optax
 import pytest
 
-from models.model_base import ModelBase, MODEL_REGISTRY
-from models.tpch import TpchModel  # only used for the cross-subclass dispatch test below
-from utils.checkpoints import load_metadata  # used by the two-call optim-rebuild workflow test below
+from pc_nox.core.model_base import ModelBase, MODEL_REGISTRY
+from pc_nox.models.tpch.model import TpchModel  # only used for the cross-subclass dispatch test below
+from pc_nox.models.tpch.config import TpchConfig
+from pc_nox.utils.checkpoints import load_metadata  # used by the two-call optim-rebuild workflow test below
 
 
 def assert_allclose(actual, expected, name, atol=1e-6, rtol=1e-6):
@@ -507,7 +508,6 @@ def test_layer_labels_real_tpch_model():
     generic ModelBase contract against a dummy. Detailed correctness
     (label content, ordering, edge cases) lives in tpch_test.py; this just
     confirms the real subclass participates in the generic hook correctly."""
-    from models.tpch import TpchConfig
     config = TpchConfig(control_layer_size=4, hidden_sizes=(3, 5), obs_size=6)
     labels = TpchModel.layer_labels(config)
     assert labels == ["Control", "Hidden 1", "Hidden 2", "Observation"]

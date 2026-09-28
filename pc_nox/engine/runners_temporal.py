@@ -54,7 +54,7 @@ import jax
 import optax
 from jaxtyping import Array
 
-from .model_base import Activities
+from pc_nox.core.model_base import Activities
 
 # =============================================================================
 # lax.scan inference and/or training helpers (optax activity optimiser)

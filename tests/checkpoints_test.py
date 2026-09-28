@@ -13,7 +13,7 @@ import json
 
 import pytest
 
-from utils.checkpoints import find_latest_checkpoint, load_metadata
+from pc_nox.utils.checkpoints import find_latest_checkpoint, load_metadata
 
 
 def make_checkpoint_dir(root, name, *, model_type="tpch", created_at="2026-01-01T00:00:00", metadata=None):

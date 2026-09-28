@@ -35,7 +35,7 @@ pitfalls). What would change, concretely:
 --------------------------------------------------------------------------
 What's shared with the temporal side, and what isn't
 --------------------------------------------------------------------------
-`regularisers.py`'s L2/orthogonal/activity math is reused as-is (weight
+`penalties.py`'s L2/orthogonal/activity math is reused as-is (weight
 selection is trivial here -- there's no rec/ff distinction, so `_all_weights()`
 is the only scope). `runners_static.py` (batch via `jax.vmap`, not `jax.lax.scan`
 across time -- see that module's docstring) is this model's counterpart
@@ -55,8 +55,9 @@ import jax.random as jr
 import optax
 from jaxtyping import Array, PRNGKeyArray, PyTree
 
-from .. import regularisers
-from ..model_base import ACT_FN_REGISTRY, Activities, ModelBase, Predictions
+from pc_nox.core import penalties
+from pc_nox.core.activations import ACT_FN_REGISTRY
+from pc_nox.core.model_base import Activities, ModelBase, Predictions
 from .config import PcnConfig
 from .layers import PcnLayer
 
@@ -78,7 +79,7 @@ class PcnModel(eqx.Module, ModelBase):
         loss: Output-layer loss, `"mse"` (default) or `"ce"`.
         weight_decay, orthogonal_penalty, activity_decay, activity_reg_type:
             same meaning as the like-named `TpchConfig` fields -- see
-            `regularisers.py`. No `_scope` variants: there's no rec/ff
+            `penalties.py`. No `_scope` variants: there's no rec/ff
             distinction in a static PCN, every penalty applies to every
             weight/state uniformly.
     """
@@ -106,9 +107,20 @@ class PcnModel(eqx.Module, ModelBase):
         if activity_reg_type not in ("l1", "l2"):
             raise ValueError(f"activity_reg_type must be 'l1' or 'l2', got {activity_reg_type!r}")
 
+
+        n_layers = len(layer_sizes) - 1
+        names = (act_fn,) * n_layers if isinstance(act_fn, str) else tuple(act_fn)
+        if len(names) != n_layers:
+            raise ValueError(f"act_fn needs {n_layers} entries (one per layer), got {len(names)}")
+        try:
+            act_fns = [ACT_FN_REGISTRY[n] for n in names]
+        except KeyError as e:
+            raise KeyError(f"act_fn {e.args[0]!r} not in ACT_FN_REGISTRY") from None
+
+        # store the original form for string configs, tuple otherwise
         self.config = PcnConfig(
             layer_sizes=tuple(layer_sizes),
-            act_fn=act_fn,
+            act_fn=act_fn if isinstance(act_fn, str) else names,
             loss=loss,
             weight_decay=weight_decay,
             orthogonal_penalty=orthogonal_penalty,
@@ -116,18 +128,10 @@ class PcnModel(eqx.Module, ModelBase):
             activity_reg_type=activity_reg_type,
         )
 
-        try:
-            act_fn_callable = ACT_FN_REGISTRY[act_fn]
-        except KeyError:
-            raise KeyError(
-                f"act_fn={act_fn!r} not in ACT_FN_REGISTRY. If this is a custom "
-                f"activation, register it before loading: ACT_FN_REGISTRY[{act_fn!r}] = ..."
-            ) from None
-
-        n_layers = len(layer_sizes) - 1
         keys = jr.split(key, n_layers)
+
         self.layers = [
-            PcnLayer(parent_size=layer_sizes[i], own_size=layer_sizes[i + 1], act_fn=act_fn_callable, key=k)
+            PcnLayer(parent_size=layer_sizes[i], own_size=layer_sizes[i + 1], act_fn=act_fns[i], key=k)
             for i, k in enumerate(keys)
         ]
 
@@ -168,7 +172,7 @@ class PcnModel(eqx.Module, ModelBase):
 
     # =========================================================================
     # Weight enumeration / regularisation -- no rec/ff distinction (no
-    # recurrent weights at all), so `regularisers.py`'s math is applied to
+    # recurrent weights at all), so `penalties.py`'s math is applied to
     # every weight uniformly.
     # =========================================================================
 
@@ -176,13 +180,13 @@ class PcnModel(eqx.Module, ModelBase):
         return [layer.weight for layer in self.layers]
 
     def _weight_l2_reg(self) -> Array:
-        return regularisers.l2_reg(self._all_weights(), self.config.weight_decay)
+        return penalties.l2_reg(self._all_weights(), self.config.weight_decay)
 
     def _weight_orthogonal_reg(self) -> Array:
-        return regularisers.orthogonal_reg(self._all_weights(), self.config.orthogonal_penalty)
+        return penalties.orthogonal_reg(self._all_weights(), self.config.orthogonal_penalty)
 
     def _activity_reg(self, states_curr: Activities) -> Array:
-        return regularisers.activity_reg(states_curr, self.config.activity_decay, self.config.activity_reg_type)
+        return penalties.activity_reg(states_curr, self.config.activity_decay, self.config.activity_reg_type)
 
     # =========================================================================
     # Free energy
@@ -192,11 +196,15 @@ class PcnModel(eqx.Module, ModelBase):
         self,
         states_curr: Activities,
         x: Array,
-        y: Array,
+        y: Optional[Array],
         weight_reg_total: Optional[Array] = None,
         return_layerwise: bool = False,
     ) -> Array:
-        """Sum over every interior layer's squared prediction error, plus
+        """If `y` is None the output is left free (unclamped): the output
+        error term is dropped, so settling never sees the label. Use this
+        for test-time inference.
+
+        Sum over every interior layer's squared prediction error, plus
         the output term (mse or ce against y), plus configured
         regularisation. Same shape as `tpch_energy_fn`, minus the temporal
         terms.
@@ -208,7 +216,10 @@ class PcnModel(eqx.Module, ModelBase):
         for target, pred in zip(targets[:-1], predictions[:-1]):
             layer_energies.append(0.5 * jnp.sum((target - pred) ** 2))
 
-        if self.config.loss == "mse":
+        if y is None:
+            # Free (unclamped) output: no target, so no output error term.
+            obs_energy = jnp.zeros(())
+        elif self.config.loss == "mse":
             obs_energy = 0.5 * jnp.sum((y - y_hat) ** 2)
         else:  # "ce"
             obs_energy = -jnp.sum(y * jax.nn.log_softmax(y_hat))

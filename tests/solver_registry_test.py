@@ -6,7 +6,7 @@ Tests for utils/solver_registry.py.
 import diffrax
 import pytest
 
-from utils.solver_registry import SOLVER_REGISTRY, build_solver
+from pc_nox.registries.solver_registry import SOLVER_REGISTRY, build_solver
 
 
 # Every registered constructor is exercised below. Keeping this mapping

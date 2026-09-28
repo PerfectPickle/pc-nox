@@ -59,9 +59,11 @@ import jax.random as jr
 import optax
 from jaxtyping import Array, PRNGKeyArray, PyTree
 
-from .. import inference, regularisers
-from ..model_base import ACT_FN_REGISTRY, Activities, ModelBase, Predictions
-from .. import eligibility
+from pc_nox.core import penalties
+from pc_nox.core.activations import ACT_FN_REGISTRY
+from pc_nox.core.model_base import Activities, ModelBase, Predictions
+from pc_nox.engine import ode_settling
+from . import eligibility
 from .config import TpchConfig, scopes_overlap
 from .layers import TpchControlLayer, TpchHeterogeneousObservationLayer, TpchHiddenLayer, TpchObservationLayer
 
@@ -388,7 +390,7 @@ class TpchModel(eqx.Module, ModelBase):
             return self._all_weights()
 
     # extra energy (penalty) from L2 weight decay / regularisation.
-    # The arithmetic itself (`regularisers.l2_reg` etc.) is generic --
+    # The arithmetic itself (`penalties.l2_reg` etc.) is generic --
     # every variant wants the same Frobenius-norm / Gram-matrix / L1-L2
     # math. Only *which weights are selected* (`_weights_for_scope`,
     # above) is tPC-H-specific, and stays here.
@@ -396,7 +398,7 @@ class TpchModel(eqx.Module, ModelBase):
         """0.5 * weight_decay * sum ||W||_F^2 (squared Frobenius norm) over
         `weight_decay_scope` weights."""
         weights = self._weights_for_scope(self.config.weight_decay_scope)
-        return regularisers.l2_reg(weights, self.config.weight_decay)
+        return penalties.l2_reg(weights, self.config.weight_decay)
 
     def _weight_orthogonal_reg(self) -> Array:
         """0.5 * orthogonal_penalty * sum ||I - W^T W||_F^2 (or W W^T for a
@@ -406,14 +408,14 @@ class TpchModel(eqx.Module, ModelBase):
         weights to keep the state dynamics well-conditioned over time.
         """
         weights = self._weights_for_scope(self.config.orthogonal_scope)
-        return regularisers.orthogonal_reg(weights, self.config.orthogonal_penalty)
+        return penalties.orthogonal_reg(weights, self.config.orthogonal_penalty)
 
     def _activity_reg(self, states_curr: Activities) -> Array:
         """0.5 * activity_decay * sum ||z||_p^p over every current state,
         with p=1 (sparsity-promoting) or p=2 (soft bound on activity norm)
         depending on `activity_reg_type`.
         """
-        return regularisers.activity_reg(states_curr, self.config.activity_decay, self.config.activity_reg_type)
+        return penalties.activity_reg(states_curr, self.config.activity_decay, self.config.activity_reg_type)
 
     # -------------------------------------------------------------------
     # Layerwise regularisation (for `return_layerwise=True`) -- additive to
@@ -466,7 +468,7 @@ class TpchModel(eqx.Module, ModelBase):
         equals `_weight_l2_reg()`'s scalar (same terms, just partitioned).
         """
         groups = self._weight_groups_for_scope(self.config.weight_decay_scope)
-        return regularisers.l2_reg_by_group(groups, self.config.weight_decay)
+        return penalties.l2_reg_by_group(groups, self.config.weight_decay)
 
     def _weight_orthogonal_reg_by_layer(self) -> Array:
         """Per-layer breakdown of `_weight_orthogonal_reg()`, same Gram-matrix
@@ -474,7 +476,7 @@ class TpchModel(eqx.Module, ModelBase):
         owning layer instead of summed across the whole scope.
         """
         groups = self._weight_groups_for_scope(self.config.orthogonal_scope)
-        return regularisers.orthogonal_reg_by_group(groups, self.config.orthogonal_penalty)
+        return penalties.orthogonal_reg_by_group(groups, self.config.orthogonal_penalty)
 
     def _activity_reg_by_layer(self, states_curr: Activities) -> Array:
         """Per-layer breakdown of the activity-regularisation term: shape
@@ -483,7 +485,7 @@ class TpchModel(eqx.Module, ModelBase):
         this with the weight-reg breakdowns above must pad with one
         trailing zero themselves (see `tpch_energy_fn`).
         """
-        return regularisers.activity_reg_by_layer(states_curr, self.config.activity_decay, self.config.activity_reg_type)
+        return penalties.activity_reg_by_layer(states_curr, self.config.activity_decay, self.config.activity_reg_type)
 
     # =========================================================================
     # Free energy -- eq. (19), generalised to an arbitrary number of layers
@@ -689,7 +691,7 @@ class TpchModel(eqx.Module, ModelBase):
     # Scan-fused inference, for performance
     # =========================================================================
     #
-    # Kept per-model rather than in `inference.py`: `make_activity_step` +
+    # Kept per-model rather than in `ode_settling.py`: `make_activity_step` +
     # `settle_scan` is ~50 lines, cheap to duplicate, and different models
     # may reasonably want a different scan body (e.g. one that fixes some
     # activities during inference). `settle_diffrax`, below, is the one
@@ -821,14 +823,14 @@ class TpchModel(eqx.Module, ModelBase):
         rtol: Optional[float] = None,
         atol: Optional[float] = None,
     ) -> diffrax.Event:
-        """tPC-H adapter over `inference.make_steady_state_event` -- builds
+        """tPC-H adapter over `ode_settling.make_steady_state_event` -- builds
         this trajectory's vector field and (for `criterion="energy_rate"`)
-        energy closure, then delegates. See `inference.make_steady_state_event`
+        energy closure, then delegates. See `ode_settling.make_steady_state_event`
         for what each `criterion` measures and the full Args/Returns.
         """
         vector_field = self.make_vector_field(states_prev, observation, control_input)
         energy_fn = lambda s: self.tpch_energy_fn(states_prev, s, observation, control_input)
-        return inference.make_steady_state_event(
+        return ode_settling.make_steady_state_event(
             vector_field, tol=tol, criterion=criterion, rtol=rtol, atol=atol, energy_fn=energy_fn,
         )
 
@@ -848,11 +850,11 @@ class TpchModel(eqx.Module, ModelBase):
         steady_state_atol: Optional[float] = None,
         return_layerwise: bool = False,
     ) -> Union["Activities", Tuple["Activities", "Array", "Array"]]:
-        """tPC-H adapter over `inference.settle_diffrax`: builds the
+        """tPC-H adapter over `ode_settling.settle_diffrax`: builds the
         feedforward init and the trajectory's closures (vector field, plain
         energy, layerwise energy), then delegates the actual integration.
         Behaviour, args and returns are unchanged from before this file was
-        split -- see `inference.settle_diffrax`'s docstring for the full
+        split -- see `ode_settling.settle_diffrax`'s docstring for the full
         description (Mode 1 / Mode 2, `return_layerwise`'s inf-padding
         caveat, etc.), which now lives there since it no longer describes
         anything tPC-H-specific.
@@ -864,7 +866,7 @@ class TpchModel(eqx.Module, ModelBase):
             states_prev, s, observation, control_input, return_layerwise=True
         )
 
-        return inference.settle_diffrax(
+        return ode_settling.settle_diffrax(
             vector_field,
             states_curr0,
             energy_fn=energy_fn,

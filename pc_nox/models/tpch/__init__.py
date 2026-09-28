@@ -11,7 +11,7 @@ New code that also wants to drive a *different* temporal variant with the
 same runners should import them from `models.runners_temporal` directly.
 """
 
-from ..runners_temporal import (
+from pc_nox.engine.runners_temporal import (
     make_eval_run,
     make_eval_run_diffrax,
     make_eval_step,
@@ -22,7 +22,7 @@ from ..runners_temporal import (
     make_train_step_diffrax,
 )
 from .config import TpchConfig
-from .layers import TpchControlLayer, TpchHiddenLayer, TpchObservationLayer
+from .layers import TpchControlLayer, TpchHiddenLayer, TpchObservationLayer, TpchHeterogeneousObservationLayer
 from .model import TpchModel
 
 __all__ = [

@@ -7,7 +7,7 @@ import diffrax
 import jax.numpy as jnp
 import pytest
 
-from utils.stepsize_controller_registry import (
+from pc_nox.registries.stepsize_controller_registry import (
     STEPSIZE_CONTROLLER_REGISTRY,
     build_stepsize_controller,
 )

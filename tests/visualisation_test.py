@@ -24,7 +24,7 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import pytest
 
-import utils.visualisation as viz
+import pc_nox.utils.visualisation as viz
 
 # --------------------------------------------------------------------------
 # helpers

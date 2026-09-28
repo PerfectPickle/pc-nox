@@ -1,5 +1,5 @@
 <p align="center">
-  <img src=".github/images/logo.png" alt="Predictions" width="250">
+  <img src=".github/images/logo.png" alt="Predictions" width="300">
 </p>
 <h1 align="center">pc-nox: Deep and Temporal Predictive Coding</h1>
 
@@ -8,7 +8,9 @@ This library aims to provide easy to use [Equinox](https://github.com/patrick-ki
 
 ## Currently Supported Architectures
 
-* **tPC-H ([Ng-Kee-Kwong et al., 2026](https://www.biorxiv.org/content/10.64898/2026.07.09.737423v1))**: Hierarchical temporal Predictive Coding, with any number of hidden layers, of any size.
+- **tPC-H ([Ng-Kee-Kwong et al., 2026](https://www.biorxiv.org/content/10.64898/2026.07.09.737423v1))**: Hierarchical temporal Predictive Coding, supporting any number of hidden layers of any size. Optional extensions:
+  - **Eligibility Traces ([Ng-Kee-Kwong et al., 2026](https://www.biorxiv.org/content/10.64898/2026.07.09.737423v1))**: Integrates eligibility traces based on tPC-E generalised to tPC-H.
+* **PCN**: Classic static PCN, with any number of hidden layers, of any size.
 
 
 ## Other Features
@@ -28,11 +30,11 @@ This library aims to provide easy to use [Equinox](https://github.com/patrick-ki
 | <img src=".github/images/predictions.gif" alt="Predictions" height="250"> | <img src=".github/images/energies.png" alt="VFE Plot" height="250"> |
 
 
-## Planned Architectures
+## Planned Extensions
 
-* **tPC-E ([Ng-Kee-Kwong et al., 2026](https://www.biorxiv.org/content/10.64898/2026.07.09.737423v1))**: Temporal Predictive Coding with eligibility traces.
-* **PCN-HEP ([Mohammadi & Ororbia, 2026](https://arxiv.org/abs/2606.22744))**: PCN with Highway Error Propagation.
-* **Meta-PCN ([Ha et al., 2026](https://openreview.net/forum?id=kE5jJUHl9i))**: PCN with meta-prediction errors and weight regularization.
+* **bPC ([Oliviers et al., 2025](https://arxiv.org/abs/2505.23415))**: Bidirectional PC that incorporates both generative and discriminative inference.
+* **PCN-HEP ([Mohammadi & Ororbia, 2026](https://arxiv.org/abs/2606.22744))**: PC with Highway Error Propagation.
+* **Meta-PCN ([Ha et al., 2026](https://openreview.net/forum?id=kE5jJUHl9i))**: PC with meta-prediction errors and weight regularisation.
 
 
 ## Installation
@@ -56,7 +58,7 @@ pip install "jax[cuda12]>=0.4.38,<0.7" "jaxlib>=0.4.38,<0.7" "numpy>=2.0,<2.5" -
 
 ## See Also
 
-* **[JPC](https://github.com/thebuckleylab/jpc)**: A JAX predictive coding library, supporting many other developments not covered by pc-nox, such as bidirectional PC, ePC, and more.
+* **[JPC](https://github.com/thebuckleylab/jpc)**: A JAX predictive coding library, supporting other developments not covered by pc-nox, such as ePC.
 * **[pyHGF](https://github.com/ComputationalPsychiatry/pyhgf)**: Rich, modular framework for a variety of networks such as the generalised Hierarchical Gaussian Filter.
 
 

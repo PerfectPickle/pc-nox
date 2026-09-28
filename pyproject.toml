@@ -1,6 +1,6 @@
 [project]
 name = "pc-nox"
-version = "0.1.0"
+version = "0.1.1"
 description = "Easy to use Equinox / JAX implementations of cutting edge predictive coding variants like tPC-H and Meta-PCN, with experimental fusions to come."
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
@@ -53,4 +53,5 @@ requires = ["hatchling"]
 include = ["pc_nox*"]
 
 [tool.pytest.ini_options]
-pythonpath = ["pc_nox"]
+pythonpath = ["."]
+testpaths = ["tests"] # or "pc_nox/tests"

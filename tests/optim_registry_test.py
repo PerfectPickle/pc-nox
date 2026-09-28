@@ -6,7 +6,7 @@ Tests for utils/optim_registry.py.
 import optax
 import pytest
 
-from utils.optim_registry import OPTIM_REGISTRY, build_optim
+from pc_nox.registries.optim_registry import OPTIM_REGISTRY, build_optim
 
 
 # A representative subset gets exercised individually below; this list

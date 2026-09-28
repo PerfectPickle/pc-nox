@@ -17,8 +17,6 @@ Predictions = List[Array]
 
 # simple name : class mapping, e.g. "tpch" : TpchModel. Registered automatically on init
 MODEL_REGISTRY = {}
-ACT_FN_REGISTRY = {"tanh": jnp.tanh, "relu": jnn.relu, "identity": lambda x: x}
-
 
 # Named tuple for readability
 class LoadedCheckpoint(NamedTuple):

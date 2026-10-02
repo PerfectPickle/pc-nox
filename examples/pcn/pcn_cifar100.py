@@ -125,6 +125,8 @@ X_test = jnp.reshape(X_test, (-1, 3072))
 Y_train = jax.nn.one_hot(jnp.array(train_fine_labels), num_classes=100)
 Y_test = jax.nn.one_hot(jnp.array(test_fine_labels), num_classes=100)
 
+N_INFER_STEPS = 100
+
 
 # =====================================================================
 # 4. Instantiate Runner Functions
@@ -137,10 +139,10 @@ param_optim = optax.adam(learning_rate=1e-3)
 train_step = make_train_step(
     param_optim=param_optim,
     activity_optim=activity_optim,
-    n_infer_steps=20,
+    n_infer_steps=N_INFER_STEPS,
 )
 
-eval_step = make_eval_step(activity_optim=activity_optim, n_infer_steps=20)
+eval_step = make_eval_step(activity_optim=activity_optim, n_infer_steps=N_INFER_STEPS)
 
 
 def compute_accuracy(y_hat: jnp.ndarray, y_true: jnp.ndarray) -> jnp.ndarray:

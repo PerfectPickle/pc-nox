@@ -196,14 +196,22 @@ def _build_tpch_obs(ctx: BuildContext) -> NodeBase:
     ))
 
 
-@register_node("input", input_layout="flat")
+@register_node("input", input_layout="spatial")
 def _build_input(ctx: BuildContext) -> NodeBase:
     s = ctx.spec
-    _no_options(s)
     _require(not s.parents, s, "an input node has no parents")
     _require(s.clamped, s, "an input node is data, so it must be clamped=True")
-    _require(s.alpha is None and not s.bidirectional, s, "an input node has no memory and no bottom-up path")
-    return InputNode(s.shape)
+    _require(s.alpha is None, s, "an input node has no memory, so alpha must be None")
+    if not s.bidirectional:
+        _no_options(s)                                   # the plain, weightless data node
+        return InputNode(s.shape)
+    # A bidirectional input is a data root that is PREDICTED from its children (the paper's generative term on x1):
+    # a bottom-up-only conv or dense node, chosen by the declared shape.
+    _require(ctx.child_shape is not None, s, "a bidirectional input node needs at least one child to predict it from")
+    if len(s.shape) == 3:
+        return PcnConvNode.from_spec(s, None, ctx.child_shape, ctx.act_fn, key=ctx.key)
+    _require(len(s.shape) == 1, s, f"shape must be (D,) or (C, H, W), got {s.shape}")
+    return PcnNode(s.shape[0], None, ctx.child_shape[0], ctx.act_fn, ctx.act_fn, True, False, key=ctx.key)
 
 
 @register_node("pcn", input_layout="flat")
@@ -216,7 +224,7 @@ def _build_pcn(ctx: BuildContext) -> NodeBase:
 @register_node("pcn_conv", input_layout="spatial")
 def _build_pcn_conv(ctx: BuildContext) -> NodeBase:
     s = ctx.spec
-    _require(bool(s.parents), s, "a conv node needs at least one parent")
+    _require(bool(s.parents) or s.bidirectional, s, "a conv node needs at least one parent (or bidirectional=True, for a bottom-up-only data root)")
     _require(s.alpha is None, s, "conv nodes are not leaky (no eligibility traces), alpha must be None")
     return PcnConvNode.from_spec(s, ctx.parent_shape, ctx.child_shape, ctx.act_fn, key=ctx.key)
 

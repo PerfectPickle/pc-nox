@@ -1,8 +1,9 @@
 """graph/nodes/conv.py
 
 `PcnConvNode`: a static (non-recurrent) convolutional node with an
-independent top-down (generative) projection from its parents and an
-optional bottom-up (discriminative) projection from its children, after
+independent top-down projection from its parents and an optional
+bottom-up projection from its children (td/bu are graph directions, see
+`NodeBase.predict`), after
 bidirectional PC (Oliviers et al., 2026).
 
 Conventions (see `NodeBase` / `NodeInputs`):
@@ -86,8 +87,8 @@ class PcnConvNode(NodeBase):
     """Static conv node with top-down ("td") and optional bottom-up ("bu")
     projections.
 
-    td = top-down, generative, from parents
-    bu = bottom-up, discriminative, from children (only if `bidirectional`)
+    td = top-down: this node predicted from its parents
+    bu = bottom-up: this node predicted from its children (only if `bidirectional`)
 
     Fields:
         td_op: `Linear` (dense parent), or for a conv parent `ConvTranspose2d`
@@ -99,7 +100,7 @@ class PcnConvNode(NodeBase):
         bu_act_fn: static metadata (hashable, resolved at trace time).
     """
 
-    td_op: Union[eqx.nn.Linear, eqx.nn.ConvTranspose2d, eqx.nn.Conv2d]
+    td_op: Optional[Union[eqx.nn.Linear, eqx.nn.ConvTranspose2d, eqx.nn.Conv2d]]
     bu_op: Optional[Union[eqx.nn.Conv2d, eqx.nn.ConvTranspose2d, eqx.nn.Linear]]
 
     own_shape: Tuple[int, int, int] = eqx.field(static=True)
@@ -132,11 +133,13 @@ class PcnConvNode(NodeBase):
         *,
         key: PRNGKeyArray,
     ):
-        parent_shape = tuple(parent_shape)
+        parent_shape = None if parent_shape is None else tuple(parent_shape)
         own_shape = tuple(own_shape)
         if len(own_shape) != 3:
             raise ValueError(f"own_shape must be (C, H, W), got {own_shape}")
-        if len(parent_shape) not in (1, 3):
+        if parent_shape is None and not bidirectional:
+            raise ValueError("a node with no parent is predicted only from its children: it needs bidirectional=True")
+        if parent_shape is not None and len(parent_shape) not in (1, 3):
             raise ValueError(f"parent_shape must be (D,) or (C, H, W), got {parent_shape}")
         if bidirectional:
             if child_shape is None:
@@ -151,9 +154,11 @@ class PcnConvNode(NodeBase):
         self.bu_act_fn = bu_act_fn
         self.bidirectional = bidirectional
 
-        # 1. PARENT PROJECTION (top-down, generative)
-        self.is_td_dense = len(parent_shape) == 1
-        if self.is_td_dense:
+        # 1. PARENT PROJECTION (top-down)
+        self.is_td_dense = parent_shape is not None and len(parent_shape) == 1
+        if parent_shape is None:                       # a parentless data root: bottom-up path only
+            self.td_op = None
+        elif self.is_td_dense:
             self.td_op = eqx.nn.Linear(parent_shape[0], prod(own_shape), use_bias=True, key=k_td)
         else:
             if _resolve_mode(td_mode, parent_shape, own_shape, "td") == "transpose":
@@ -179,7 +184,7 @@ class PcnConvNode(NodeBase):
                 )
             _check_conv_output(self.td_op, parent_shape, own_shape, "top-down")
 
-        # 2. CHILD PROJECTION (bottom-up, discriminative)
+        # 2. CHILD PROJECTION (bottom-up)
         self.is_bu_dense = False
         self.bu_op = None
         if bidirectional:
@@ -239,10 +244,10 @@ class PcnConvNode(NodeBase):
         return cls(
             parent_shape=parent_shape,
             own_shape=spec.shape,
-            child_shape=child_shape if spec.bidirectional else None,
+            child_shape=child_shape if bool(spec.bidirectional) else None,
             td_act_fn=act_fn,
             bu_act_fn=act_fn,
-            bidirectional=spec.bidirectional,
+            bidirectional=bool(spec.bidirectional),
             key=key,
             **opts,
         )
@@ -257,7 +262,12 @@ class PcnConvNode(NodeBase):
 
     @property
     def prediction_keys(self) -> Tuple[str, ...]:
-        return ("td", "bu") if self.bidirectional else ("td",)
+        keys = () if self.td_op is None else ("td",)
+        return keys + ("bu",) if self.bidirectional else keys
+
+    @property
+    def needs_parents_curr(self) -> bool:
+        return self.td_op is not None
 
     @property
     def needs_children(self) -> bool:
@@ -283,9 +293,11 @@ class PcnConvNode(NodeBase):
         also reports its pre-activation (for energies that need it)."""
         self.check_inputs(inp)
 
-        pre_td = self._project(self.td_op, inp.parents_curr, self.is_td_dense)
-        predictions = {"td": self.td_act_fn(pre_td)}
-        pre_activations = {"td": pre_td}
+        predictions, pre_activations = {}, {}
+        if self.td_op is not None:
+            pre_td = self._project(self.td_op, inp.parents_curr, self.is_td_dense)
+            predictions["td"] = self.td_act_fn(pre_td)
+            pre_activations["td"] = pre_td
 
         if self.bidirectional:
             pre_bu = self._project(self.bu_op, inp.children_curr, self.is_bu_dense)
@@ -300,7 +312,7 @@ class PcnConvNode(NodeBase):
         views are reshapes of the live weights, so penalty gradients reach
         the real parameters. Biases are not included.
         """
-        ops = [("td_op", self.td_op)] + ([("bu_op", self.bu_op)] if self.bu_op is not None else [])
+        ops = ([("td_op", self.td_op)] if self.td_op is not None else []) + ([("bu_op", self.bu_op)] if self.bu_op is not None else [])
         return [
             WeightEntry(f"{name}.weight", "ff", jnp.reshape(op.weight, (op.weight.shape[0], -1)))
             for name, op in ops

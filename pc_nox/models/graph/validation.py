@@ -75,6 +75,9 @@ def validate_pairings(
                 "a node that only carries data should be clamped=True"
             )
 
+        if spec.release and not keys:
+            errors.append(f"{where}: is released (free when unobserved) but predicts nothing in either direction, so it cannot be initialised")
+
         # --- node outputs vs energy requirements ---------------------------
         strategy = energy_registry.get(energy_name)
         if strategy is None:
@@ -91,6 +94,11 @@ def validate_pairings(
                     f"{where}: node returns paths {sorted(unsupported)} that this energy "
                     f"cannot score (it handles {sorted(strategy.allowed_paths)})"
                 )
+        if spec.release and not strategy.valid_for_free_state:
+            errors.append(
+                f"{where}: is released (free when unobserved) but its energy {energy_name!r} is a loss against data, "
+                "not a prediction error on a free state; use a squared-error energy such as 'pc'"
+            )
         if strategy.needs_pre_activations and not node.provides_pre_activations:
             errors.append(f"{where}: energy needs pre-activations but the node does not provide them")
 

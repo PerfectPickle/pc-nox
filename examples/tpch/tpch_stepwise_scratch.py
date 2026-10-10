@@ -71,7 +71,7 @@ import numpy as np
 import time
 
 # Number of settling iterations
-NUM_INFERENCE_STEPS = 20
+NUM_INFERENCE_STEPS = 200
 
 # example_env.mp4 has 2000 frames
 N_TRAIN_ITERS = 2000

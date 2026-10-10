@@ -12,6 +12,7 @@ from matplotlib.lines import Line2D
 from matplotlib.collections import LineCollection
 import math
 from typing import Optional
+from collections.abc import Mapping
 
 
 
@@ -569,9 +570,13 @@ class VisualPredictionPlotter:
             posterior_label += f" (Step {inference_steps_made})"
         pad_width = len(str(total_frames - 1))
         frame_str = f"frame_{frame_number:0{pad_width}d}.png"
-        y_img = np.asarray(y).reshape(self.output_shape)
-        prior_img = np.asarray(prior_pred).reshape(self.output_shape)
-        post_img = np.asarray(posterior_pred).reshape(self.output_shape)
+        y_img = np.asarray(_normalise_visual_value(y, "y")).reshape(self.output_shape)
+        prior_img = np.asarray(
+            _normalise_visual_value(prior_pred, "prior_pred")
+        ).reshape(self.output_shape)
+        post_img = np.asarray(
+            _normalise_visual_value(posterior_pred, "posterior_pred")
+        ).reshape(self.output_shape)
         self.im_y.set_data(y_img)
         self.im_prior.set_data(prior_img)
         self.im_post.set_data(post_img)
@@ -644,6 +649,39 @@ matters.
 """
 
  
+def _normalise_visual_value(value, name="visual value"):
+    """
+    Normalize a visual value for the single-frame visualization path.
+
+    Supported inputs:
+      - an array/ArrayLike, as used by the original visualization API
+      - a mapping such as {"image6": array}, as returned by GraphModel
+        prediction APIs
+
+    For batched graph-runner outputs, a leading singleton batch axis is
+    removed. A single-frame recorder cannot represent B > 1, so a non-singleton
+    leading batch axis is left intact; the eventual reshape will therefore
+    expose the mismatch rather than silently selecting the wrong example.
+    """
+    if isinstance(value, Mapping):
+        if len(value) != 1:
+            raise ValueError(
+                f"{name} is a mapping with {len(value)} entries; "
+                "PredictionRecorder/VisualPredictionPlotter expects a single "
+                "visual output. Pass the array for the desired output node."
+            )
+        value = next(iter(value.values()))
+
+    value = jnp.asarray(value)
+
+    # GraphModel runner outputs carry a leading batch axis. For the single
+    # frame API, accept the common B=1 case and remove only that axis.
+    if value.ndim >= 1 and value.shape[0] == 1:
+        value = value[0]
+
+    return value
+
+
 class PredictionRecorder:
     """
     Buffers prediction blocks as JAX-array references and periodically flushes
@@ -682,13 +720,22 @@ class PredictionRecorder:
         """
         Record a single frame.
 
+        Arrays retain the original API. A single-entry mapping such as
+        {"image6": array} is also accepted. For batched graph-runner outputs,
+        a leading singleton batch axis (B=1) is removed automatically before
+        the frame axis is added for storage.
+
         This is a thin wrapper around append_block(), so the single-frame
         training loop remains compatible with the block-based recorder.
         """
         self.append_block(
-            y=jnp.expand_dims(y, axis=0),
-            prior_pred=jnp.expand_dims(prior_pred, axis=0),
-            posterior_pred=jnp.expand_dims(posterior_pred, axis=0),
+            y=jnp.expand_dims(_normalise_visual_value(y, "y"), axis=0),
+            prior_pred=jnp.expand_dims(
+                _normalise_visual_value(prior_pred, "prior_pred"), axis=0
+            ),
+            posterior_pred=jnp.expand_dims(
+                _normalise_visual_value(posterior_pred, "posterior_pred"), axis=0
+            ),
             inference_steps_made=[inference_steps_made],
             frame_numbers=[frame_number],
         )

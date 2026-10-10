@@ -47,7 +47,7 @@ class NodeInputs(NamedTuple):
             guess during inference, the parents' predictions during the
             feedforward initialisation sweep).
         children_curr: Child state(s) at the current time step. Only nodes
-            with a bottom-up (discriminative) path need this.
+            with a bottom-up (child-driven) path need this.
         control_input: External input x_t. Control-type nodes only.
     """
     own_prev: Optional[Array] = None
@@ -62,9 +62,11 @@ class NodePrediction(NamedTuple):
     pre-activations an energy strategy may need.
 
     Both fields are dicts keyed by PATH NAME. The conventional names are
-    "td" (top-down / generative, from parents; REQUIRED for every unclamped
-    node, since the feedforward initialisation sweep uses it) and "bu"
-    (bottom-up / discriminative, from children; bidirectional nodes only).
+    "td" (top-down: the node predicted from its PARENTS; REQUIRED for every
+    unclamped node, since the initialisation sweep uses it) and "bu"
+    (bottom-up: the node predicted from its CHILDREN; bidirectional nodes
+    only). These are directions in the graph, not task roles -- see
+    `NodeBase.predict`.
     A new path is just a new key.
 
     The energy strategy decides how to combine paths -- the standard "pc"
@@ -92,7 +94,7 @@ class WeightEntry(NamedTuple):
         name: Field name on the node (e.g. "W_rec"), for per-weight
             breakdowns and for locating the weight in a gradient pytree.
         tag: Scope tag the spec's regulariser scopes select on, e.g. "rec"
-            (recurrent, self-to-self) or "ff" (feedforward). Matches
+            (recurrent, self-to-self) or "ff" (everything else). Matches
             the existing `weight_decay_scope` / `orthogonal_scope` values.
         matrix: A 2-D view of the weight (a conv kernel is reshaped to
             `(out_channels, -1)`), so `penalties.py` -- which assumes 2-D
@@ -124,21 +126,32 @@ class NodeBase(eqx.Module):
     @property
     @abstractmethod
     def state_shape(self) -> Tuple[int, ...]:
-        """Shape of the state this node predicts (its own state shape), e.g. `(128,)` or
+        """Shape of the state this node predicts, e.g. `(128,)` or
         `(C, H, W)`. The builder checks it against the node's `NodeSpec`
         at construction, so shape mismatches fail early and by name.
         """
         ...
 
-    # TODO allow prediction along specified path only, e.g. for bottom up d
-    # ask Claude about the "unless the node is never unclamped-initialised"
     @abstractmethod
     def predict(self, inp: NodeInputs) -> NodePrediction:
         """Run every prediction path this node has, given `inp`.
 
-        Must return a "td" entry in `predictions` (the generative
-        prediction from parents) unless the node is never unclamped-
-        initialised. Every returned array must have shape `state_shape`.
+        Must return a "td" entry in `predictions` -- the TOP-DOWN
+        prediction, i.e. of this node's state from its PARENTS -- unless
+        the node is clamped. `GraphModel.init_activities` starts every
+        inferred (unclamped) node at its own "td" prediction, sweeping
+        parents before children, and validation rejects an unclamped node
+        that has none. Clamped nodes are data and are never initialised,
+        so they may return no "td" (`InputNode` returns nothing at all).
+
+        "td" and "bu" name graph DIRECTIONS (parent -> child, and child ->
+        parent), not task roles. In a supervised chain (image -> ... ->
+        label) "td" is the DISCRIMINATIVE direction; in a latent-on-top
+        graph (latent -> ... -> image) it is the generative one. Only a
+        top-down initialisation sweep exists; there is currently no
+        bottom-up sweep, and the "bu" path is never used to initialise.
+
+        Every returned array must have shape `state_shape`.
         Read only the `inp` fields this node declares it needs; call
         `check_inputs(inp)` first to fail with a clear message if the
         model failed to supply one.

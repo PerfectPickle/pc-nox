@@ -13,6 +13,16 @@ the data into the graph so children can name it as a parent.
 
 Must be `clamped=True` (it is data, not an inferred state) and must be
 supplied in every `observation`, since its children read it.
+
+LIMITATION (by design, for now): because it has no weights and no
+predictions, nothing can predict it from its children, and it can never be
+a free (inferred) node. A graph with an `InputNode` root therefore runs in
+ONE direction only (input -> ... -> label). Querying the reverse direction
+(label clamped, input generated from the label up) needs a root node that
+carries a bottom-up path, and a way to release a clamped node into the
+inferred states; neither exists yet. See the design notes in the project
+discussion; `pcn`-kind roots (dense) can already be clamped and carry a
+bottom-up path for TRAINING, but cannot yet be released at test time.
 """
 
 from typing import List, Tuple

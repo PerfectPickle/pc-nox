@@ -59,6 +59,7 @@ class PcnNode(NodeBase):
         td_act_fn: Callable = jnp.tanh,
         bu_act_fn: Callable = jnp.tanh,
         bidirectional: bool = False,
+        has_prior: bool = True,
         *,
         key: PRNGKeyArray,
     ):
@@ -76,9 +77,14 @@ class PcnNode(NodeBase):
         if parent_size:
             self.td_op = eqx.nn.Linear(parent_size, own_size, use_bias=True, key=k_td)
             self.prior = None
-        else:                                           # root mode: learned prior
+        elif has_prior:                                 # root mode: learned prior
             self.td_op = None
             self.prior = jnp.zeros(own_size)
+        else:                                           # parentless data root: bottom-up path only
+            if not bidirectional:
+                raise ValueError("a node with no parents and no prior predicts nothing: it needs bidirectional=True")
+            self.td_op = None
+            self.prior = None
 
         self.bu_op = eqx.nn.Linear(child_size, own_size, use_bias=True, key=k_bu) if bidirectional else None
 
@@ -97,13 +103,16 @@ class PcnNode(NodeBase):
         directions."""
         if len(spec.shape) != 1:
             raise ValueError(f"node {spec.name!r}: PcnNode shape must be 1-D, got {spec.shape}")
-        if spec.options:
-            raise ValueError(f"node {spec.name!r}: PcnNode takes no options, got {dict(spec.options)}")
+        opts = spec.opts
+        unknown = set(opts) - {"prior"}
+        if unknown:
+            raise ValueError(f"node {spec.name!r}: PcnNode takes no options other than 'prior', got {sorted(unknown)}")
+        bi = bool(spec.bidirectional)
         return cls(
             own_size=spec.shape[0],
             parent_size=parent_shape[0] if parent_shape else None,
-            child_size=child_shape[0] if (spec.bidirectional and child_shape) else None,
-            td_act_fn=act_fn, bu_act_fn=act_fn, bidirectional=spec.bidirectional, key=key,
+            child_size=child_shape[0] if (bi and child_shape) else None,
+            td_act_fn=act_fn, bu_act_fn=act_fn, bidirectional=bi, has_prior=bool(opts.get("prior", True)), key=key,
         )
 
     # ------------------------------------------------------------------ #
@@ -116,7 +125,8 @@ class PcnNode(NodeBase):
 
     @property
     def prediction_keys(self) -> Tuple[str, ...]:
-        return ("td", "bu") if self.bidirectional else ("td",)
+        keys = ("td",) if (self.td_op is not None or self.prior is not None) else ()
+        return keys + ("bu",) if self.bidirectional else keys
 
     @property
     def needs_parents_curr(self) -> bool:
@@ -140,9 +150,11 @@ class PcnNode(NodeBase):
         `inp.children_curr` if `bidirectional`."""
         self.check_inputs(inp)
 
+        predictions, pre_activations = {}, {}
         pre_td = self.td_op(inp.parents_curr) if self.td_op is not None else self.prior
-        predictions = {"td": self.td_act_fn(pre_td)}
-        pre_activations = {"td": pre_td}
+        if pre_td is not None:
+            predictions["td"] = self.td_act_fn(pre_td)
+            pre_activations["td"] = pre_td
 
         if self.bidirectional:
             pre_bu = self.bu_op(inp.children_curr)

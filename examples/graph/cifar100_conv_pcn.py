@@ -130,18 +130,20 @@ Y_test = jax.nn.one_hot(jnp.array(test_fine_labels), num_classes=100)
 # =====================================================================
 RETURN_LAYERWISE = False
 
+# CHANGED: learning rates. The conv graph is far more sensitive to these than the dense PcnModel was. Measured on
+# CIFAR-100 with this graph: param lr 1e-3 collapsed the feedforward net to chance in every run (with activity lr 0.01
+# or 0.001); param lr 1e-4 trained, and lowering the activity lr to 0.001 as well gave the best result (~16.6% test
+# after 10 epochs, still rising). Tune these first if you change the architecture.
 activity_optim = optax.adam(learning_rate=0.001)
-param_optim = optax.adam(learning_rate=0.001)
-
-N_INFER_STEPS=20
+param_optim = optax.adam(learning_rate=1e-4)
 
 train_step = make_train_step(
     param_optim=param_optim,
     activity_optim=activity_optim,
-    n_infer_steps=N_INFER_STEPS,
+    n_infer_steps=20,
 )
 
-eval_step = make_eval_step(activity_optim=activity_optim, n_infer_steps=N_INFER_STEPS)
+eval_step = make_eval_step(activity_optim=activity_optim, n_infer_steps=20)
 
 
 def compute_accuracy(y_hat: jnp.ndarray, y_true: jnp.ndarray) -> jnp.ndarray:
@@ -193,21 +195,20 @@ def run_evaluation(model, X_test, Y_test, batch_size=64):
 # =====================================================================
 batch_size = 64
 num_batches = len(X_train) // batch_size
-num_epochs = 10
+num_epochs = 20
 
 key = jax.random.PRNGKey(42)
 rng_key, model_key = jax.random.split(key)
 
 # CHANGED: a graph instead of a layer-size list -- the classic supervised PCN, in a straight line:
 #
-#   image (clamped input) -> c1 -> c2 -> c3 -> fc -> label (clamped in training, FREE at test)
+#   image (clamped input) -> c1 -> c2 -> fc -> label (clamped in training, FREE at test)
 #
-# Predictions flow down from the image, so each conv node maps a larger map to a smaller one and
-# the node picks a strided Conv2d for it ("auto" mode: a transposed conv can only upsample).
-# `fc` is dense; it receives c3 flattened. In training both ends are clamped and the hidden nodes
-# settle between them. At test time only the image is clamped: with no label error, nothing pushes
-# the hidden states away from their feedforward values, so "Bef" and "Aft" test accuracy match --
-# exactly as in the original PcnModel.
+# Predictions flow down from the image, so each conv node maps a larger map to a smaller one and the node picks a
+# strided Conv2d for it ("auto" mode: a transposed conv can only upsample). `fc` is dense; it receives c2 flattened.
+# In training both ends are clamped and the hidden nodes settle between them. At test time only the image is clamped:
+# with no label error, nothing pushes the hidden states away from their feedforward values, so "Bef" and "Aft" test
+# accuracy match -- exactly as in the original PcnModel.
 config = GraphModelConfig(
     node_specs=(
         NodeSpec("image", "input", (3, 32, 32), clamped=True),
@@ -289,3 +290,5 @@ save_eval_samples(
     num_samples=15,
     filename="eval_samples_cifar100.png",
 )
+
+model.save_checkpoint(opt_state=opt_state)

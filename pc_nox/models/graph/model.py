@@ -20,6 +20,10 @@ Responsibilities (the split we designed):
 State layout (the same calling convention the shared runners use):
 
   states_prev / states_curr : {name: Array} for every UNCLAMPED node
+  (A clamped node with `release=True` that is omitted from `observation`
+   becomes an INFERRED state: it appears in `states`, is initialised by the
+   sweep, and its energy is scored. Without `release` an omitted clamped
+   node is dropped, as below.)
   observation (the runners' `y`) : {name: Array} for CLAMPED nodes. A clamped
                               node may be OMITTED (a missing modality): its
                               energy term is dropped but its prediction is
@@ -172,12 +176,18 @@ class GraphModel(eqx.Module, ModelBase):
         states_prev: States,
         curr: Mapping[str, Array],
         control_input: Optional[Array],
-        zero_missing_children: bool = False,
+        zero_fill: Optional[str] = None,
     ) -> NodeInputs:
         """Build the `NodeInputs` a node declared it needs. `curr` holds the
         current values of every node known so far (inferred states plus
         clamped observations). Multi-parent / multi-child inputs are
-        combined per the node kind's layout (see `builders.combine`)."""
+        combined per the node kind's layout (see `builders.combine`).
+
+        `zero_fill` ("children" | "parents" | None): during an initialisation
+        sweep, the neighbours on the side the sweep has not reached yet are
+        replaced by zeros of the right shape. Their paths' results are
+        discarded (only the sweep direction's prediction is used), so the
+        stand-in is harmless; any OTHER missing neighbour is still an error."""
         layout = get_builder(spec.kind).input_layout
         fields = {}
         if node.needs_own_prev:
@@ -187,15 +197,14 @@ class GraphModel(eqx.Module, ModelBase):
                 [_get(states_prev, p, "the previous state", spec.name) for p in spec.parents], layout)
         if node.needs_parents_curr:
             fields["parents_curr"] = combine(
-                [_get(curr, p, "the current state (or observation)", spec.name) for p in spec.parents], layout)
+                [curr[p] if p in curr else (jnp.zeros(self.config.spec(p).shape) if zero_fill == "parents" else
+                 _get(curr, p, "the current state (or observation)", spec.name)) for p in spec.parents], layout)
         if node.needs_children:
             kids = []
             for c in _children_of(self.config)[spec.name]:
                 if c in curr:
                     kids.append(curr[c])
-                elif zero_missing_children:
-                    # feedforward init: the bottom-up path cannot be computed yet and its result is
-                    # discarded (only "td" is used), so a zero stand-in of the right shape suffices
+                elif zero_fill == "children":
                     kids.append(jnp.zeros(self.config.spec(c).shape))
                 else:
                     raise KeyError(f"node {spec.name!r} needs the current state of child {c!r}, which was not provided")
@@ -233,25 +242,52 @@ class GraphModel(eqx.Module, ModelBase):
                  if "td" in predictions[s.name].predictions}        # pure-data nodes (InputNode) predict nothing
         return predictions, y_hat
 
+    def inferred_specs(self, observation: Optional[Mapping[str, Array]] = None) -> Tuple[NodeSpec, ...]:
+        """The nodes whose state is inferred in a call with this `observation`,
+        in canonical order: every unclamped node, plus every clamped node that
+        is `release`d and omitted from `observation`."""
+        obs = observation or {}
+        return tuple(s for s in self.config.node_specs if (not s.clamped) or (s.release and s.name not in obs))
+
     def init_activities(
         self,
         states_prev: States,
         control_input: Optional[Array] = None,
         observation: Optional[Mapping[str, Array]] = None,
+        direction: Optional[str] = None,
     ) -> States:
-        """Feedforward "kick-start": each inferred node's initial current
-        state is its own "td" prediction, swept in level order so every
-        node sees its parents' predictions (clamped parents use their data).
+        """Amortised initialisation sweep: each inferred node starts at its own
+        prediction in the sweep direction, so settling begins from a good guess.
+
+        direction="td" (default `config.init_direction`): parents before
+            children, each node at its "td" prediction. With the image as the
+            root this is the paper's bottom-up discriminative sweep.
+        direction="bu": children before parents, each node at its "bu"
+            prediction -- the generative sweep from a clamped label up to a
+            released image. Every inferred node on the path must be
+            bidirectional, and its children must be observed or already swept.
+
+        A node with no prediction in the sweep direction (e.g. a released
+        data root in a "td" sweep) starts at zero, as the paper initialises
+        missing pixels. Clamped observations are used as given.
         """
+        direction = direction or self.config.init_direction
+        if direction not in ("td", "bu"):
+            raise ValueError(f"direction must be 'td' or 'bu', got {direction!r}")
         _check_observation(self.config, observation)
         known: Dict[str, Array] = dict(observation or {})
         states_curr: States = {}
-        for spec in self.config.unclamped:
+        inferred = self.inferred_specs(observation)
+        for spec in (inferred if direction == "td" else tuple(reversed(inferred))):
             node = self.nodes[spec.name]
-            inp = self._inputs(spec, node, states_prev, known, control_input, zero_missing_children=True)
-            pred = node.predict(inp).predictions["td"]
-            states_curr[spec.name] = pred
-            known[spec.name] = pred
+            if direction not in node.prediction_keys:
+                value = jnp.zeros(spec.shape)
+            else:
+                inp = self._inputs(spec, node, states_prev, known, control_input,
+                                   zero_fill="children" if direction == "td" else "parents")
+                value = node.predict(inp).predictions[direction]
+            states_curr[spec.name] = value
+            known[spec.name] = value
         return states_curr
 
     # ------------------------------------------------------------------ #
@@ -276,7 +312,8 @@ class GraphModel(eqx.Module, ModelBase):
                 energies.append(jnp.asarray(0.0))
                 continue
             strategy = ENERGY_REGISTRY[self.config.get(spec, "energy")]
-            energies.append(spec.precision * strategy.fn(curr[spec.name], predictions[spec.name], None))
+            weights = {"td": self.config.get(spec, "td_precision"), "bu": self.config.get(spec, "bu_precision")}
+            energies.append(spec.precision * strategy.fn(curr[spec.name], predictions[spec.name], None, weights))
         return energies
 
     def _weight_reg_by_node(self) -> Array:
@@ -293,11 +330,11 @@ class GraphModel(eqx.Module, ModelBase):
         return jnp.stack(terms)
 
     def _activity_reg_by_node(self, states_curr: States) -> Array:
-        """Activity penalty per node (canonical order); clamped nodes get 0."""
+        """Activity penalty per node (canonical order); nodes that are not inferred states get 0."""
         cfg = self.config
         terms = []
         for spec in cfg.node_specs:
-            if spec.clamped:
+            if spec.name not in states_curr:                  # clamped (or dropped): not an inferred state
                 terms.append(jnp.asarray(0.0))
             else:
                 terms.append(penalties.activity_reg(
@@ -374,11 +411,12 @@ class GraphModel(eqx.Module, ModelBase):
         control_input: Optional[Array] = None,
         n_steps: int = 20,
         return_layerwise: bool = False,
+        init_direction: Optional[str] = None,
     ):
         """Feedforward init, then `n_steps` of optax-driven relaxation as one
         `jax.lax.scan`. With `return_layerwise`, also returns the
         `(n_steps, n_nodes)` layerwise energy trace."""
-        states_curr0 = self.init_activities(states_prev, control_input, observation)
+        states_curr0 = self.init_activities(states_prev, control_input, observation, init_direction)
         opt_state0 = activity_optim.init(states_curr0)
         step = self.make_activity_step(activity_optim, states_prev, observation, control_input)
         (states_curr, _), states_hist = jax.lax.scan(step, (states_curr0, opt_state0), xs=None, length=n_steps)
@@ -427,13 +465,14 @@ class GraphModel(eqx.Module, ModelBase):
         steady_state_rtol: Optional[float] = None,
         steady_state_atol: Optional[float] = None,
         return_layerwise: bool = False,
+        init_direction: Optional[str] = None,
     ) -> Union[States, Tuple[States, Array, Array]]:
         """Adapter over `ode_settling.settle_diffrax` (see its docstring for
         modes and returns)."""
         energy, layerwise = self._energy_closures(states_prev, observation, control_input)
         return ode_settling.settle_diffrax(
             self.make_vector_field(states_prev, observation, control_input),
-            self.init_activities(states_prev, control_input, observation),
+            self.init_activities(states_prev, control_input, observation, init_direction),
             energy_fn=energy, layerwise_energy_fn=layerwise,
             max_t1=max_t1, dt0=dt0, n_save=n_save, solver=solver, stepsize_controller=stepsize_controller,
             steady_state_tol=steady_state_tol, steady_state_criterion=steady_state_criterion,

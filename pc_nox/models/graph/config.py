@@ -85,6 +85,16 @@ class NodeSpec:
             ...) as a hashable tuple of `(key, value)` pairs. A dict is
             accepted and canonicalised (sorted). Values must be
             JSON-compatible scalars or tuples of them.
+        bidirectional: Whether the node also has a bottom-up path from its
+            children. None = inherit `GraphModelConfig.bidirectional`, which
+            the config resolves to an explicit bool (see there).
+        td_precision, bu_precision: Per-node override of the weight on this
+            node's top-down / bottom-up prediction-error terms (None =
+            inherit the model-wide value). The paper's alpha_disc/alpha_gen.
+        release: A CLAMPED node that is omitted from `observation` becomes an
+            inferred state (initialised by the sweep, updated by settling)
+            instead of being dropped. This is how a label is free at test
+            time, or an image is generated from a label.
     """
     name: str
     kind: str
@@ -92,7 +102,7 @@ class NodeSpec:
     parents: Tuple[str, ...] = ()
     level: Optional[int] = None
     clamped: bool = False
-    bidirectional: bool = False
+    bidirectional: Optional[bool] = None
     alpha: Optional[float] = None
     precision: float = 1.0
     energy: Optional[str] = None
@@ -101,6 +111,9 @@ class NodeSpec:
     orthogonal_penalty: Optional[float] = None
     activity_decay: Optional[float] = None
     options: Tuple[Tuple[str, Any], ...] = ()
+    td_precision: Optional[float] = None
+    bu_precision: Optional[float] = None
+    release: bool = False
 
     def __post_init__(self):
         # --- coerce JSON-round-tripped / convenient forms to canonical ones
@@ -137,6 +150,12 @@ class NodeSpec:
             v = getattr(self, f)
             if v is not None and v < 0:
                 errs.append(f"{f} must be >= 0, got {v}")
+        for f in ("td_precision", "bu_precision"):
+            v = getattr(self, f)
+            if v is not None and v < 0:
+                errs.append(f"{f} must be >= 0, got {v}")
+        if self.release and not self.clamped:
+            errs.append("release only applies to a clamped node (an unclamped node is always inferred)")
         for k, v in self.options:
             if not _is_json_value(v):
                 errs.append(f"option {k!r}={v!r} is not a JSON-compatible scalar/tuple")
@@ -205,6 +224,19 @@ class GraphModelConfig:
             Model-wide settings with the same meaning as in `TpchConfig`.
             (Per-node scopes can be added later the same way as the
             coefficient overrides.)
+        bidirectional: Model-wide default for `NodeSpec.bidirectional`: when
+            True, every node that has children gets a bottom-up path unless it
+            sets `bidirectional=False` itself. (A node kind that cannot be
+            bidirectional then fails to build, naming the node.)
+        td_precision, bu_precision: Model-wide weights on the top-down /
+            bottom-up prediction-error terms (the paper's alpha_disc /
+            alpha_gen, in whichever direction your graph makes them). Per-node
+            overrides on `NodeSpec`. The paper finds the generative weight must
+            be much smaller than the discriminative one (1e-3 .. 1e-8).
+        init_direction: Default direction of the initialisation sweep: "td"
+            (parents before children; the paper's bottom-up amortised sweep when
+            the image is the root) or "bu" (children before parents; the
+            generative sweep from a clamped label). Overridable per call.
     """
     node_specs: Tuple[NodeSpec, ...]
     input_size: int = 0
@@ -217,6 +249,10 @@ class GraphModelConfig:
     activity_decay: float = 0.0
     activity_reg_type: str = "l1"
     trace_mode: str = "readout"
+    bidirectional: bool = False
+    td_precision: float = 1.0
+    bu_precision: float = 1.0
+    init_direction: str = "td"
 
     def __post_init__(self):
         specs = tuple(s if isinstance(s, NodeSpec) else NodeSpec(**s) for s in self.node_specs)
@@ -230,10 +266,11 @@ class GraphModelConfig:
             ("orthogonal_scope", _SCOPES),
             ("activity_reg_type", _ACTIVITY_REG_TYPES),
             ("trace_mode", _TRACE_MODES),
+            ("init_direction", ("td", "bu")),
         ):
             if getattr(self, field) not in allowed:
                 errs.append(f"{field}={getattr(self, field)!r} not in {allowed}")
-        for field in ("weight_decay", "orthogonal_penalty", "activity_decay"):
+        for field in ("weight_decay", "orthogonal_penalty", "activity_decay", "td_precision", "bu_precision"):
             if getattr(self, field) < 0:
                 errs.append(f"{field} must be >= 0, got {getattr(self, field)}")
 
@@ -260,6 +297,16 @@ class GraphModelConfig:
 
         order = sorted(range(len(specs)), key=lambda i: (levels[specs[i].name], i))
         canonical = tuple(replace(specs[i], level=levels[specs[i].name]) for i in order)
+        # Resolve the model-wide `bidirectional` default structurally: a node inherits it iff it HAS children, so
+        # data roots get a bottom-up-only path and leaves stay top-down-only (the paper's x1 / xL asymmetry).
+        n_children = {s.name: 0 for s in canonical}
+        for s in canonical:
+            for p in s.parents:
+                n_children[p] += 1
+        canonical = tuple(
+            replace(s, bidirectional=bool(self.bidirectional and n_children[s.name] > 0)) if s.bidirectional is None else s
+            for s in canonical
+        )
         object.__setattr__(self, "node_specs", canonical)
 
         try:  # fail now, with a clear message, rather than inside jit

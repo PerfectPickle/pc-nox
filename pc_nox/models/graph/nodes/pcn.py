@@ -35,16 +35,16 @@ class PcnNode(NodeBase):
     """Static dense node with an optional bottom-up path.
 
     Fields:
-        td_op: `Linear(parent_size -> own_size)` with bias; None in root mode.
+        op_td: `Linear(parent_size -> own_size)` with bias; None in root mode.
         prior: trainable prior pre-activation `(own_size,)`; None unless root.
-        bu_op: `Linear(child_size -> own_size)` with bias; None unless
+        op_bu: `Linear(child_size -> own_size)` with bias; None unless
             `bidirectional`.
         own_size, bidirectional, td_act_fn, bu_act_fn: static metadata.
     """
 
-    td_op: Optional[eqx.nn.Linear]
+    op_td: Optional[eqx.nn.Linear]
     prior: Optional[Array]
-    bu_op: Optional[eqx.nn.Linear]
+    op_bu: Optional[eqx.nn.Linear]
 
     own_size: int = eqx.field(static=True)
     bidirectional: bool = eqx.field(static=True)
@@ -75,18 +75,18 @@ class PcnNode(NodeBase):
         self.bu_act_fn = bu_act_fn
 
         if parent_size:
-            self.td_op = eqx.nn.Linear(parent_size, own_size, use_bias=True, key=k_td)
+            self.op_td = eqx.nn.Linear(parent_size, own_size, use_bias=True, key=k_td)
             self.prior = None
         elif has_prior:                                 # root mode: learned prior
-            self.td_op = None
+            self.op_td = None
             self.prior = jnp.zeros(own_size)
         else:                                           # parentless data root: bottom-up path only
             if not bidirectional:
                 raise ValueError("a node with no parents and no prior predicts nothing: it needs bidirectional=True")
-            self.td_op = None
+            self.op_td = None
             self.prior = None
 
-        self.bu_op = eqx.nn.Linear(child_size, own_size, use_bias=True, key=k_bu) if bidirectional else None
+        self.op_bu = eqx.nn.Linear(child_size, own_size, use_bias=True, key=k_bu) if bidirectional else None
 
     @classmethod
     def from_spec(
@@ -125,12 +125,12 @@ class PcnNode(NodeBase):
 
     @property
     def prediction_keys(self) -> Tuple[str, ...]:
-        keys = ("td",) if (self.td_op is not None or self.prior is not None) else ()
+        keys = ("td",) if (self.op_td is not None or self.prior is not None) else ()
         return keys + ("bu",) if self.bidirectional else keys
 
     @property
     def needs_parents_curr(self) -> bool:
-        return self.td_op is not None                   # root mode needs no parents
+        return self.op_td is not None                   # root mode needs no parents
 
     @property
     def needs_children(self) -> bool:
@@ -151,13 +151,13 @@ class PcnNode(NodeBase):
         self.check_inputs(inp)
 
         predictions, pre_activations = {}, {}
-        pre_td = self.td_op(inp.parents_curr) if self.td_op is not None else self.prior
+        pre_td = self.op_td(inp.parents_curr) if self.op_td is not None else self.prior
         if pre_td is not None:
             predictions["td"] = self.td_act_fn(pre_td)
             pre_activations["td"] = pre_td
 
         if self.bidirectional:
-            pre_bu = self.bu_op(inp.children_curr)
+            pre_bu = self.op_bu(inp.children_curr)
             predictions["bu"] = self.bu_act_fn(pre_bu)
             pre_activations["bu"] = pre_bu
 
@@ -167,8 +167,8 @@ class PcnNode(NodeBase):
         """Weight matrices tagged "ff" (nothing is recurrent). Biases and
         the root prior are not included."""
         entries = []
-        if self.td_op is not None:
-            entries.append(WeightEntry("td_op.weight", "ff", self.td_op.weight))
-        if self.bu_op is not None:
-            entries.append(WeightEntry("bu_op.weight", "ff", self.bu_op.weight))
+        if self.op_td is not None:
+            entries.append(WeightEntry("op_td.weight", "ff", self.op_td.weight))
+        if self.op_bu is not None:
+            entries.append(WeightEntry("op_bu.weight", "ff", self.op_bu.weight))
         return entries

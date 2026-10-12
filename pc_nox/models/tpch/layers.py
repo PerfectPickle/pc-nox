@@ -22,18 +22,18 @@ class TpchControlLayer(eqx.Module):
     This is the only layer driven by the raw external input x_t. It has two
     sets of weights:
 
-        W_rec  ("A" in the paper): applied to its own previous state s_{t-1}
+        op_rec  ("A" in the paper): applied to its own previous state s_{t-1}
         W_in   ("B" in the paper): applied to the current control input x_t
 
     Prediction (eq. 19's first term, generalised):
-        s_hat_t = f(W_rec @ s_{t-1} + W_in @ x_t)
+        s_hat_t = f(op_rec @ s_{t-1} + W_in @ x_t)
 
     Optional leaky integration (tPC-E, eq. 29 of the tPC-E paper, linear
     case -- generalised here to the nonlinear/post-activation prediction,
     not verified against that paper's nonlinear appendix): when `alpha` is
     set, the returned prediction is instead
 
-        s_hat_t = (1 - alpha) * s_{t-1} + alpha * f(W_rec @ s_{t-1} + W_in @ x_t)
+        s_hat_t = (1 - alpha) * s_{t-1} + alpha * f(op_rec @ s_{t-1} + W_in @ x_t)
 
     i.e. a leaky blend of the layer's own previous state with its usual
     instantaneous prediction, giving the state persistent memory across
@@ -46,7 +46,7 @@ class TpchControlLayer(eqx.Module):
     let that lingering memory reach the weight update too.
     """
 
-    W_rec: eqx.nn.Linear  # recurrent weight (from self at t-1)
+    op_rec: eqx.nn.Linear  # recurrent weight (from self at t-1)
     W_in: eqx.nn.Linear = None  # optional control input
 
     # static=True excludes this variable from the pytree, i.e. it's python metadata, not a leaf, and will be ignored during JAX autodifferentiation
@@ -65,7 +65,7 @@ class TpchControlLayer(eqx.Module):
     ):
         key_rec, key_in = jr.split(key)
         # use_bias=False to match the paper exactly (eq. 19 has no bias terms)
-        self.W_rec = eqx.nn.Linear(state_size, state_size, use_bias=False, key=key_rec)
+        self.op_rec = eqx.nn.Linear(state_size, state_size, use_bias=False, key=key_rec)
         self.act_fn = act_fn
         self.alpha = alpha
         self.has_input = (input_size > 0)
@@ -78,7 +78,7 @@ class TpchControlLayer(eqx.Module):
         `..eligibility.elementwise_deriv`) for the traced weight-update
         rule; see `TpchModel.param_grad_traced`.
         """
-        pre_acts = self.W_rec(state_prev)
+        pre_acts = self.op_rec(state_prev)
         if self.has_input and control_input is not None:
             pre_acts = pre_acts + self.W_in(control_input)
         return pre_acts
@@ -97,14 +97,14 @@ class TpchHiddenLayer(eqx.Module):
     these can be stacked between the control layer and the observation
     layer.
 
-        W_rec ("P"): applied to its own previous state, z_{t-1}
-        W_parent_prev ("Q"): applied to its parent's previous state, s_{t-1}
-        W_parent_curr ("R"): applied to its parent's CURRENT state, s_t
+        op_rec ("P"): applied to its own previous state, z_{t-1}
+        op_parents_prev ("Q"): applied to its parent's previous state, s_{t-1}
+        op_parents_curr ("R"): applied to its parent's CURRENT state, s_t
 
     Prediction (eq. 19's second term, generalised):
-        z_hat_t = f(W_rec @ z_{t-1} + W_parent_prev @ s_{t-1} + W_parent_curr @ s_t)
+        z_hat_t = f(op_rec @ z_{t-1} + op_parents_prev @ s_{t-1} + op_parents_curr @ s_t)
 
-    The W_parent_curr / "R" pathway is what lets information flow down the
+    The op_parents_curr / "R" pathway is what lets information flow down the
     hierarchy within a single time step, instead of only across time steps.
 
     Optional leaky integration (tPC-E, see `TpchControlLayer.alpha` for the
@@ -112,17 +112,17 @@ class TpchHiddenLayer(eqx.Module):
     set,
         z_hat_t = (1-alpha)*z_{t-1} + alpha*f(P@z_{t-1} + Q@s_{t-1} + R@s_t)
     All THREE weights get an eligibility trace under this layer's own
-    alpha when leaky (see `..eligibility`), including W_parent_curr --
+    alpha when leaky (see `..eligibility`), including op_parents_curr --
     even though R multiplies a same-timestep value, R's contribution still
     persists forward through this layer's own leaky memory of z_t, exactly
-    the way W_rec's does; only the observation layer (no memory at all) is
+    the way op_rec's does; only the observation layer (no memory at all) is
     exempt from tracing. `alpha=None` (default) is the original tPC-H
     prediction, unchanged.
     """
 
-    W_rec: eqx.nn.Linear
-    W_parent_prev: eqx.nn.Linear
-    W_parent_curr: eqx.nn.Linear
+    op_rec: eqx.nn.Linear
+    op_parents_prev: eqx.nn.Linear
+    op_parents_curr: eqx.nn.Linear
     act_fn: Callable = eqx.field(static=True)
     alpha: Optional[float] = eqx.field(static=True, default=None)  # tPC-E leak rate; None = disabled
 
@@ -136,9 +136,9 @@ class TpchHiddenLayer(eqx.Module):
         key: PRNGKeyArray,
     ):
         key_rec, key_parent_prev, key_parent_curr = jr.split(key, 3)
-        self.W_rec = eqx.nn.Linear(state_size, state_size, use_bias=False, key=key_rec)
-        self.W_parent_prev = eqx.nn.Linear(parent_size, state_size, use_bias=False, key=key_parent_prev)
-        self.W_parent_curr = eqx.nn.Linear(parent_size, state_size, use_bias=False, key=key_parent_curr)
+        self.op_rec = eqx.nn.Linear(state_size, state_size, use_bias=False, key=key_rec)
+        self.op_parents_prev = eqx.nn.Linear(parent_size, state_size, use_bias=False, key=key_parent_prev)
+        self.op_parents_curr = eqx.nn.Linear(parent_size, state_size, use_bias=False, key=key_parent_curr)
         self.act_fn = act_fn
         self.alpha = alpha
 
@@ -146,9 +146,9 @@ class TpchHiddenLayer(eqx.Module):
         """P @ z_{t-1} + Q @ s_{t-1} + R @ s_t -- see
         `TpchControlLayer.pre_activation` for why this is exposed."""
         return (
-            self.W_rec(state_prev)
-            + self.W_parent_prev(parent_prev)
-            + self.W_parent_curr(parent_curr)
+            self.op_rec(state_prev)
+            + self.op_parents_prev(parent_prev)
+            + self.op_parents_curr(parent_curr)
         )
 
     def predict(self, state_prev: Array, parent_prev: Array, parent_curr: Array) -> Array:
@@ -168,7 +168,7 @@ class TpchObservationLayer(eqx.Module):
     of whatever the lowest hidden layer's CURRENT state is. One set of
     weights:
 
-        W_parent ("C"): applied to the parent layer's current state, z_t
+        op_parents_curr ("C"): applied to the parent layer's current state, z_t
 
     Prediction (eq. 19's third term):
         y_hat_t = C @ z_t
@@ -180,16 +180,16 @@ class TpchObservationLayer(eqx.Module):
     variant with per-node-group losses/weights.
     """
 
-    W_parent: eqx.nn.Linear
+    op_parents_curr: eqx.nn.Linear
     loss: str = eqx.field(static=True, default="mse")  # 'mse' | 'ce'
 
     def __init__(self, obs_size: int, parent_size: int, loss: str = "mse", *, key: PRNGKeyArray):
-        self.W_parent = eqx.nn.Linear(parent_size, obs_size, use_bias=False, key=key)
+        self.op_parents_curr = eqx.nn.Linear(parent_size, obs_size, use_bias=False, key=key)
         self.loss = loss
 
     def predict(self, parent_curr: Array) -> Array:
         """y_hat_t = C @ z_t  (no activation function -- pure linear readout)"""
-        return self.W_parent(parent_curr)
+        return self.op_parents_curr(parent_curr)
 
     def energy(self, y_hat: Array, observation: Array) -> Array:
         """Observation-term energy: 0.5 * ||y - y_hat||^2 for `loss='mse'`,
@@ -210,7 +210,7 @@ class TpchObservationLayer(eqx.Module):
         enumeration doesn't need to know whether the model's observation
         layer is homogeneous or not.
         """
-        return [self.W_parent.weight]
+        return [self.op_parents_curr.weight]
 
 
 class TpchHeterogeneousObservationLayer(eqx.Module):

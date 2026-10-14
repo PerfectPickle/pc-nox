@@ -198,9 +198,9 @@ model_key, data_key = jr.split(key)
 
 config = GraphModelConfig(
     node_specs=(
-        NodeSpec("ctrl0", "tpch_control", (192,), act_fn="tanh"),
-        NodeSpec("h1", "tpch_hidden", (384,), act_fn="tanh", parents=("ctrl0",)),
-        NodeSpec("h2", "tpch_hidden", (768,), act_fn="tanh", parents=("h1",)),
+        NodeSpec("ctrl0", "tpch_control", (192,), act_fn="tanh", bidirectional=True),
+        NodeSpec("h1", "tpch_hidden", (384,), act_fn="tanh", parents=("ctrl0",), bidirectional=True),
+        NodeSpec("h2", "tpch_hidden", (768,), act_fn="tanh", parents=("h1",), bidirectional=True),
         NodeSpec("o3", "tpch_obs", (768,), act_fn="identity", parents=("h2",), clamped=True),
         # NodeSpec("c4", "pcn_conv", (8, 2, 4), act_fn="tanh", parents=("o3",)),
         # NodeSpec("c5", "pcn_conv", (4, 4, 8), act_fn="tanh", parents=("c4",), options={"td_output_padding": 1}),

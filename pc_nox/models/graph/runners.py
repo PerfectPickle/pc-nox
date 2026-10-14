@@ -78,8 +78,8 @@ def _leading_size(tree: PyTree, axis: int) -> int:
 def _frame(model, activity_optim, n_infer_steps, return_layerwise, with_grads, init_direction=None):
     """The per-example computation: init -> settle -> predictions/energies
     (before and after) -> optionally the weight gradient."""
-    def per_example(states_prev, observation, control_input):
-        states_curr_init = model.init_activities(states_prev, control_input, observation, init_direction)
+    def per_example(states_prev, observation, control_input): # TODO, consider moving y_hat_before earlier? or separate y_hat_before init dir option
+        states_curr_init = model.init_activities(states_prev, control_input, observation, "td")
         _, y_hat_before = model.predict(states_prev, states_curr_init, control_input, observation)
         energy_before = model.energy_fn(states_prev, states_curr_init, observation, control_input)
 

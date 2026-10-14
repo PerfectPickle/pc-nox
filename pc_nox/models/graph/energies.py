@@ -49,7 +49,7 @@ def pc_energy(state: Array, prediction: NodePrediction, frozen=None, path_weight
     (default 1; the model passes the resolved td/bu precisions) (one term for a plain node, two for a
     bidirectional one, and zero for a pure-data node such as `InputNode`).
     """
-    w = path_weights or {}
+    w = path_weights or {} # i.e. 'precision' weighting on td, bu etc
     return sum((w.get(k, 1.0) * 0.5 * jnp.sum((state - p) ** 2) for k, p in prediction.predictions.items()), jnp.asarray(0.0))
 
 

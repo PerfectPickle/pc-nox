@@ -1,12 +1,14 @@
 """graph/model.py
 
-`GraphModel`: a temporal predictive-coding network whose structure is a
-graph of named nodes (see `config.py`) instead of a fixed
-control -> hidden -> observation chain. Branches ("tails"), multi-parent
+`GraphModel`: a mixed predictive-coding network whose structure is a
+graph of named nodes (see `config.py`) instead of a fixed chain, e.g.
+control -> hidden -> observation. Branches ("tails"), multi-parent
 nodes and mixed dense/conv nodes all fall out of the config; there is no
 tail-specific code. Two tails never interact because no node lists a node
 from another tail as a parent, and a shared parent simply receives the
-SUM of its children's error gradients from `jax.grad`.
+SUM of its children's error gradients from `jax.grad`. 
+Both temporal and static nodes are supported and can coexist in the same graph.
+Bidirectionality is supported.
 
 Responsibilities (the split we designed):
 
@@ -260,11 +262,9 @@ class GraphModel(eqx.Module, ModelBase):
         prediction in the sweep direction, so settling begins from a good guess.
 
         direction="td" (default `config.init_direction`): parents before
-            children, each node at its "td" prediction. With the image as the
-            root this is the paper's bottom-up discriminative sweep.
+            children, each node at its "td" prediction.
         direction="bu": children before parents, each node at its "bu"
-            prediction -- the generative sweep from a clamped label up to a
-            released image. Every inferred node on the path must be
+            prediction. Every inferred node on the path must be
             bidirectional, and its children must be observed or already swept.
 
         A node with no prediction in the sweep direction (e.g. a released
@@ -312,6 +312,7 @@ class GraphModel(eqx.Module, ModelBase):
                 energies.append(jnp.asarray(0.0))
                 continue
             strategy = ENERGY_REGISTRY[self.config.get(spec, "energy")]
+            # pathway weighting, td vs bu
             weights = {"td": self.config.get(spec, "td_precision"), "bu": self.config.get(spec, "bu_precision")}
             energies.append(spec.precision * strategy.fn(curr[spec.name], predictions[spec.name], None, weights))
         return energies

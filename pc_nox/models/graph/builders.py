@@ -48,7 +48,7 @@ from .nodes.input import InputNode
 from .nodes.pcn import PcnNode
 # nodes/tpch.py is the ONLY file that imports the tPC-H layers from the tpch package
 from .nodes.tpch import (
-    TpchControlLayer, TpchControlNode, TpchHiddenLayer, TpchHiddenNode, TpchObservationLayer, TpchObservationNode,
+    TpchControlNode, TpchHiddenNode, TpchObservationNode,
 )
 
 LAYOUTS = ("flat", "spatial")
@@ -167,9 +167,9 @@ def _build_tpch_control(ctx: BuildContext) -> NodeBase:
     _no_options(s)
     _require(not s.parents, s, "a control node has no parents")
     _require(len(s.shape) == 1, s, f"shape must be 1-D, got {s.shape}")
-    return TpchControlNode(TpchControlLayer(
-        state_size=s.shape[0], input_size=ctx.input_size, act_fn=ctx.act_fn, alpha=s.alpha, key=ctx.key,
-    ))
+    return TpchControlNode( # TODO, does BUILDER support differing act_fns  for td vs bu pathway??
+        own_size=s.shape[0], child_size=ctx.child_shape, bidirectional=s.bidirectional, input_size=ctx.input_size, td_act_fn=ctx.act_fn, bu_act_fn=ctx.act_fn, alpha=s.alpha, key=ctx.key,
+    )
 
 
 @register_node("tpch_hidden", input_layout="flat")
@@ -178,9 +178,9 @@ def _build_tpch_hidden(ctx: BuildContext) -> NodeBase:
     _no_options(s)
     _require(bool(s.parents), s, "a hidden node needs at least one parent")
     _require(len(s.shape) == 1, s, f"shape must be 1-D, got {s.shape}")
-    return TpchHiddenNode(TpchHiddenLayer(
-        state_size=s.shape[0], parent_size=ctx.parent_shape[0], act_fn=ctx.act_fn, alpha=s.alpha, key=ctx.key,
-    ))
+    return TpchHiddenNode(
+        own_size=s.shape[0], child_size=ctx.child_shape, bidirectional=s.bidirectional, parent_size=ctx.parent_shape[0], td_act_fn=ctx.act_fn, bu_act_fn=ctx.act_fn, alpha=s.alpha, key=ctx.key,
+    )
 
 
 @register_node("tpch_obs", input_layout="flat")
@@ -191,9 +191,9 @@ def _build_tpch_obs(ctx: BuildContext) -> NodeBase:
     _require(len(s.shape) == 1, s, f"shape must be 1-D, got {s.shape}")
     _require(s.alpha is None, s, "an observation node has no memory, so alpha must be None")
     # loss is chosen by the spec's `energy` ("pc" = squared error, "ce" = cross-entropy), not here
-    return TpchObservationNode(TpchObservationLayer(
+    return TpchObservationNode(
         obs_size=s.shape[0], parent_size=ctx.parent_shape[0], key=ctx.key,
-    ))
+    )
 
 
 @register_node("input", input_layout="spatial")

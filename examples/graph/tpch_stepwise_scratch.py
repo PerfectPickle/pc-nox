@@ -160,27 +160,27 @@ metadata = {
     "ENV_HEIGHT": ENV_HEIGHT
 }
 
-# frames = np.stack(raw_frames)
-# if frames.ndim == 4 and frames.shape[-1] in (3, 4):  # Convert RGB(A) to grayscale
-#     frames = np.mean(frames[..., :3], axis=-1)
-# # Normalize pixel values if they are in range 0-255
-# frames = jnp.array(frames, dtype=jnp.float32) / 255.0
-# # Flatten spatial dimensions into vectors for network observation layer: 
-# # (num_frames, H, W, C) -> (num_frames, H * W * C)
-# #frames = frames.reshape(frames.shape[0], -1)
+frames = np.stack(raw_frames)
+if frames.ndim == 4 and frames.shape[-1] in (3, 4):  # Convert RGB(A) to grayscale
+    frames = np.mean(frames[..., :3], axis=-1)
+# Normalize pixel values if they are in range 0-255
+frames = jnp.array(frames, dtype=jnp.float32) / 255.0
+# Flatten spatial dimensions into vectors for network observation layer: 
+# (num_frames, H, W, C) -> (num_frames, H * W * C)
+frames = frames.reshape(frames.shape[0], -1)
 
-# Stack raw frames as RGB uint8 (N, H, W, 3)
-raw_frames_arr = np.stack(raw_frames)
-if raw_frames_arr.ndim == 4 and raw_frames_arr.shape[-1] >= 3:
-    raw_frames_arr = raw_frames_arr[..., :3]  # Drop alpha if present
+# # Stack raw frames as RGB uint8 (N, H, W, 3)
+# raw_frames_arr = np.stack(raw_frames)
+# if raw_frames_arr.ndim == 4 and raw_frames_arr.shape[-1] >= 3:
+#     raw_frames_arr = raw_frames_arr[..., :3]  # Drop alpha if present
 
-# Encode frames into DINOv2 latents (N, 768)
-X_train_latents = dino_encode(raw_frames_arr)
+# # Encode frames into DINOv2 latents (N, 768)
+# X_train_latents = dino_encode(raw_frames_arr)
 
-# Standardize features using dataset statistics
-feat_mean = X_train_latents.mean(axis=0, keepdims=True)
-feat_std = X_train_latents.std(axis=0, keepdims=True) + 1e-6
-frames = (X_train_latents - feat_mean) / feat_std
+# # Standardize features using dataset statistics
+# feat_mean = X_train_latents.mean(axis=0, keepdims=True)
+# feat_std = X_train_latents.std(axis=0, keepdims=True) + 1e-6
+# frames = (X_train_latents - feat_mean) / feat_std
 
 
 key = jr.PRNGKey(0)
@@ -198,10 +198,10 @@ model_key, data_key = jr.split(key)
 
 config = GraphModelConfig(
     node_specs=(
-        NodeSpec("ctrl0", "tpch_control", (192,), act_fn="tanh"),
-        NodeSpec("h1", "tpch_hidden", (384,), act_fn="tanh", parents=("ctrl0",)),
-        NodeSpec("h2", "tpch_hidden", (768,), act_fn="tanh", parents=("h1",)),
-        NodeSpec("o3", "tpch_obs", (768,), act_fn="identity", parents=("h2",), clamped=True),
+        NodeSpec("ctrl0", "tpch_control", (32,), act_fn="tanh", bidirectional=True),
+        NodeSpec("h1", "tpch_hidden", (64,), act_fn="tanh", parents=("ctrl0",), bidirectional=True),
+        NodeSpec("h2", "tpch_hidden", (128,), act_fn="tanh", parents=("h1",), bidirectional=True),
+        NodeSpec("o3", "tpch_obs", (128,), act_fn="identity", parents=("h2",), clamped=True),
         # NodeSpec("c4", "pcn_conv", (8, 2, 4), act_fn="tanh", parents=("o3",)),
         # NodeSpec("c5", "pcn_conv", (4, 4, 8), act_fn="tanh", parents=("c4",), options={"td_output_padding": 1}),
         # NodeSpec("image6", "pcn_conv", (1, 8, 16), act_fn="identity", parents=("c5",), clamped=True,
@@ -229,12 +229,12 @@ start_time = time.perf_counter()
 total_frames_processed = 0
 
 for i, frame in enumerate(frames[0:N_TRAIN_ITERS]):
-    y = {"o3": frame[None, :]}
+    y = {"o3": jnp.reshape(frame, (1, -1))}
     #y = {"o3": jnp.reshape(frame, (1, 1, 8, 16))}    # (batch=1, C, H, W); accepts (8, 16) or flat (128,) frames alike
     # full JIT inference and weight update for the current frame
         # full JIT inference and weight update for the current frame. Outputs carry the batch axis, so [0] picks the sequence.
     model, param_opt_state, states_curr, y_hat_before, y_hat_after, energy_before, energy_after, energy_trace = train_step(
-        model, param_opt_state, y, states_prev=states_prev, return_layerwise=False
+        model, param_opt_state, y, states_prev=states_prev, init_direction="bu", return_layerwise=False
     )
     states_prev = states_curr                            # thread time: this frame's settled states are the next frame's "previous"
  
@@ -242,9 +242,11 @@ for i, frame in enumerate(frames[0:N_TRAIN_ITERS]):
     energies.append(float(energy_after[0]))
 
     total_frames_processed += 1
-
+    y_np = np.asarray(frame)  # or np.asarray(y["o3"][0])
+    prior_pred_np = np.asarray(y_hat_before["o3"][0])
+    posterior_pred_np = np.asarray(y_hat_after["o3"][0])
     recorder.append(
-    y=y, prior_pred=y_hat_before, posterior_pred=y_hat_after,
+    y=y_np, prior_pred=prior_pred_np, posterior_pred=posterior_pred_np,
     inference_steps_made=NUM_INFERENCE_STEPS, frame_number=i,
     )
     if i % CHECKPOINT_INTERVAL == 0 or i == (N_TRAIN_ITERS - 1):
@@ -281,74 +283,122 @@ if total_frames_processed > 0:
 #     grid_threshold=8
 #     )
 
-#print("Reconstructing and saving prediction plots...")
-# # replay and save frames as pngs, needed for compile_videos_from_frames() call below
-# replay_recordings(
-#     recordings_dir=PREDICTIONS_RECORDING_DIR, 
-#     output_shape=(24, 32), #(ENV_HEIGHT, ENV_WIDTH),
-#     total_frames=len(frames),
-#     output_dir=PREDICTIONS_DIR,
-#     save_separate=True
-#     )
-
-
-# 1. Prepare target pixel vectors (N, 128)
-pixel_targets = np.stack(raw_frames)
-if pixel_targets.ndim == 4 and pixel_targets.shape[-1] >= 3:
-    pixel_targets = np.mean(pixel_targets[..., :3], axis=-1)
-pixel_targets = pixel_targets.reshape(len(pixel_targets), ENV_HEIGHT * ENV_WIDTH) / 255.0
-
-# 2. Add bias column (1s) to 768-D features -> shape (N, 769)
-X_train_np = np.array(frames)
-X_tilde = np.hstack([X_train_np, np.ones((len(X_train_np), 1))])
-
-# 3. Solve for weight matrix W: (769, 128)
-print("Fitting linear latent-to-pixel decoder using NumPy...")
-W_decoder, _, _, _ = np.linalg.lstsq(X_tilde, pixel_targets, rcond=None)
-
-# Helper function to map latents (N, 768) -> decoded pixels (N, 8, 16)
-def decode_to_pixels(latents_array):
-    latents_np = np.asarray(latents_array)
-    # Add bias term for inference
-    latents_tilde = np.hstack([latents_np, np.ones((len(latents_np), 1))])
-    decoded_flat = latents_tilde @ W_decoder  # (N, 128)
-    decoded_clipped = np.clip(decoded_flat, 0.0, 1.0)
-    return decoded_clipped.reshape(-1, ENV_HEIGHT, ENV_WIDTH)
-
-
-import glob
-import os
-
-print("Reconstructing decoded pixel prediction plots...")
-
-chunk_paths = sorted(glob.glob(os.path.join(PREDICTIONS_RECORDING_DIR, "chunk_*.npz")))
-plotter = VisualPredictionPlotter(output_shape=(ENV_HEIGHT, ENV_WIDTH), cmap="gray")
-
-try:
-    for path in chunk_paths:
-        data = np.load(path)
-        
-        # Decode 768-D latents back to (N, 8, 16) pixel frames
-        y_pix = decode_to_pixels(data["y"])
-        prior_pix = decode_to_pixels(data["prior_pred"])
-        post_pix = decode_to_pixels(data["posterior_pred"])
-        
-        for i in range(len(data["frame_numbers"])):
-            plotter.update(
-                y=y_pix[i],
-                prior_pred=prior_pix[i],
-                posterior_pred=post_pix[i],
-                inference_steps_made=int(data["inference_steps"][i]),
-                frame_number=int(data["frame_numbers"][i]),
-                total_frames=len(frames),
-                output_dir=PREDICTIONS_DIR,
-                save_separate=True,
-                save_combined=True,
-            )
-finally:
-    plotter.close()
-
-# Compile decoded image frames into MP4 video
+print("Reconstructing and saving prediction plots...")
+# replay and save frames as pngs, needed for compile_videos_from_frames() call below
+replay_recordings(
+    recordings_dir=PREDICTIONS_RECORDING_DIR, 
+    output_shape=(ENV_HEIGHT, ENV_WIDTH),
+    total_frames=len(frames),
+    output_dir=PREDICTIONS_DIR,
+    save_separate=True
+    )
 compile_videos_from_frames(output_dir=PREDICTIONS_DIR)
+#     recorder.append(
+#     y=y, prior_pred=y_hat_before, posterior_pred=y_hat_after,
+#     inference_steps_made=NUM_INFERENCE_STEPS, frame_number=i,
+#     )
+#     if i % CHECKPOINT_INTERVAL == 0 or i == (N_TRAIN_ITERS - 1):
+#         print(f"{i}. VFE before inference: {energy_before}")
+#         print(f"{i}. VFE after inference: {energy_after}")
+#         metadata["last_frame_processed"] = i
+#         model.save_checkpoint(root=CHECKPOINT_ROOT, opt_state=param_opt_state, activities=states_curr, metadata=metadata)
+#         # Flush the prediction recorder to disk for later replaying / reconstruction
+#         recorder.flush()
 
-#compile_videos_from_frames(output_dir=PREDICTIONS_DIR)
+#     # Pass settled states as previous states for step t + 1
+#     states_prev = states_curr
+
+# # Stop the stopwatch
+# total_elapsed = time.perf_counter() - start_time
+# if total_frames_processed > 0:
+#     avg_ms_per_frame = (total_elapsed / total_frames_processed) * 1000
+#     fps = total_frames_processed / total_elapsed
+
+#     mins, secs = divmod(total_elapsed, 60)
+#     print(f"\nProcessed {total_frames_processed} frames in {int(mins)}m {secs:.2f}s")
+#     print(f"Average speed: {avg_ms_per_frame:.2f} ms/frame ({fps:.2f} FPS)\n")
+
+# # print("Plotting energies...")
+# # plot_energies(
+# #     energies, 
+# #     model=model, 
+# #     save_plot=True, 
+# #     separate_layers=True, 
+# #     output_dir="figures",
+# #     save_individual=True,
+# #     save_overlay=True,
+# #     display=False,
+# #     grid_threshold=8
+# #     )
+
+# #print("Reconstructing and saving prediction plots...")
+# # # replay and save frames as pngs, needed for compile_videos_from_frames() call below
+# # replay_recordings(
+# #     recordings_dir=PREDICTIONS_RECORDING_DIR, 
+# #     output_shape=(24, 32), #(ENV_HEIGHT, ENV_WIDTH),
+# #     total_frames=len(frames),
+# #     output_dir=PREDICTIONS_DIR,
+# #     save_separate=True
+# #     )
+
+
+# # 1. Prepare target pixel vectors (N, 128)
+# pixel_targets = np.stack(raw_frames)
+# if pixel_targets.ndim == 4 and pixel_targets.shape[-1] >= 3:
+#     pixel_targets = np.mean(pixel_targets[..., :3], axis=-1)
+# pixel_targets = pixel_targets.reshape(len(pixel_targets), ENV_HEIGHT * ENV_WIDTH) / 255.0
+
+# # 2. Add bias column (1s) to 768-D features -> shape (N, 769)
+# X_train_np = np.array(frames)
+# X_tilde = np.hstack([X_train_np, np.ones((len(X_train_np), 1))])
+
+# # 3. Solve for weight matrix W: (769, 128)
+# print("Fitting linear latent-to-pixel decoder using NumPy...")
+# W_decoder, _, _, _ = np.linalg.lstsq(X_tilde, pixel_targets, rcond=None)
+
+# # Helper function to map latents (N, 768) -> decoded pixels (N, 8, 16)
+# def decode_to_pixels(latents_array):
+#     latents_np = np.asarray(latents_array)
+#     # Add bias term for inference
+#     latents_tilde = np.hstack([latents_np, np.ones((len(latents_np), 1))])
+#     decoded_flat = latents_tilde @ W_decoder  # (N, 128)
+#     decoded_clipped = np.clip(decoded_flat, 0.0, 1.0)
+#     return decoded_clipped.reshape(-1, ENV_HEIGHT, ENV_WIDTH)
+
+
+# import glob
+# import os
+
+# print("Reconstructing decoded pixel prediction plots...")
+
+# chunk_paths = sorted(glob.glob(os.path.join(PREDICTIONS_RECORDING_DIR, "chunk_*.npz")))
+# plotter = VisualPredictionPlotter(output_shape=(ENV_HEIGHT, ENV_WIDTH), cmap="gray")
+
+# try:
+#     for path in chunk_paths:
+#         data = np.load(path)
+        
+#         # Decode 768-D latents back to (N, 8, 16) pixel frames
+#         y_pix = decode_to_pixels(data["y"])
+#         prior_pix = decode_to_pixels(data["prior_pred"])
+#         post_pix = decode_to_pixels(data["posterior_pred"])
+        
+#         for i in range(len(data["frame_numbers"])):
+#             plotter.update(
+#                 y=y_pix[i],
+#                 prior_pred=prior_pix[i],
+#                 posterior_pred=post_pix[i],
+#                 inference_steps_made=int(data["inference_steps"][i]),
+#                 frame_number=int(data["frame_numbers"][i]),
+#                 total_frames=len(frames),
+#                 output_dir=PREDICTIONS_DIR,
+#                 save_separate=True,
+#                 save_combined=True,
+#             )
+# finally:
+#     plotter.close()
+
+# # Compile decoded image frames into MP4 video
+# compile_videos_from_frames(output_dir=PREDICTIONS_DIR)
+
+# #compile_videos_from_frames(output_dir=PREDICTIONS_DIR)

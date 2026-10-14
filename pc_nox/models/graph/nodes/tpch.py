@@ -21,6 +21,7 @@ from jaxtyping import Array, PRNGKeyArray
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import equinox as eqx
 
 from .base import NodeBase, NodeInputs, NodePrediction, WeightEntry
 
@@ -68,16 +69,22 @@ class TpchControlNode(NodeBase):
         self.has_input = (input_size > 0)
 
         self.op_rec = eqx.nn.Linear(own_size, own_size, use_bias=False, key=k_rec)
-        if has_input:
+        if self.has_input:
             self.op_in = eqx.nn.Linear(input_size, own_size, use_bias=True, key=k_in)
         if bidirectional:
-            if child_size is None or child_size <= 0:
+            if child_size is None: # NOTE, handling of child_size wrong
                 raise ValueError("A node with no child_size cannot be bidirectional")
-            self.op_bu = eqx.nn.Linear(child_size, own_size, use_bias=True, key=k_bu)
+            self.op_bu = eqx.nn.Linear(child_size[0], own_size, use_bias=True, key=k_bu)
 
     @property
     def state_shape(self) -> Tuple[int, ...]:
         return (self.op_rec.weight.shape[0],)
+    
+    @property
+    def prediction_keys(self) -> Tuple[str, ...]:
+        keys = ("td",) if (self.op_rec is not None) else ()
+        return keys + ("bu",) if self.bidirectional else keys
+
 
     @property
     def needs_own_prev(self) -> bool:
@@ -150,8 +157,8 @@ class TpchHiddenNode(NodeBase):
     """Middle node: `z_hat_t = f(P z_{t-1} + Q s_{t-1} + R s_t)` where `s`
     is the (combined) parent state; optionally leaky."""
     op_rec: eqx.nn.Linear  # recurrent weight (from self at t-1)
-    op_parents_prev: eqx.nn.linear # node can have multiple parents, treated as one inside the node
-    op_parents_curr: eqx.nn.linear
+    op_parents_prev: eqx.nn.Linear # node can have multiple parents, treated as one inside the node
+    op_parents_curr: eqx.nn.Linear
     op_bu: eqx.nn.Linear = None # optional bidirectional bottom up weight
 
     td_act_fn: Callable = eqx.field(static=True) # not truly td because of rec self->self weight
@@ -186,21 +193,26 @@ class TpchHiddenNode(NodeBase):
         self.td_act_fn = td_act_fn
         self.bu_act_fn = bu_act_fn
         self.alpha = alpha
-        self.has_input = (input_size > 0)
 
         self.op_rec = eqx.nn.Linear(own_size, own_size, use_bias=False, key=k_rec)
         self.op_parents_prev = eqx.nn.Linear(parent_size, own_size, use_bias=False, key=k_parent_prev)
         self.op_parents_curr = eqx.nn.Linear(parent_size, own_size, use_bias=True, key=k_parent_curr)
 
         if bidirectional:
-            if child_size is None or child_size <= 0:
+            if child_size is None or child_size[0] <= 0:
                 raise ValueError("A node with no child_size cannot be bidirectional")
-            self.op_bu = eqx.nn.Linear(child_size, own_size, use_bias=True, key=k_bu)
+            self.op_bu = eqx.nn.Linear(child_size[0], own_size, use_bias=True, key=k_bu)
 
 
     @property
     def state_shape(self) -> Tuple[int, ...]:
         return (self.op_rec.weight.shape[0],)
+
+    @property
+    def prediction_keys(self) -> Tuple[str, ...]:
+        keys = ("td",) if not None in [self.op_parents_curr, self.op_parents_prev, self.op_rec] else ()
+        return keys + ("bu",) if self.bidirectional else keys
+
 
     @property
     def needs_own_prev(self) -> bool:
@@ -271,9 +283,18 @@ class TpchObservationNode(NodeBase):
     """
     op_parents_curr: eqx.nn.Linear
 
+    def __init__(self, obs_size: int, parent_size: int, key: PRNGKeyArray):
+        self.op_parents_curr = eqx.nn.Linear(parent_size, obs_size, use_bias=False, key=key)
+
     @property
     def state_shape(self) -> Tuple[int, ...]:
         return (self.op_parents_curr.weight.shape[0],)
+
+    @property
+    def prediction_keys(self) -> Tuple[str, ...]:
+        keys = ("td",) if (self.op_parents_curr is not None) else ()
+        return keys
+
 
     @property
     def provides_pre_activations(self) -> bool:

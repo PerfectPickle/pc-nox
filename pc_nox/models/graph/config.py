@@ -78,7 +78,7 @@ class NodeSpec:
         bidirectional: Whether the node also has a bottom-up path from its
             children.
         alpha: tPC-E leak rate; None = non-leaky.
-        precision: Weight on this node's energy term (> 0).
+        precision: Weight on this node's energy term (> 0). # TODO precision vs td_precision????
         energy, act_fn, weight_decay, orthogonal_penalty, activity_decay:
             Per-node overrides; None = inherit the model-wide default.
         options: Node-specific constructor options (kernel size, stride,
@@ -297,7 +297,7 @@ class GraphModelConfig:
 
         order = sorted(range(len(specs)), key=lambda i: (levels[specs[i].name], i))
         canonical = tuple(replace(specs[i], level=levels[specs[i].name]) for i in order)
-        # Resolve the model-wide `bidirectional` default structurally: a node inherits it iff it HAS children, so
+        # Resolve the model-wide `bidirectional` default structurally: a node inherits it if it HAS children, so
         # data roots get a bottom-up-only path and leaves stay top-down-only (the paper's x1 / xL asymmetry).
         n_children = {s.name: 0 for s in canonical}
         for s in canonical:

@@ -143,7 +143,7 @@ class GraphModel(eqx.Module, ModelBase):
             NodeSpec("core", "tpch_control", 64),
             NodeSpec("vis", "tpch_hidden", 128, parents=("core",)),
             NodeSpec("aud", "tpch_hidden", 32,  parents=("core",)),
-            NodeSpec("vis_obs", "tpch_obs", 4096, parents=("vis",), clamped=True, precision=1/4096),
+            NodeSpec("vis_obs", "tpch_obs", 4096, parents=("vis",), clamped=True,),
             NodeSpec("aud_obs", "tpch_obs", 16,   parents=("aud",), clamped=True),
         ))
         model = GraphModel(config, key=jax.random.PRNGKey(0))
@@ -314,7 +314,7 @@ class GraphModel(eqx.Module, ModelBase):
             strategy = ENERGY_REGISTRY[self.config.get(spec, "energy")]
             # pathway weighting, td vs bu
             weights = {"td": self.config.get(spec, "td_precision"), "bu": self.config.get(spec, "bu_precision")}
-            energies.append(spec.precision * strategy.fn(curr[spec.name], predictions[spec.name], None, weights))
+            energies.append(strategy.fn(curr[spec.name], predictions[spec.name], None, weights))
         return energies
 
     def _weight_reg_by_node(self) -> Array:

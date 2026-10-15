@@ -75,11 +75,15 @@ def _leading_size(tree: PyTree, axis: int) -> int:
 # One frame, then one batched step (shared by the *_step and *_run factories)
 # --------------------------------------------------------------------------- #
 
-def _frame(model, activity_optim, n_infer_steps, return_layerwise, with_grads, init_direction=None):
+def _frame(model, activity_optim, n_infer_steps, return_layerwise, with_grads, init_direction=None, before_init_dir=None):
     """The per-example computation: init -> settle -> predictions/energies
     (before and after) -> optionally the weight gradient."""
+    # This flag exists so that in a bidirectional context, 
+    # a purely generative (td init) y_hat_before and energy_before can be returned
+    if before_init_dir is None:
+        before_init_dir = init_direction
     def per_example(states_prev, observation, control_input): # TODO, consider moving y_hat_before earlier? or separate y_hat_before init dir option
-        states_curr_init = model.init_activities(states_prev, control_input, observation, "td")
+        states_curr_init = model.init_activities(states_prev, control_input, observation, before_init_dir)
         _, y_hat_before = model.predict(states_prev, states_curr_init, control_input, observation)
         energy_before = model.energy_fn(states_prev, states_curr_init, observation, control_input)
 
@@ -98,15 +102,15 @@ def _frame(model, activity_optim, n_infer_steps, return_layerwise, with_grads, i
     return per_example
 
 
-def _eval_batch(model, activity_optim, n_infer_steps, observation, states_prev, control_input, return_layerwise, init_direction=None):
-    frame = _frame(model, activity_optim, n_infer_steps, return_layerwise, with_grads=False, init_direction=init_direction)
+def _eval_batch(model, activity_optim, n_infer_steps, observation, states_prev, control_input, return_layerwise, init_direction=None, before_init_dir=None):
+    frame = _frame(model, activity_optim, n_infer_steps, return_layerwise, with_grads=False, init_direction=init_direction, before_init_dir=before_init_dir)
     _, *outputs = jax.vmap(frame)(states_prev, observation, control_input)
     return tuple(outputs)        # states_curr, y_hat_before, y_hat_after, e_before, e_after, trace
 
 
 def _train_batch(model, param_optim, activity_optim, n_infer_steps, param_opt_state,
-                 observation, states_prev, control_input, return_layerwise, init_direction=None):
-    frame = _frame(model, activity_optim, n_infer_steps, return_layerwise, with_grads=True, init_direction=init_direction)
+                 observation, states_prev, control_input, return_layerwise, init_direction=None, before_init_dir=None):
+    frame = _frame(model, activity_optim, n_infer_steps, return_layerwise, with_grads=True, init_direction=init_direction, before_init_dir=before_init_dir)
     grads_batch, *outputs = jax.vmap(frame)(states_prev, observation, control_input)
 
     grads = jax.tree_util.tree_map(lambda g: jnp.mean(g, axis=0), grads_batch)   # minibatch semantics
@@ -129,8 +133,8 @@ def make_eval_step(activity_optim: optax.GradientTransformation, n_infer_steps: 
     """
     @eqx.filter_jit
     def eval_step(model, observation: Mapping[str, Array], *, states_prev=None, control_input=None,
-                  return_layerwise: bool = False, init_direction: Optional[str] = None):
-        return _eval_batch(model, activity_optim, n_infer_steps, observation, states_prev, control_input, return_layerwise, init_direction)
+                  return_layerwise: bool = False, init_direction: Optional[str] = None, before_init_dir=None):
+        return _eval_batch(model, activity_optim, n_infer_steps, observation, states_prev, control_input, return_layerwise, init_direction, before_init_dir)
 
     return eval_step
 
@@ -148,9 +152,9 @@ def make_train_step(param_optim: optax.GradientTransformation, activity_optim: o
     """
     @eqx.filter_jit
     def train_step(model, param_opt_state, observation: Mapping[str, Array], *, states_prev=None,
-                   control_input=None, return_layerwise: bool = False, init_direction: Optional[str] = None):
+                   control_input=None, return_layerwise: bool = False, init_direction: Optional[str] = None, before_init_dir: Optional[str] = None):
         return _train_batch(model, param_optim, activity_optim, n_infer_steps, param_opt_state,
-                            observation, states_prev, control_input, return_layerwise, init_direction)
+                            observation, states_prev, control_input, return_layerwise, init_direction, before_init_dir)
 
     return train_step
 
@@ -171,14 +175,14 @@ def make_eval_run(activity_optim: optax.GradientTransformation, n_infer_steps: i
     """
     @eqx.filter_jit
     def eval_run(model, observations: Mapping[str, Array], *, states_prev=None, control_inputs=None,
-                 return_layerwise: bool = False, init_direction: Optional[str] = None):
+                 return_layerwise: bool = False, init_direction: Optional[str] = None, before_init_dir: Optional[str] = None):
         if states_prev is None:
             states_prev = zero_states(model, _leading_size(observations, axis=1))
 
         def step(states_prev, xs_t):
             obs_t, ci_t = xs_t
             states_curr, *logs = _eval_batch(
-                model, activity_optim, n_infer_steps, obs_t, states_prev, ci_t, return_layerwise, init_direction)
+                model, activity_optim, n_infer_steps, obs_t, states_prev, ci_t, return_layerwise, init_direction, before_init_dir)
             return states_curr, tuple(logs)
 
         states_curr, logs = jax.lax.scan(step, states_prev, xs=(observations, control_inputs), length=run_length)
@@ -199,7 +203,7 @@ def make_train_run(param_optim: optax.GradientTransformation, activity_optim: op
     """
     @eqx.filter_jit
     def train_run(model, param_opt_state, observations: Mapping[str, Array], *, states_prev=None,
-                  control_inputs=None, return_layerwise: bool = False, init_direction: Optional[str] = None):
+                  control_inputs=None, return_layerwise: bool = False, init_direction: Optional[str] = None, before_init_dir: Optional[str] = None):
         if states_prev is None:
             states_prev = zero_states(model, _leading_size(observations, axis=1))
 
@@ -208,7 +212,7 @@ def make_train_run(param_optim: optax.GradientTransformation, activity_optim: op
             obs_t, ci_t = xs_t
             model, param_opt_state, states_curr, *logs = _train_batch(
                 model, param_optim, activity_optim, n_infer_steps, param_opt_state,
-                obs_t, states_prev, ci_t, return_layerwise, init_direction)
+                obs_t, states_prev, ci_t, return_layerwise, init_direction, before_init_dir)
             return (model, param_opt_state, states_curr), tuple(logs)
 
         (model, param_opt_state, states_curr), logs = jax.lax.scan(

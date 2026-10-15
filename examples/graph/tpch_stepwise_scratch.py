@@ -198,9 +198,9 @@ model_key, data_key = jr.split(key)
 
 config = GraphModelConfig(
     node_specs=(
-        NodeSpec("ctrl0", "tpch_control", (32,), act_fn="tanh", bidirectional=True),
-        NodeSpec("h1", "tpch_hidden", (64,), act_fn="tanh", parents=("ctrl0",), bidirectional=True),
-        NodeSpec("h2", "tpch_hidden", (128,), act_fn="tanh", parents=("h1",), bidirectional=True),
+        NodeSpec("ctrl0", "tpch_control", (32,), act_fn="tanh", bidirectional=True, td_precision=0.5),
+        NodeSpec("h1", "tpch_hidden", (64,), act_fn="tanh", parents=("ctrl0",), bidirectional=True, td_precision=0.5),
+        NodeSpec("h2", "tpch_hidden", (128,), act_fn="tanh", parents=("h1",), bidirectional=True, td_precision=0.5),
         NodeSpec("o3", "tpch_obs", (128,), act_fn="identity", parents=("h2",), clamped=True),
         # NodeSpec("c4", "pcn_conv", (8, 2, 4), act_fn="tanh", parents=("o3",)),
         # NodeSpec("c5", "pcn_conv", (4, 4, 8), act_fn="tanh", parents=("c4",), options={"td_output_padding": 1}),
@@ -234,7 +234,7 @@ for i, frame in enumerate(frames[0:N_TRAIN_ITERS]):
     # full JIT inference and weight update for the current frame
         # full JIT inference and weight update for the current frame. Outputs carry the batch axis, so [0] picks the sequence.
     model, param_opt_state, states_curr, y_hat_before, y_hat_after, energy_before, energy_after, energy_trace = train_step(
-        model, param_opt_state, y, states_prev=states_prev, init_direction="bu", return_layerwise=False
+        model, param_opt_state, y, states_prev=states_prev, init_direction="bu", before_init_dir="td", return_layerwise=False
     )
     states_prev = states_curr                            # thread time: this frame's settled states are the next frame's "previous"
  

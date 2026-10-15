@@ -78,7 +78,6 @@ class NodeSpec:
         bidirectional: Whether the node also has a bottom-up path from its
             children.
         alpha: tPC-E leak rate; None = non-leaky.
-        precision: Weight on this node's energy term (> 0). # TODO precision vs td_precision????
         energy, act_fn, weight_decay, orthogonal_penalty, activity_decay:
             Per-node overrides; None = inherit the model-wide default.
         options: Node-specific constructor options (kernel size, stride,
@@ -104,7 +103,6 @@ class NodeSpec:
     clamped: bool = False
     bidirectional: Optional[bool] = None
     alpha: Optional[float] = None
-    precision: float = 1.0
     energy: Optional[str] = None
     act_fn: Optional[str] = None
     weight_decay: Optional[float] = None
@@ -144,8 +142,6 @@ class NodeSpec:
             errs.append(f"alpha must be in (0, 1], got {self.alpha}")
         if self.alpha is not None and self.clamped:
             errs.append("a clamped node cannot be leaky (alpha)")
-        if not self.precision > 0:
-            errs.append(f"precision must be > 0, got {self.precision}")
         for f in ("weight_decay", "orthogonal_penalty", "activity_decay"):
             v = getattr(self, f)
             if v is not None and v < 0:

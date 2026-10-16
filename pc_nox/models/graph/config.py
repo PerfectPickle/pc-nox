@@ -78,7 +78,7 @@ class NodeSpec:
         bidirectional: Whether the node also has a bottom-up path from its
             children.
         alpha: tPC-E leak rate; None = non-leaky.
-        energy, act_fn, weight_decay, orthogonal_penalty, activity_decay:
+        energy, td_act_fn, bu_act_fn, weight_decay, orthogonal_penalty, activity_decay:
             Per-node overrides; None = inherit the model-wide default.
         options: Node-specific constructor options (kernel size, stride,
             ...) as a hashable tuple of `(key, value)` pairs. A dict is
@@ -104,7 +104,8 @@ class NodeSpec:
     bidirectional: Optional[bool] = None
     alpha: Optional[float] = None
     energy: Optional[str] = None
-    act_fn: Optional[str] = None
+    td_act_fn: Optional[str] = None
+    bu_act_fn: Optional[str] = None
     weight_decay: Optional[float] = None
     orthogonal_penalty: Optional[float] = None
     activity_decay: Optional[float] = None
@@ -214,7 +215,7 @@ class GraphModelConfig:
             resolved -- so the layerwise-energy order, execution order and
             saved config are all deterministic.
         input_size: Width of the external control input (0 = none).
-        act_fn, energy, weight_decay, orthogonal_penalty, activity_decay:
+        td_act_fn, bu_act_fn, energy, weight_decay, orthogonal_penalty, activity_decay:
             Model-wide defaults that a `NodeSpec` may override.
         weight_decay_scope, orthogonal_scope, activity_reg_type, trace_mode:
             Model-wide settings with the same meaning as in `TpchConfig`.
@@ -236,7 +237,8 @@ class GraphModelConfig:
     """
     node_specs: Tuple[NodeSpec, ...]
     input_size: int = 0
-    act_fn: str = "tanh"
+    td_act_fn: str = "tanh"
+    bu_act_fn: str = "tanh"
     energy: str = "pc"
     weight_decay: float = 0.0
     weight_decay_scope: str = "all"

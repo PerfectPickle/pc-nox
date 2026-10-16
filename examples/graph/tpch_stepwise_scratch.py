@@ -105,7 +105,7 @@ def dino_encode(images_uint8, batch_size=128):
 
 
 # Number of settling iterations
-NUM_INFERENCE_STEPS = 50
+NUM_INFERENCE_STEPS = 20
 
 # example_env.mp4 has 2000 frames
 N_TRAIN_ITERS = 2000
@@ -198,15 +198,15 @@ model_key, data_key = jr.split(key)
 
 config = GraphModelConfig(
     node_specs=(
-        NodeSpec("ctrl0", "tpch_control", (32,), act_fn="tanh", bidirectional=True, td_precision=0.5),
-        NodeSpec("h1", "tpch_hidden", (64,), act_fn="tanh", parents=("ctrl0",), bidirectional=True, td_precision=0.5),
-        NodeSpec("h2", "tpch_hidden", (128,), act_fn="tanh", parents=("h1",), bidirectional=True, td_precision=0.5),
-        NodeSpec("o3", "tpch_obs", (128,), act_fn="identity", parents=("h2",), clamped=True),
+        NodeSpec("ctrl0", "tpch_control", (32,), bidirectional=True, td_precision=0.5),
+        NodeSpec("h1", "tpch_hidden", (64,), parents=("ctrl0",), bidirectional=True, td_precision=0.5),
+        NodeSpec("h2", "tpch_hidden", (128,), parents=("h1",), bidirectional=True, td_precision=0.5),
+        NodeSpec("o3", "tpch_obs", (128,), td_act_fn="identity", parents=("h2",), clamped=True),
         # NodeSpec("c4", "pcn_conv", (8, 2, 4), act_fn="tanh", parents=("o3",)),
         # NodeSpec("c5", "pcn_conv", (4, 4, 8), act_fn="tanh", parents=("c4",), options={"td_output_padding": 1}),
         # NodeSpec("image6", "pcn_conv", (1, 8, 16), act_fn="identity", parents=("c5",), clamped=True,
         #          options={"td_output_padding": 1}),
-    ),
+    ),td_act_fn="elu", bu_act_fn="elu"
 )
 model = GraphModel(config, key=model_key)
 

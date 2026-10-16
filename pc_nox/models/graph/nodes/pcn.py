@@ -94,7 +94,8 @@ class PcnNode(NodeBase):
         spec,                                           # NodeSpec
         parent_shape: Optional[Tuple[int, ...]],
         child_shape: Optional[Tuple[int, ...]],
-        act_fn: Callable,
+        td_act_fn: Callable,
+        bu_act_fn: Callable,
         *,
         key: PRNGKeyArray,
     ) -> "PcnNode":
@@ -112,7 +113,7 @@ class PcnNode(NodeBase):
             own_size=spec.shape[0],
             parent_size=parent_shape[0] if parent_shape else None,
             child_size=child_shape[0] if (bi and child_shape) else None,
-            td_act_fn=act_fn, bu_act_fn=act_fn, bidirectional=bi, has_prior=bool(opts.get("prior", True)), key=key,
+            td_act_fn=td_act_fn, bu_act_fn=bu_act_fn, bidirectional=bi, has_prior=bool(opts.get("prior", True)), key=key,
         )
 
     # ------------------------------------------------------------------ #

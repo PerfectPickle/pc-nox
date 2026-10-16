@@ -103,14 +103,16 @@ class BuildContext(NamedTuple):
             None if the node has no parents.
         child_shape: Combined child shape, or None unless the spec is
             `bidirectional`.
-        act_fn: Resolved activation callable (spec override or model default).
+        td_act_fn: Resolved top-down activation callable (spec override or model default).
+        bu_act_fn: Resolved bottom-up activation callable (spec override or model default).
         input_size: The config's control-input width (0 = none).
         key: A PRNG key unique to this node (see `node_key`).
     """
     spec: NodeSpec
     parent_shape: Optional[Tuple[int, ...]]
     child_shape: Optional[Tuple[int, ...]]
-    act_fn: Callable
+    td_act_fn: Callable
+    bu_act_fn: Callable
     input_size: int
     key: PRNGKeyArray
 
@@ -167,8 +169,15 @@ def _build_tpch_control(ctx: BuildContext) -> NodeBase:
     _no_options(s)
     _require(not s.parents, s, "a control node has no parents")
     _require(len(s.shape) == 1, s, f"shape must be 1-D, got {s.shape}")
-    return TpchControlNode( # TODO, does BUILDER support differing act_fns  for td vs bu pathway??
-        own_size=s.shape[0], child_size=ctx.child_shape, bidirectional=s.bidirectional, input_size=ctx.input_size, td_act_fn=ctx.act_fn, bu_act_fn=ctx.act_fn, alpha=s.alpha, key=ctx.key,
+    return TpchControlNode(
+        own_size=s.shape[0], 
+        child_size=ctx.child_shape, 
+        bidirectional=s.bidirectional, 
+        input_size=ctx.input_size, 
+        td_act_fn=ctx.td_act_fn, 
+        bu_act_fn=ctx.bu_act_fn, 
+        alpha=s.alpha, 
+        key=ctx.key,
     )
 
 
@@ -179,7 +188,14 @@ def _build_tpch_hidden(ctx: BuildContext) -> NodeBase:
     _require(bool(s.parents), s, "a hidden node needs at least one parent")
     _require(len(s.shape) == 1, s, f"shape must be 1-D, got {s.shape}")
     return TpchHiddenNode(
-        own_size=s.shape[0], child_size=ctx.child_shape, bidirectional=s.bidirectional, parent_size=ctx.parent_shape[0], td_act_fn=ctx.act_fn, bu_act_fn=ctx.act_fn, alpha=s.alpha, key=ctx.key,
+        own_size=s.shape[0], 
+        child_size=ctx.child_shape, 
+        bidirectional=s.bidirectional, 
+        parent_size=ctx.parent_shape[0], 
+        td_act_fn=ctx.td_act_fn, 
+        bu_act_fn=ctx.bu_act_fn, 
+        alpha=s.alpha, 
+        key=ctx.key,
     )
 
 
@@ -209,16 +225,16 @@ def _build_input(ctx: BuildContext) -> NodeBase:
     # a bottom-up-only conv or dense node, chosen by the declared shape.
     _require(ctx.child_shape is not None, s, "a bidirectional input node needs at least one child to predict it from")
     if len(s.shape) == 3:
-        return PcnConvNode.from_spec(s, None, ctx.child_shape, ctx.act_fn, key=ctx.key)
+        return PcnConvNode.from_spec(s, None, ctx.child_shape, ctx.td_act_fn, ctx.bu_act_fn, key=ctx.key)
     _require(len(s.shape) == 1, s, f"shape must be (D,) or (C, H, W), got {s.shape}")
-    return PcnNode(s.shape[0], None, ctx.child_shape[0], ctx.act_fn, ctx.act_fn, True, False, key=ctx.key)
+    return PcnNode(s.shape[0], None, ctx.child_shape[0], ctx.td_act_fn, ctx.bu_act_fn, True, False, key=ctx.key)
 
 
 @register_node("pcn", input_layout="flat")
 def _build_pcn(ctx: BuildContext) -> NodeBase:
     s = ctx.spec
     _require(s.alpha is None, s, "a static PCN node has no memory, so alpha must be None")
-    return PcnNode.from_spec(s, ctx.parent_shape, ctx.child_shape, ctx.act_fn, key=ctx.key)
+    return PcnNode.from_spec(s, ctx.parent_shape, ctx.child_shape, ctx.td_act_fn, ctx.bu_act_fn, key=ctx.key)
 
 
 @register_node("pcn_conv", input_layout="spatial")
@@ -226,7 +242,7 @@ def _build_pcn_conv(ctx: BuildContext) -> NodeBase:
     s = ctx.spec
     _require(bool(s.parents) or s.bidirectional, s, "a conv node needs at least one parent (or bidirectional=True, for a bottom-up-only data root)")
     _require(s.alpha is None, s, "conv nodes are not leaky (no eligibility traces), alpha must be None")
-    return PcnConvNode.from_spec(s, ctx.parent_shape, ctx.child_shape, ctx.act_fn, key=ctx.key)
+    return PcnConvNode.from_spec(s, ctx.parent_shape, ctx.child_shape, ctx.td_act_fn, ctx.bu_act_fn, key=ctx.key)
 
 
 # --------------------------------------------------------------------------- #
@@ -274,7 +290,8 @@ def build_nodes(config: GraphModelConfig, key: PRNGKeyArray) -> Dict[str, NodeBa
             parent_shape, child_shape = input_shapes(config, spec)
             ctx = BuildContext(
                 spec=spec, parent_shape=parent_shape, child_shape=child_shape,
-                act_fn=resolve_act_fn(config.get(spec, "act_fn")),
+                td_act_fn=resolve_act_fn(config.get(spec, "td_act_fn")),
+                bu_act_fn=resolve_act_fn(config.get(spec, "bu_act_fn")),
                 input_size=config.input_size, key=node_key(key, spec.name),
             )
             nodes[spec.name] = builder.build(ctx)

@@ -6,4 +6,7 @@ import jax.nn as jnn
 ACT_FN_REGISTRY: dict[str, Callable]= {
     "tanh": jnp.tanh, 
     "relu": jnn.relu, 
-    "identity": lambda x: x}
+    "identity": lambda x: x,
+    "gelu": jnn.gelu,
+    "elu": jnn.elu,
+    }

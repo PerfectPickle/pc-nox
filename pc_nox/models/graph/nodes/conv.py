@@ -225,7 +225,8 @@ class PcnConvNode(NodeBase):
         spec,                                   # NodeSpec
         parent_shape: Tuple[int, ...],
         child_shape: Optional[Tuple[int, ...]],
-        act_fn: Callable,
+        td_act_fn: Callable,
+        bu_act_fn: Callable,
         *,
         key: PRNGKeyArray,
     ) -> "PcnConvNode":
@@ -245,8 +246,8 @@ class PcnConvNode(NodeBase):
             parent_shape=parent_shape,
             own_shape=spec.shape,
             child_shape=child_shape if bool(spec.bidirectional) else None,
-            td_act_fn=act_fn,
-            bu_act_fn=act_fn,
+            td_act_fn=td_act_fn,
+            bu_act_fn=bu_act_fn,
             bidirectional=bool(spec.bidirectional),
             key=key,
             **opts,

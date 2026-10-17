@@ -11,7 +11,29 @@ import optax
 # (Adjust the package path to wherever you placed the graph package.)
 from pc_nox.models.graph import GraphModel, GraphModelConfig, NodeSpec
 from pc_nox.models.graph.runners import make_eval_step, make_train_step
+from pc_nox.models.graph.optim_utils import grouped_optimiser
 
+from pc_nox.models.graph.runners import zero_states  
+
+def diagnose(model, tag, n=64):
+    rms = lambda a: float(jnp.sqrt(jnp.mean(a ** 2)))
+    xs, ys = X_test[:n], Y_test[:n]
+    obs = {"image": xs, "label": ys}                   # label clamped, so settling has a driver
+
+    # the starting point z0 (the feed-forward sweep)
+    s0 = jax.vmap(lambda sp, o: model.init_activities(sp, None, o))(zero_states(model, n), obs)
+    # the settled states, plus the feed-forward logits and energies
+    sT, y_before, _, e_before, e_after, _ = eval_step(model, obs)
+
+    print(f"--- {tag} ---")
+    for k in sT:
+        print(f"{k:7s} z0 rms {rms(s0[k]):8.4f} | settled move {rms(sT[k] - s0[k]):8.4f}")
+    print(f"logit std {float(y_before['label'].std()):.4f} | "
+          f"energy_before {float(jnp.mean(e_before)):.3f} (CE at init ~ ln 100 = 4.6)")
+
+    for name in ("conv1", "conv2", "conv3", "fc", "label"):
+        w = model.nodes[name].op_td.weight
+        print(f"{name:6s} mean/std = {float(w.mean() / w.std()):+.3f}")
 
 # =====================================================================
 # 1. Visualization Helper (RGB Images + Class Names)
@@ -34,9 +56,12 @@ def save_eval_samples(
 
     # CHANGED: only the image is observed at test time. The label node is `release`d, so omitting it makes it a
     # free state that settles together with the hidden nodes; its settled activity is the classification.
-    states_curr, _, _, _, _, _ = eval_step(model, {"image": xs_batch}, return_layerwise=False)
+    #states_curr, _, _, _, _, _ = eval_step(model, {"image": xs_batch}, return_layerwise=False)
+    # In save_eval_samples():
+    _, _, y_hat_after, _, _, _ = eval_step(model, {"image": xs_batch}, return_layerwise=False)
 
-    preds = np.array(jnp.argmax(states_curr["label"], axis=-1))   # the label node is RELEASED at test time: read its state
+    preds = np.array(jnp.argmax(y_hat_after["label"], axis=-1))  # Changed from states_curr["label"]
+
     trues = np.array(jnp.argmax(ys_batch, axis=-1))
 
     # CHANGED: images are (N, 3, 32, 32) channels-first now; matplotlib wants (32, 32, 3)
@@ -128,23 +153,6 @@ Y_test = jax.nn.one_hot(jnp.array(test_fine_labels), num_classes=100)
 # =====================================================================
 # 4. Instantiate Runner Functions
 # =====================================================================
-RETURN_LAYERWISE = False
-
-# CHANGED: learning rates. The conv graph is far more sensitive to these than the dense PcnModel was. Measured on
-# CIFAR-100 with this graph: param lr 1e-3 collapsed the feedforward net to chance in every run (with activity lr 0.01
-# or 0.001); param lr 1e-4 trained, and lowering the activity lr to 0.001 as well gave the best result (~16.6% test
-# after 10 epochs, still rising). Tune these first if you change the architecture.
-activity_optim = optax.adam(learning_rate=0.001)
-param_optim = optax.adam(learning_rate=1e-4)
-
-train_step = make_train_step(
-    param_optim=param_optim,
-    activity_optim=activity_optim,
-    n_infer_steps=20,
-)
-
-eval_step = make_eval_step(activity_optim=activity_optim, n_infer_steps=20)
-
 
 def compute_accuracy(y_hat: jnp.ndarray, y_true: jnp.ndarray) -> jnp.ndarray:
     preds = jnp.argmax(y_hat, axis=-1)
@@ -180,7 +188,7 @@ def run_evaluation(model, X_test, Y_test, batch_size=64):
         total_energy_before += jnp.mean(energy_before)
         total_energy_after += jnp.mean(energy_after)
         total_acc_before += compute_accuracy(y_hat_before["label"], ys_batch)
-        total_acc_after += compute_accuracy(states_curr["label"], ys_batch)
+        total_acc_after += compute_accuracy(y_hat_after["label"], ys_batch)
 
     return {
         "energy_before": float(total_energy_before / num_test_batches),
@@ -221,21 +229,86 @@ rng_key, model_key = jax.random.split(key)
 #   * The label uses squared error against the one-hot vector (the paper's energy), not cross-entropy.
 config = GraphModelConfig(
     node_specs=(
-        NodeSpec("image", "input", (3, 32, 32), clamped=True, release=True, act_fn="identity",
-                 options={"bu_output_padding": 1}),                                        # bu: 16 -> 32
-        NodeSpec("c1", "pcn_conv", (32, 16, 16), parents=("image",), act_fn="tanh",
-                 options={"bu_output_padding": 1}),                                        # td: 32 -> 16 ; bu: 8 -> 16
-        NodeSpec("c2", "pcn_conv", (64, 8, 8), parents=("c1",), act_fn="tanh",
-                options={"bu_output_padding": 1}),            # td: 16 -> 8  ; bu: from fc
-        NodeSpec("c3", "pcn_conv", (128, 4, 4), parents=("c2",), act_fn="tanh"),            # td: 16 -> 8  ; bu: from fc
-        NodeSpec("fc", "pcn", 512, parents=("c3",), act_fn="tanh"),
-        NodeSpec("label", "pcn", 100, parents=("fc",), act_fn="identity", clamped=True, release=True),
+        # --- INPUT ---
+        NodeSpec(
+            "image",
+            "input",
+            (3, 32, 32),
+            clamped=True,
+            release=False,
+            bu_act_fn="identity",
+        ),
+        # --- STAGE 1: (64 channels, 32x32) ---
+        NodeSpec(
+            "conv1",
+            "pcn_conv",
+            (64, 32, 32),
+            parents=("image",),
+            td_act_fn="gelu",
+            options={"td_stride": 1, "bu_stride": 2, "bu_output_padding": 1},
+        ),
+        # --- STAGE 2: Downsample to (128 channels, 16x16) ---
+        NodeSpec(
+            "conv2",
+            "pcn_conv",
+            (128, 16, 16),
+            parents=("conv1",),
+            td_act_fn="gelu",
+            options={"td_stride": 2, "bu_stride": 2, "bu_output_padding": 1},
+        ),
+        # --- STAGE 3: Downsample to (256 channels, 8x8) ---
+        NodeSpec(
+            "conv3",
+            "pcn_conv",
+            (256, 8, 8),
+            parents=("conv2",),
+            td_act_fn="gelu",
+            options={"td_stride": 2, "bu_stride": 1},
+        ),
+        # --- DENSE TAIL ---
+        NodeSpec("fc", "pcn", 1024, parents=("conv3",), td_act_fn="tanh",),
+        NodeSpec(
+            "label",
+            "pcn",
+            100,
+            parents=("fc",),
+            td_act_fn="identity",
+            clamped=True,
+            release=False,
+            energy="meta_ce"
+        ),
     ),
-    bidirectional=True,
+    bidirectional=False,
     td_precision=1.0,
-    bu_precision=1.0#1e-3,
+    bu_precision=1.0,
+    energy="meta",
+    weight_norm="variance",
 )
 model = GraphModel(config, key=model_key)
+
+
+RETURN_LAYERWISE = False
+
+# CHANGED: learning rates. The conv graph is far more sensitive to these than the dense PcnModel was. Measured on
+# CIFAR-100 with this graph: param lr 1e-3 collapsed the feedforward net to chance in every run (with activity lr 0.01
+# or 0.001); param lr 1e-4 trained, and lowering the activity lr to 0.001 as well gave the best result (~16.6% test
+# after 10 epochs, still rising). Tune these first if you change the architecture.
+ACTIVITY_LR = 0.2
+#activity_optim = grouped_optimiser(config, optax.sgd, ACTIVITY_LR, {"kind:pcn_conv": 0.1})
+#param_optim = optax.adam(learning_rate=0.001)
+activity_optim = optax.sgd(learning_rate=ACTIVITY_LR)
+PARAM_LR = 0.0003
+param_optim = grouped_optimiser(config, optax.adamw, PARAM_LR, {"kind:pcn": 0.3})
+# param_optim = optax.adam(learning_rate=0.0001)
+
+train_step = make_train_step(
+    param_optim=param_optim,
+    activity_optim=activity_optim,
+    n_infer_steps=20,
+)
+
+eval_step = make_eval_step(activity_optim=activity_optim, n_infer_steps=20)
+
 
 print(
     f"{'Epoch':<6} | {'Tr Energy (Bef/Aft)':<22} | {'Tr Acc (Bef/Aft)':<18} |"
@@ -244,6 +317,8 @@ print(
 print("-" * 72)
 
 param_opt_state = param_optim.init(eqx.filter(model, eqx.is_array))
+
+diagnose(model, "step 0 (untrained)")
 
 for epoch in range(num_epochs):
     # Shuffle training set every epoch
@@ -297,6 +372,9 @@ for epoch in range(num_epochs):
         f" {test_metrics['acc_after']*100:5.1f}%"
     )
 
+    if epoch == 0:
+        diagnose(model, "after epoch 1")
+
 # Save test samples with class labels as PNG image
 save_eval_samples(
     model,
@@ -331,4 +409,4 @@ def save_generated_samples(model, fine_names=None, n=10, n_steps=100, filename="
     print(f"Generated-from-label samples saved to '{filename}'")
 
 
-save_generated_samples(model, fine_names=fine_names)
+# save_generated_samples(model, fine_names=fine_names)

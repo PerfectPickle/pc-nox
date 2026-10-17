@@ -38,8 +38,11 @@ Extension points (each is one place, on purpose):
 
   * a new node kind        -> `builders.register_node`
   * a new energy           -> `energies.ENERGY_REGISTRY`; energies that need
-                              a per-settle frozen context (Meta-PCN) get it
-                              via the `frozen` argument in `_node_energies`
+                              a per-settle frozen context (Meta-PCN) declare an
+                              `init_frozen` hook; `frozen_context` builds it once
+                              per settle and `_node_energies` hands it to them
+  * weight normalisation   -> `weight_norm.py`, switched on by the config's
+                              `weight_norm`; runs via `postprocess_params`
   * eligibility traces     -> not implemented yet; they need a
                               `trace_inputs` hook on recurrent nodes and a
                               loop over `supports_trace` nodes in a
@@ -68,6 +71,7 @@ from .config import GraphModelConfig, NodeSpec
 from .energies import ENERGY_REGISTRY
 from .nodes.base import NodeBase, NodeInputs, NodePrediction, WeightEntry
 from .validation import validate_pairings
+from .weight_norm import normalise_weights, tag_in_scope
 
 States = Dict[str, Array]
 
@@ -103,10 +107,7 @@ def _check_observation(config: GraphModelConfig, observation: Optional[Mapping[s
 
 def select_weights(entries: Sequence[WeightEntry], scope: str) -> List[Array]:
     """2-D weight matrices whose tag matches `scope` ('all' | 'rec' | 'ff')."""
-    return [
-        e.matrix for e in entries
-        if scope == "all" or (scope == "rec" and e.tag == "rec") or (scope == "ff" and e.tag != "rec")
-    ]
+    return [e.matrix for e in entries if tag_in_scope(e.tag, scope)]
 
 
 def _scopes_overlap(a: str, b: str) -> bool:
@@ -294,16 +295,61 @@ class GraphModel(eqx.Module, ModelBase):
     # Energy
     # ------------------------------------------------------------------ #
 
+    def frozen_context(
+        self,
+        states_prev: States,
+        states_ref: States,
+        observation: Optional[Mapping[str, Array]],
+        control_input: Optional[Array] = None,
+        learning: bool = False,
+    ) -> Dict[str, object]:
+        """Build, once per settle, the context that strategies with an
+        `init_frozen` hook (currently "meta") keep constant while states move.
+
+        Plain English: evaluate every node's predictions at a REFERENCE set of
+        states (`states_ref`, normally the initialisation sweep's output
+        $z^{(0)}$) and let each such strategy record what it needs from them
+        (for Meta-PCN: the frozen predictions $c$ and derivatives
+        $\\phi'(h^{(0)})$). Settling then differentiates energies that use
+        this fixed context w.r.t. the states only.
+
+        Args:
+            states_prev: Previous-step states (for recurrent nodes).
+            states_ref: The linearisation point, e.g. `init_activities(...)`.
+            observation: Clamped data, as everywhere.
+            control_input: External input, as everywhere.
+            learning: Build the LEARNING-mode context instead (Meta-PCN: keep
+                the predictions live in the weights and drop the coupling
+                term; used inside `param_grad`).
+
+        Returns:
+            `{node_name: context}` for every node whose energy strategy has an
+            `init_frozen` hook; empty if none does (so it is free to call
+            for a plain-PC graph).
+        """
+        hooked = [s for s in self.config.node_specs
+                  if ENERGY_REGISTRY[self.config.get(s, "energy")].init_frozen is not None]
+        if not hooked:
+            return {}
+        predictions, _ = self.predict(states_prev, states_ref, control_input, observation)
+        return {
+            s.name: ENERGY_REGISTRY[self.config.get(s, "energy")].init_frozen(
+                self.nodes[s.name], predictions[s.name], learning)
+            for s in hooked
+        }
+
     def _node_energies(
         self,
         states_prev: States,
         states_curr: States,
         observation: Optional[Mapping[str, Array]],
         control_input: Optional[Array],
+        frozen: Optional[Mapping[str, object]] = None,
     ) -> List[Array]:
         """Each node's precision-weighted energy, in canonical order. This
-        is the ONE place energy strategies are called -- the place to pass
-        a per-settle frozen context to strategies that need one (Meta-PCN)."""
+        is the ONE place energy strategies are called. `frozen` is the
+        per-settle context from `frozen_context`; it is passed to each node's
+        strategy (and required by those that declare an `init_frozen` hook)."""
         predictions, _ = self.predict(states_prev, states_curr, control_input, observation)
         curr = {**states_curr, **(observation or {})}
         energies = []
@@ -314,7 +360,13 @@ class GraphModel(eqx.Module, ModelBase):
             strategy = ENERGY_REGISTRY[self.config.get(spec, "energy")]
             # pathway weighting, td vs bu
             weights = {"td": self.config.get(spec, "td_precision"), "bu": self.config.get(spec, "bu_precision")}
-            energies.append(strategy.fn(curr[spec.name], predictions[spec.name], None, weights))
+            node_frozen = None if frozen is None else frozen.get(spec.name)
+            if strategy.init_frozen is not None and node_frozen is None:
+                raise ValueError(
+                    f"node {spec.name!r} uses energy {self.config.get(spec, 'energy')!r}, which needs a frozen "
+                    "context: pass `frozen=model.frozen_context(states_prev, states_init, observation, control_input)` "
+                    "(settle_scan and the runners already do this)")
+            energies.append(strategy.fn(curr[spec.name], predictions[spec.name], node_frozen, weights))
         return energies
 
     def _weight_reg_by_node(self) -> Array:
@@ -350,9 +402,13 @@ class GraphModel(eqx.Module, ModelBase):
         control_input: Optional[Array] = None,
         weight_reg_total: Optional[Array] = None,
         return_layerwise: bool = False,
+        frozen: Optional[Mapping[str, object]] = None,
     ) -> Array:
         """Total free energy: every node's precision-weighted energy, plus
         weight and activity regularisation.
+
+        `frozen`: per-settle context from `frozen_context`; only needed if some
+        node's energy has an `init_frozen` hook (Meta-PCN), else leave None.
 
         `weight_reg_total`: a precomputed weight-regularisation scalar, for
         callers doing repeated inference steps (weights cannot change while
@@ -363,7 +419,7 @@ class GraphModel(eqx.Module, ModelBase):
         plus its own regularisation; its sum equals the scalar result. An
         unobserved clamped node contributes 0 to its entry's energy term.
         """
-        node_energies = jnp.stack(self._node_energies(states_prev, states_curr, observation, control_input))
+        node_energies = jnp.stack(self._node_energies(states_prev, states_curr, observation, control_input, frozen))
         activity = self._activity_reg_by_node(states_curr)
         if return_layerwise:
             return node_energies + self._weight_reg_by_node() + activity
@@ -375,13 +431,16 @@ class GraphModel(eqx.Module, ModelBase):
     # Inference
     # ------------------------------------------------------------------ #
 
-    def _energy_closures(self, states_prev, observation, control_input):
+    def _energy_closures(self, states_prev, observation, control_input, frozen=None):
         """(energy(s), layerwise_energy(s)) closed over one trajectory, with
-        the weight regularisation computed once and frozen."""
+        the weight regularisation computed once and frozen, and the per-settle
+        `frozen` context (if any) closed over so it is constant while the
+        states move."""
         weight_reg_total = jnp.sum(self._weight_reg_by_node())
         energy = lambda s: self.energy_fn(
-            states_prev, s, observation, control_input, weight_reg_total=weight_reg_total)
-        layerwise = lambda s: self.energy_fn(states_prev, s, observation, control_input, return_layerwise=True)
+            states_prev, s, observation, control_input, weight_reg_total=weight_reg_total, frozen=frozen)
+        layerwise = lambda s: self.energy_fn(
+            states_prev, s, observation, control_input, return_layerwise=True, frozen=frozen)
         return energy, layerwise
 
     def make_activity_step(
@@ -390,10 +449,11 @@ class GraphModel(eqx.Module, ModelBase):
         states_prev: States,
         observation: Mapping[str, Array],
         control_input: Optional[Array] = None,
+        frozen: Optional[Mapping[str, object]] = None,
     ):
         """A scan body running ONE inference update. carry:
         `(states_curr, activity_opt_state)`; output: `states_curr`."""
-        energy, _ = self._energy_closures(states_prev, observation, control_input)
+        energy, _ = self._energy_closures(states_prev, observation, control_input, frozen)
 
         def activity_step(carry, _):
             states_curr, opt_state = carry
@@ -413,22 +473,31 @@ class GraphModel(eqx.Module, ModelBase):
         n_steps: int = 20,
         return_layerwise: bool = False,
         init_direction: Optional[str] = None,
+        states_init: Optional[States] = None,
     ):
         """Feedforward init, then `n_steps` of optax-driven relaxation as one
         `jax.lax.scan`. With `return_layerwise`, also returns the
-        `(n_steps, n_nodes)` layerwise energy trace."""
-        states_curr0 = self.init_activities(states_prev, control_input, observation, init_direction)
+        `(n_steps, n_nodes)` layerwise energy trace.
+
+        If any node's energy needs a frozen context (Meta-PCN), it is built
+        here ONCE from the initialisation states (the linearisation point
+        $z^{(0)}$) and held constant for all `n_steps`. `states_init` lets a
+        caller that already ran the init sweep pass it in to avoid repeating it."""
+        states_curr0 = states_init if states_init is not None else self.init_activities(
+            states_prev, control_input, observation, init_direction)
+        frozen = self.frozen_context(states_prev, states_curr0, observation, control_input)
         opt_state0 = activity_optim.init(states_curr0)
-        step = self.make_activity_step(activity_optim, states_prev, observation, control_input)
+        step = self.make_activity_step(activity_optim, states_prev, observation, control_input, frozen)
         (states_curr, _), states_hist = jax.lax.scan(step, (states_curr0, opt_state0), xs=None, length=n_steps)
         if not return_layerwise:
             return states_curr
-        _, layerwise = self._energy_closures(states_prev, observation, control_input)
+        _, layerwise = self._energy_closures(states_prev, observation, control_input, frozen)
         return states_curr, jax.vmap(layerwise)(states_hist)
 
-    def make_vector_field(self, states_prev: States, observation: Mapping[str, Array], control_input: Optional[Array] = None):
+    def make_vector_field(self, states_prev: States, observation: Mapping[str, Array], control_input: Optional[Array] = None,
+                          frozen: Optional[Mapping[str, object]] = None):
         """The ODE vector field `ds/dt = -dE/ds` for one trajectory."""
-        energy, _ = self._energy_closures(states_prev, observation, control_input)
+        energy, _ = self._energy_closures(states_prev, observation, control_input, frozen)
 
         def vector_field(t, states_curr, args):
             return jax.tree_util.tree_map(jnp.negative, jax.grad(energy)(states_curr))
@@ -444,10 +513,11 @@ class GraphModel(eqx.Module, ModelBase):
         criterion: str = "rms",
         rtol: Optional[float] = None,
         atol: Optional[float] = None,
+        frozen: Optional[Mapping[str, object]] = None,
     ) -> diffrax.Event:
         """Adapter over `ode_settling.make_steady_state_event`."""
-        vector_field = self.make_vector_field(states_prev, observation, control_input)
-        energy, _ = self._energy_closures(states_prev, observation, control_input)
+        vector_field = self.make_vector_field(states_prev, observation, control_input, frozen)
+        energy, _ = self._energy_closures(states_prev, observation, control_input, frozen)
         return ode_settling.make_steady_state_event(
             vector_field, tol=tol, criterion=criterion, rtol=rtol, atol=atol, energy_fn=energy)
 
@@ -470,10 +540,12 @@ class GraphModel(eqx.Module, ModelBase):
     ) -> Union[States, Tuple[States, Array, Array]]:
         """Adapter over `ode_settling.settle_diffrax` (see its docstring for
         modes and returns)."""
-        energy, layerwise = self._energy_closures(states_prev, observation, control_input)
+        states_init = self.init_activities(states_prev, control_input, observation, init_direction)
+        frozen = self.frozen_context(states_prev, states_init, observation, control_input)   # Meta-PCN etc.; {} otherwise
+        energy, layerwise = self._energy_closures(states_prev, observation, control_input, frozen)
         return ode_settling.settle_diffrax(
-            self.make_vector_field(states_prev, observation, control_input),
-            self.init_activities(states_prev, control_input, observation, init_direction),
+            self.make_vector_field(states_prev, observation, control_input, frozen),
+            states_init,
             energy_fn=energy, layerwise_energy_fn=layerwise,
             max_t1=max_t1, dt0=dt0, n_save=n_save, solver=solver, stepsize_controller=stepsize_controller,
             steady_state_tol=steady_state_tol, steady_state_criterion=steady_state_criterion,
@@ -491,16 +563,39 @@ class GraphModel(eqx.Module, ModelBase):
         states_curr: States,
         observation: Mapping[str, Array],
         control_input: Optional[Array] = None,
+        states_init: Optional[States] = None,
     ) -> PyTree:
         """dE/d(weights) at the settled states. `eqx.filter_grad` ignores
-        the static, non-array node metadata."""
-        energy_of_weights = lambda m: m.energy_fn(states_prev, states_curr, observation, control_input)
+        the static, non-array node metadata.
+
+        `states_init`: the initialisation states $z^{(0)}$ that settling started
+        from. Only needed when some node's energy has a frozen context
+        (Meta-PCN): its learning rule is plain PC against the frozen forward
+        pass, $\\tfrac12\\lVert z^{(T)} - f(z^{(0)};\\theta)\\rVert^2$ (paper Eq. 27),
+        so the context is rebuilt INSIDE the differentiated function, in
+        learning mode, letting the weight gradient flow through the frozen
+        prediction $c(\\theta)$."""
+        def energy_of_weights(m):
+            frozen = None
+            if states_init is not None:
+                frozen = m.frozen_context(states_prev, states_init, observation, control_input, learning=True)
+            return m.energy_fn(states_prev, states_curr, observation, control_input, frozen=frozen)
         return eqx.filter_grad(energy_of_weights)(self)
 
     def update_params(self, grads: PyTree, optim: optax.GradientTransformation, opt_state: optax.OptState):
         """Optax-driven weight update; `opt_state` is carried by the caller."""
         updates, opt_state = optim.update(grads, opt_state, self)
-        return eqx.apply_updates(self, updates), opt_state
+        return eqx.apply_updates(self, updates).postprocess_params(), opt_state
+
+    def postprocess_params(self) -> "GraphModel":
+        """Hook run after every optimiser update (see `ModelBase`).
+
+        Here: Meta-PCN's variance-based weight normalisation for every node
+        whose resolved `weight_norm` is "variance" (see `weight_norm.py`):
+        each weight matrix is divided by $(\\sqrt m + \\sqrt n)\\sigma_w$ so its
+        spectral norm stays near 1. A no-op (returns `self`) when nothing opts in.
+        """
+        return normalise_weights(self)
 
     # ------------------------------------------------------------------ #
     # ModelBase hooks (saving / loading / labelling)

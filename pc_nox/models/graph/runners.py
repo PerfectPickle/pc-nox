@@ -85,18 +85,26 @@ def _frame(model, activity_optim, n_infer_steps, return_layerwise, with_grads, i
     def per_example(states_prev, observation, control_input): # TODO, consider moving y_hat_before earlier? or separate y_hat_before init dir option
         states_curr_init = model.init_activities(states_prev, control_input, observation, before_init_dir)
         _, y_hat_before = model.predict(states_prev, states_curr_init, control_input, observation)
-        energy_before = model.energy_fn(states_prev, states_curr_init, observation, control_input)
+
+        # The states settling starts from (the linearisation point z^(0)). Energies with a frozen context
+        # (Meta-PCN) are defined relative to it, so the before/after energies and the weight gradient all
+        # use it. `frozen` is {} (and free) for plain-PC graphs.
+        states_settle_init = model.init_activities(states_prev, control_input, observation, init_direction)
+        frozen = model.frozen_context(states_prev, states_settle_init, observation, control_input)
+        energy_before = model.energy_fn(states_prev, states_curr_init, observation, control_input, frozen=frozen)
 
         settle_result = model.settle_scan(
             activity_optim, states_prev, observation, control_input,
             n_steps=n_infer_steps, return_layerwise=return_layerwise, init_direction=init_direction,
+            states_init=states_settle_init,
         )
         states_curr, energy_trace = settle_result if return_layerwise else (settle_result, None)
 
         _, y_hat_after = model.predict(states_prev, states_curr, control_input, observation)
-        energy_after = model.energy_fn(states_prev, states_curr, observation, control_input)
+        energy_after = model.energy_fn(states_prev, states_curr, observation, control_input, frozen=frozen)
 
-        grads = model.param_grad(states_prev, states_curr, observation, control_input) if with_grads else None
+        grads = (model.param_grad(states_prev, states_curr, observation, control_input, states_init=states_settle_init)
+                 if with_grads else None)
         return grads, states_curr, y_hat_before, y_hat_after, energy_before, energy_after, energy_trace
 
     return per_example

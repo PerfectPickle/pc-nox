@@ -41,6 +41,7 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 _SCOPES = ("all", "rec", "ff")
 _ACTIVITY_REG_TYPES = ("l1", "l2")
 _TRACE_MODES = ("readout", "accumulate")
+_WEIGHT_NORMS = ("none", "variance")     # see weight_norm.py
 
 
 def _freeze(v: Any) -> Any:
@@ -94,6 +95,8 @@ class NodeSpec:
             inferred state (initialised by the sweep, updated by settling)
             instead of being dropped. This is how a label is free at test
             time, or an image is generated from a label.
+        weight_norm: Per-node override of the model-wide `weight_norm`
+            ("none" | "variance"); None = inherit.
     """
     name: str
     kind: str
@@ -113,6 +116,7 @@ class NodeSpec:
     td_precision: Optional[float] = None
     bu_precision: Optional[float] = None
     release: bool = False
+    weight_norm: Optional[str] = None
 
     def __post_init__(self):
         # --- coerce JSON-round-tripped / convenient forms to canonical ones
@@ -151,6 +155,8 @@ class NodeSpec:
             v = getattr(self, f)
             if v is not None and v < 0:
                 errs.append(f"{f} must be >= 0, got {v}")
+        if self.weight_norm is not None and self.weight_norm not in _WEIGHT_NORMS:
+            errs.append(f"weight_norm={self.weight_norm!r} not in {_WEIGHT_NORMS}")
         if self.release and not self.clamped:
             errs.append("release only applies to a clamped node (an unclamped node is always inferred)")
         for k, v in self.options:
@@ -234,6 +240,13 @@ class GraphModelConfig:
             (parents before children; the paper's bottom-up amortised sweep when
             the image is the root) or "bu" (children before parents; the
             generative sweep from a clamped label). Overridable per call.
+        weight_norm: Model-wide weight normalisation applied after every
+            parameter update: "none" (default) or "variance" (Meta-PCN's
+            $W \\leftarrow W / ((\\sqrt m + \\sqrt n)\\sigma_w)$; see `weight_norm.py`).
+            A `NodeSpec` may override it. Biases are never normalised.
+        weight_norm_scope: Which weights `weight_norm` touches: "all" (default),
+            "rec" (recurrent only) or "ff" (everything else); same tags as
+            `weight_decay_scope`.
     """
     node_specs: Tuple[NodeSpec, ...]
     input_size: int = 0
@@ -251,6 +264,8 @@ class GraphModelConfig:
     td_precision: float = 1.0
     bu_precision: float = 1.0
     init_direction: str = "td"
+    weight_norm: str = "none"
+    weight_norm_scope: str = "all"
 
     def __post_init__(self):
         specs = tuple(s if isinstance(s, NodeSpec) else NodeSpec(**s) for s in self.node_specs)
@@ -265,6 +280,8 @@ class GraphModelConfig:
             ("activity_reg_type", _ACTIVITY_REG_TYPES),
             ("trace_mode", _TRACE_MODES),
             ("init_direction", ("td", "bu")),
+            ("weight_norm", _WEIGHT_NORMS),
+            ("weight_norm_scope", _SCOPES),
         ):
             if getattr(self, field) not in allowed:
                 errs.append(f"{field}={getattr(self, field)!r} not in {allowed}")
@@ -349,7 +366,7 @@ class GraphModelConfig:
     def get(self, spec: NodeSpec, field: str) -> Any:
         """A per-node setting with fallback to the model-wide default.
         Valid for: act_fn, energy, weight_decay, orthogonal_penalty,
-        activity_decay.
+        activity_decay, weight_norm.
         """
         v = getattr(spec, field)
         return getattr(self, field) if v is None else v

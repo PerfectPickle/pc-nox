@@ -99,7 +99,8 @@ def validate_pairings(
                 f"{where}: is released (free when unobserved) but its energy {energy_name!r} is a loss against data, "
                 "not a prediction error on a free state; use a squared-error energy such as 'pc'"
             )
-        if strategy.needs_pre_activations and not node.provides_pre_activations:
+        # (a pure-data node with no prediction paths, e.g. InputNode, has nothing to score, so cannot "need" them)
+        if strategy.needs_pre_activations and keys and not node.provides_pre_activations:
             errors.append(f"{where}: energy needs pre-activations but the node does not provide them")
 
     if config.input_size > 0 and not any(n.needs_control_input for n in nodes.values()):

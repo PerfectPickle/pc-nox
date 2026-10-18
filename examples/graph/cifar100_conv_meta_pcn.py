@@ -6,11 +6,52 @@ import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import numpy as np
 import optax
+import dataclasses
 
 # CHANGED: GraphModel + the combined batch/time runners instead of PcnModel + runners_static.
 # (Adjust the package path to wherever you placed the graph package.)
 from pc_nox.models.graph import GraphModel, GraphModelConfig, NodeSpec
 from pc_nox.models.graph.runners import make_eval_step, make_train_step
+from pc_nox.models.graph.optim_utils import grouped_optimiser
+
+from pc_nox.models.graph.runners import zero_states  
+
+
+
+def td_only(model):
+    # same weights, but the config zeroes every bottom-up energy term
+    return eqx.tree_at(lambda m: m.nodes, _template, model.nodes)
+
+def diagnose(model, tag, n=64):
+    rms = lambda a: float(jnp.sqrt(jnp.mean(a ** 2)))
+    xs, ys = X_test[:n], Y_test[:n]
+    obs = {"image": xs, "label": ys}                   # label clamped, so settling has a driver
+
+    # the starting point z0 (the feed-forward sweep)
+    s0 = jax.vmap(lambda sp, o: model.init_activities(sp, None, o))(zero_states(model, n), obs)
+    # the settled states, plus the feed-forward logits and energies
+    sT, y_before, _, e_before, e_after, _ = eval_step(model, obs)
+
+    print(f"--- {tag} ---")
+    for k in sT:
+        print(f"{k:7s} z0 rms {rms(s0[k]):8.4f} | settled move {rms(sT[k] - s0[k]):8.4f}")
+    print(f"logit std {float(y_before['label'].std()):.4f} | "
+          f"energy_before {float(jnp.mean(e_before)):.3f} (CE at init ~ ln 100 = 4.6)")
+
+    for name in ("conv1", "conv2", "conv3", "conv4", "fc", "label"):
+        w = model.nodes[name].op_td.weight
+        print(f"{name:6s} mean/std = {float(w.mean() / w.std()):+.3f}")
+
+
+
+def augment(key, x):                                   # x: (B, 3, 32, 32), already standardised
+    k1, k2 = jax.random.split(key)
+    flip = jax.random.bernoulli(k1, 0.5, (x.shape[0], 1, 1, 1))
+    x = jnp.where(flip, x[..., ::-1], x)
+    xp = jnp.pad(x, ((0, 0), (0, 0), (4, 4), (4, 4)), mode="reflect")
+    off = jax.random.randint(k2, (x.shape[0], 2), 0, 9)
+    crop = lambda img, o: jax.lax.dynamic_slice(img, (0, o[0], o[1]), (3, 32, 32))
+    return jax.vmap(crop)(xp, off)
 
 
 # =====================================================================
@@ -32,11 +73,14 @@ def save_eval_samples(
     xs_batch = X_test[:num_samples]
     ys_batch = Y_test[:num_samples]
 
-    # CHANGED: only the image is observed at test time; the label node is omitted and
-    # is read out as the network's PREDICTION.
-    _, _, y_hat_after, _, _, _ = eval_step(model, {"image": xs_batch}, return_layerwise=False)
+    # CHANGED: only the image is observed at test time. The label node is `release`d, so omitting it makes it a
+    # free state that settles together with the hidden nodes; its settled activity is the classification.
+    #states_curr, _, _, _, _, _ = eval_step(model, {"image": xs_batch}, return_layerwise=False)
+    # In save_eval_samples():
+    _, _, y_hat_after, _, _, _ = eval_step(td_only(model), {"image": xs_batch}, return_layerwise=False)
 
-    preds = np.array(jnp.argmax(y_hat_after["label"], axis=-1))
+    preds = np.array(jnp.argmax(y_hat_after["label"], axis=-1))  # Changed from states_curr["label"]
+
     trues = np.array(jnp.argmax(ys_batch, axis=-1))
 
     # CHANGED: images are (N, 3, 32, 32) channels-first now; matplotlib wants (32, 32, 3)
@@ -124,27 +168,18 @@ X_test = jnp.transpose(jnp.array(test_images, dtype=jnp.float32) / 255.0, (0, 3,
 Y_train = jax.nn.one_hot(jnp.array(train_fine_labels), num_classes=100)
 Y_test = jax.nn.one_hot(jnp.array(test_fine_labels), num_classes=100)
 
+# standardise
+mean = X_train.mean(axis=(0, 2, 3), keepdims=True)    # (1, 3, 1, 1), per channel
+std  = X_train.std(axis=(0, 2, 3), keepdims=True)
+X_train = (X_train - mean) / std
+X_test  = (X_test  - mean) / std
+
+
+
 
 # =====================================================================
 # 4. Instantiate Runner Functions
 # =====================================================================
-RETURN_LAYERWISE = False
-
-# CHANGED: learning rates. The conv graph is far more sensitive to these than the dense PcnModel was. Measured on
-# CIFAR-100 with this graph: param lr 1e-3 collapsed the feedforward net to chance in every run (with activity lr 0.01
-# or 0.001); param lr 1e-4 trained, and lowering the activity lr to 0.001 as well gave the best result (~16.6% test
-# after 10 epochs, still rising). Tune these first if you change the architecture.
-activity_optim = optax.adam(learning_rate=0.001)
-param_optim = optax.adam(learning_rate=1e-4)
-
-train_step = make_train_step(
-    param_optim=param_optim,
-    activity_optim=activity_optim,
-    n_infer_steps=20,
-)
-
-eval_step = make_eval_step(activity_optim=activity_optim, n_infer_steps=20)
-
 
 def compute_accuracy(y_hat: jnp.ndarray, y_true: jnp.ndarray) -> jnp.ndarray:
     preds = jnp.argmax(y_hat, axis=-1)
@@ -157,6 +192,7 @@ def compute_accuracy(y_hat: jnp.ndarray, y_true: jnp.ndarray) -> jnp.ndarray:
 # =====================================================================
 def run_evaluation(model, X_test, Y_test, batch_size=64):
     """Evaluates model across the entire test set in mini-batches."""
+    eval_model = td_only(model) 
     num_test_batches = len(X_test) // batch_size
 
     total_energy_before = 0.0
@@ -175,7 +211,7 @@ def run_evaluation(model, X_test, Y_test, batch_size=64):
             energy_before,
             energy_after,
             energy_trace,
-        ) = eval_step(model, {"image": xs_batch}, return_layerwise=RETURN_LAYERWISE)   # CHANGED: label omitted
+        ) = eval_step(eval_model, {"image": xs_batch}, return_layerwise=RETURN_LAYERWISE)   # CHANGED: label omitted
 
         total_energy_before += jnp.mean(energy_before)
         total_energy_after += jnp.mean(energy_after)
@@ -195,30 +231,126 @@ def run_evaluation(model, X_test, Y_test, batch_size=64):
 # =====================================================================
 batch_size = 64
 num_batches = len(X_train) // batch_size
-num_epochs = 20
+num_epochs = 10
 
 key = jax.random.PRNGKey(42)
 rng_key, model_key = jax.random.split(key)
 
-# CHANGED: a graph instead of a layer-size list -- the classic supervised PCN, in a straight line:
+# CHANGED: BIDIRECTIONAL PREDICTIVE CODING (Oliviers, Tang & Bogacz, ICLR 2026) -- the bidirectional twin of
+# cifar100_conv_pcn.py. Same straight line, data, and optimisers; every node that has children also predicts itself
+# from them:
 #
-#   image (clamped input) -> c1 -> c2 -> fc -> label (clamped in training, FREE at test)
+#   image <-> c1 <-> c2 <-> fc <-> label
 #
-# Predictions flow down from the image, so each conv node maps a larger map to a smaller one and the node picks a
-# strided Conv2d for it ("auto" mode: a transposed conv can only upsample). `fc` is dense; it receives c2 flattened.
-# In training both ends are clamped and the hidden nodes settle between them. At test time only the image is clamped:
-# with no label error, nothing pushes the hidden states away from their feedforward values, so "Bef" and "Aft" test
-# accuracy match -- exactly as in the original PcnModel.
+# Vocabulary, because it trips everyone up: in this graph the image is the ROOT, so a node's `td` prediction (from its
+# parent) is the paper's DISCRIMINATIVE direction (image -> label, weights V) and its `bu` prediction (from its child) is
+# the paper's GENERATIVE direction (label -> image, weights W). The paper's "bottom-up amortised initialisation sweep"
+# is therefore our default `td` sweep.
+#
+#   * `bidirectional=True` (model-wide): every node WITH CHILDREN gets a bu path. The image is a data root, so it
+#     gets a bu-ONLY conv node (the paper's generative term on x1); the label is a leaf, so it stays td-only.
+#   * `release=True` on image and label: when omitted from `observation` they become free states. Classification =
+#     image observed, label free; generation = label observed, image free.
+#   * td_precision / bu_precision are the paper's alpha_disc / alpha_gen. The paper finds the generative weight must be
+#     MUCH smaller than the discriminative one (1e-3 .. 1e-8): top-down errors are orders of magnitude larger, and with
+#     equal weights they swamp the classification signal. 1e-3 is a starting point, not a tuned value.
+#   * The label uses squared error against the one-hot vector (the paper's energy), not cross-entropy.
 config = GraphModelConfig(
     node_specs=(
-        NodeSpec("image", "input", (3, 32, 32), clamped=True),
-        NodeSpec("c1", "pcn_conv", (32, 16, 16), parents=("image",), act_fn="tanh"),   # k3 s2 p1: 32 -> 16
-        NodeSpec("c2", "pcn_conv", (64, 8, 8), parents=("c1",), act_fn="tanh"),        #            16 -> 8
-        NodeSpec("fc", "pcn", 512, parents=("c2",), act_fn="tanh"),
-        NodeSpec("label", "pcn", 100, parents=("fc",), act_fn="identity", energy="ce", clamped=True),
+        # --- INPUT ---
+        NodeSpec(
+            "image",
+            "input",
+            (3, 32, 32),
+            clamped=True,
+            release=False,
+            bu_act_fn="identity",
+        ),
+        # --- STAGE 1: (64 channels, 32x32) ---
+        NodeSpec(
+            "conv1",
+            "pcn_conv",
+            (64, 32, 32),
+            parents=("image",),
+            td_act_fn="gelu",
+            options={"td_stride": 1},
+        ),
+        # --- STAGE 2: Downsample to (128 channels, 16x16) ---
+        NodeSpec(
+            "conv2",
+            "pcn_conv",
+            (128, 16, 16),
+            parents=("conv1",),
+            td_act_fn="gelu",
+            options={"td_stride": 2},
+        ),
+        # --- STAGE 3: Downsample to (256 channels, 8x8) ---
+        NodeSpec(
+            "conv3",
+            "pcn_conv",
+            (256, 8, 8),
+            parents=("conv2",),
+            td_act_fn="gelu",
+            options={"td_stride": 2,},
+        ),
+        NodeSpec(
+            "conv4", 
+            "pcn_conv", 
+            (256, 4, 4), 
+            parents=("conv3",), 
+            td_act_fn="gelu",
+            options={"td_stride": 2,}),
+        # --- DENSE TAIL ---
+        NodeSpec(
+            "fc", 
+            "pcn", 
+            2048, 
+            parents=("conv4",), 
+            td_act_fn="gelu",),
+        NodeSpec(
+            "label",
+            "pcn",
+            100,
+            parents=("fc",),
+            td_act_fn="identity",
+            clamped=True,
+            release=False,
+            energy="meta_ce"
+        ),
     ),
+    bidirectional=False,
+    td_precision=1.0,
+    bu_precision=0.01,
+    energy="meta",
+    weight_norm="variance",
 )
 model = GraphModel(config, key=model_key)
+
+td_only_config = dataclasses.replace(config, bu_precision=0.0)   # your specs set no per-node bu_precision
+_template = GraphModel(td_only_config, key=jax.random.PRNGKey(0))
+
+RETURN_LAYERWISE = False
+
+# CHANGED: learning rates. The conv graph is far more sensitive to these than the dense PcnModel was. Measured on
+# CIFAR-100 with this graph: param lr 1e-3 collapsed the feedforward net to chance in every run (with activity lr 0.01
+# or 0.001); param lr 1e-4 trained, and lowering the activity lr to 0.001 as well gave the best result (~16.6% test
+# after 10 epochs, still rising). Tune these first if you change the architecture.
+ACTIVITY_LR = 0.2
+#activity_optim = grouped_optimiser(config, optax.sgd, ACTIVITY_LR, {"kind:pcn_conv": 0.1})
+#param_optim = optax.adam(learning_rate=0.001)
+activity_optim = optax.sgd(learning_rate=ACTIVITY_LR)
+PARAM_LR = 0.0003
+param_optim = grouped_optimiser(config, optax.adamw, PARAM_LR, {"kind:pcn": 0.3})
+# param_optim = optax.adam(learning_rate=0.0001)
+
+train_step = make_train_step(
+    param_optim=param_optim,
+    activity_optim=activity_optim,
+    n_infer_steps=20,
+)
+
+eval_step = make_eval_step(activity_optim=activity_optim, n_infer_steps=20)
+
 
 print(
     f"{'Epoch':<6} | {'Tr Energy (Bef/Aft)':<22} | {'Tr Acc (Bef/Aft)':<18} |"
@@ -227,6 +359,8 @@ print(
 print("-" * 72)
 
 param_opt_state = param_optim.init(eqx.filter(model, eqx.is_array))
+
+diagnose(model, "step 0 (untrained)")
 
 for epoch in range(num_epochs):
     # Shuffle training set every epoch
@@ -242,6 +376,8 @@ for epoch in range(num_epochs):
 
     for i in range(num_batches):
         xs_batch = X_train_shuffled[i * batch_size : (i + 1) * batch_size]
+        rng_key, aug_key = jax.random.split(rng_key)
+        xs_batch = augment(aug_key, xs_batch)
         ys_batch = Y_train_shuffled[i * batch_size : (i + 1) * batch_size]
 
         (
@@ -280,6 +416,9 @@ for epoch in range(num_epochs):
         f" {test_metrics['acc_after']*100:5.1f}%"
     )
 
+    if epoch == 0:
+        diagnose(model, "after epoch 1")
+
 # Save test samples with class labels as PNG image
 save_eval_samples(
     model,
@@ -291,4 +430,27 @@ save_eval_samples(
     filename="eval_samples_cifar100.png",
 )
 
-model.save_checkpoint(opt_state=opt_state)
+
+# CHANGED: the reverse query. Clamp ONLY the label; the image is released, initialised by the generative (bu) sweep
+# from the label up, then settled. More inference steps than in training, as in the paper.
+def save_generated_samples(model, fine_names=None, n=10, n_steps=100, filename="generated_from_label_cifar100.png"):
+    gen_step = make_eval_step(activity_optim=activity_optim, n_infer_steps=n_steps)
+    onehots = jax.nn.one_hot(jnp.arange(n), 100)
+    states_curr, *_ = gen_step(model, {"label": onehots}, init_direction="bu")
+    images = np.clip(np.array(states_curr["image"]).transpose(0, 2, 3, 1), 0.0, 1.0)
+
+    cols = 5
+    rows = int(np.ceil(n / cols))
+    fig, axes = plt.subplots(rows, cols, figsize=(3 * cols, 3 * rows))
+    for i, ax in enumerate(np.array(axes).flatten()):
+        ax.axis("off")
+        if i < n:
+            ax.imshow(images[i])
+            ax.set_title(fine_names[i] if fine_names else f"class {i}", fontsize=10)
+    plt.tight_layout()
+    plt.savefig(filename, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"Generated-from-label samples saved to '{filename}'")
+
+
+# save_generated_samples(model, fine_names=fine_names)

@@ -207,7 +207,7 @@ class GraphModel(eqx.Module, ModelBase):
             for c in _children_of(self.config)[spec.name]:
                 if c in curr:
                     kids.append(curr[c])
-                elif zero_fill == "children":
+                elif zero_fill == "children" or self.config.spec(c).clamped:
                     kids.append(jnp.zeros(self.config.spec(c).shape))
                 else:
                     raise KeyError(f"node {spec.name!r} needs the current state of child {c!r}, which was not provided")
@@ -360,6 +360,7 @@ class GraphModel(eqx.Module, ModelBase):
             strategy = ENERGY_REGISTRY[self.config.get(spec, "energy")]
             # pathway weighting, td vs bu
             weights = {"td": self.config.get(spec, "td_precision"), "bu": self.config.get(spec, "bu_precision")}
+
             node_frozen = None if frozen is None else frozen.get(spec.name)
             if strategy.init_frozen is not None and node_frozen is None:
                 raise ValueError(

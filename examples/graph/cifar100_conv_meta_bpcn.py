@@ -6,6 +6,7 @@ import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import numpy as np
 import optax
+import dataclasses
 
 # CHANGED: GraphModel + the combined batch/time runners instead of PcnModel + runners_static.
 # (Adjust the package path to wherever you placed the graph package.)
@@ -14,6 +15,12 @@ from pc_nox.models.graph.runners import make_eval_step, make_train_step
 from pc_nox.models.graph.optim_utils import grouped_optimiser
 
 from pc_nox.models.graph.runners import zero_states  
+
+
+
+def td_only(model):
+    # same weights, but the config zeroes every bottom-up energy term
+    return eqx.tree_at(lambda m: m.nodes, _template, model.nodes)
 
 def diagnose(model, tag, n=64):
     rms = lambda a: float(jnp.sqrt(jnp.mean(a ** 2)))
@@ -31,9 +38,21 @@ def diagnose(model, tag, n=64):
     print(f"logit std {float(y_before['label'].std()):.4f} | "
           f"energy_before {float(jnp.mean(e_before)):.3f} (CE at init ~ ln 100 = 4.6)")
 
-    for name in ("conv1", "conv2", "conv3", "fc", "label"):
+    for name in ("conv1", "conv2", "conv3", "conv4", "fc", "label"):
         w = model.nodes[name].op_td.weight
         print(f"{name:6s} mean/std = {float(w.mean() / w.std()):+.3f}")
+
+
+
+def augment(key, x):                                   # x: (B, 3, 32, 32), already standardised
+    k1, k2 = jax.random.split(key)
+    flip = jax.random.bernoulli(k1, 0.5, (x.shape[0], 1, 1, 1))
+    x = jnp.where(flip, x[..., ::-1], x)
+    xp = jnp.pad(x, ((0, 0), (0, 0), (4, 4), (4, 4)), mode="reflect")
+    off = jax.random.randint(k2, (x.shape[0], 2), 0, 9)
+    crop = lambda img, o: jax.lax.dynamic_slice(img, (0, o[0], o[1]), (3, 32, 32))
+    return jax.vmap(crop)(xp, off)
+
 
 # =====================================================================
 # 1. Visualization Helper (RGB Images + Class Names)
@@ -58,7 +77,7 @@ def save_eval_samples(
     # free state that settles together with the hidden nodes; its settled activity is the classification.
     #states_curr, _, _, _, _, _ = eval_step(model, {"image": xs_batch}, return_layerwise=False)
     # In save_eval_samples():
-    _, _, y_hat_after, _, _, _ = eval_step(model, {"image": xs_batch}, return_layerwise=False)
+    _, _, y_hat_after, _, _, _ = eval_step(td_only(model), {"image": xs_batch}, return_layerwise=False)
 
     preds = np.array(jnp.argmax(y_hat_after["label"], axis=-1))  # Changed from states_curr["label"]
 
@@ -149,6 +168,14 @@ X_test = jnp.transpose(jnp.array(test_images, dtype=jnp.float32) / 255.0, (0, 3,
 Y_train = jax.nn.one_hot(jnp.array(train_fine_labels), num_classes=100)
 Y_test = jax.nn.one_hot(jnp.array(test_fine_labels), num_classes=100)
 
+# standardise
+mean = X_train.mean(axis=(0, 2, 3), keepdims=True)    # (1, 3, 1, 1), per channel
+std  = X_train.std(axis=(0, 2, 3), keepdims=True)
+X_train = (X_train - mean) / std
+X_test  = (X_test  - mean) / std
+
+
+
 
 # =====================================================================
 # 4. Instantiate Runner Functions
@@ -165,6 +192,7 @@ def compute_accuracy(y_hat: jnp.ndarray, y_true: jnp.ndarray) -> jnp.ndarray:
 # =====================================================================
 def run_evaluation(model, X_test, Y_test, batch_size=64):
     """Evaluates model across the entire test set in mini-batches."""
+    eval_model = td_only(model) 
     num_test_batches = len(X_test) // batch_size
 
     total_energy_before = 0.0
@@ -183,7 +211,7 @@ def run_evaluation(model, X_test, Y_test, batch_size=64):
             energy_before,
             energy_after,
             energy_trace,
-        ) = eval_step(model, {"image": xs_batch}, return_layerwise=RETURN_LAYERWISE)   # CHANGED: label omitted
+        ) = eval_step(eval_model, {"image": xs_batch}, return_layerwise=RETURN_LAYERWISE)   # CHANGED: label omitted
 
         total_energy_before += jnp.mean(energy_before)
         total_energy_after += jnp.mean(energy_after)
@@ -237,6 +265,7 @@ config = GraphModelConfig(
             clamped=True,
             release=False,
             bu_act_fn="identity",
+            #options={"bu_stride":1},
         ),
         # --- STAGE 1: (64 channels, 32x32) ---
         NodeSpec(
@@ -263,10 +292,22 @@ config = GraphModelConfig(
             (256, 8, 8),
             parents=("conv2",),
             td_act_fn="gelu",
-            options={"td_stride": 2, "bu_stride": 1},
+            options={"td_stride": 2, "bu_stride": 2, "bu_output_padding": 1},
         ),
+        NodeSpec(
+            "conv4", 
+            "pcn_conv", 
+            (256, 4, 4), 
+            parents=("conv3",), 
+            td_act_fn="gelu",
+            options={"td_stride": 2,}),
         # --- DENSE TAIL ---
-        NodeSpec("fc", "pcn", 1024, parents=("conv3",), td_act_fn="tanh",),
+        NodeSpec(
+            "fc", 
+            "pcn", 
+            2048, 
+            parents=("conv4",), 
+            td_act_fn="gelu",),
         NodeSpec(
             "label",
             "pcn",
@@ -280,12 +321,14 @@ config = GraphModelConfig(
     ),
     bidirectional=False,
     td_precision=1.0,
-    bu_precision=1.0,
+    bu_precision=0.1,
     energy="meta",
     weight_norm="variance",
 )
 model = GraphModel(config, key=model_key)
 
+td_only_config = dataclasses.replace(config, bu_precision=0.0)   # your specs set no per-node bu_precision
+_template = GraphModel(td_only_config, key=jax.random.PRNGKey(0))
 
 RETURN_LAYERWISE = False
 
@@ -334,6 +377,8 @@ for epoch in range(num_epochs):
 
     for i in range(num_batches):
         xs_batch = X_train_shuffled[i * batch_size : (i + 1) * batch_size]
+        rng_key, aug_key = jax.random.split(rng_key)
+        xs_batch = augment(aug_key, xs_batch)
         ys_batch = Y_train_shuffled[i * batch_size : (i + 1) * batch_size]
 
         (

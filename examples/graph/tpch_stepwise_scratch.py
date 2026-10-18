@@ -105,7 +105,7 @@ def dino_encode(images_uint8, batch_size=128):
 
 
 # Number of settling iterations
-NUM_INFERENCE_STEPS = 20
+NUM_INFERENCE_STEPS = 50
 
 # example_env.mp4 has 2000 frames
 N_TRAIN_ITERS = 2000
@@ -129,7 +129,7 @@ ENV_HEIGHT = 8 # pixels
 ENV_COLOUR_CHANNELS = 1
 CONTROL_WIDTH = 8
 CONTROL_ALPHA = None#0.5
-HIDDEN_SHAPE = [8, 16, 32, 64, 128] # # width, from highest layer to lowest, including output / sensory layer
+HIDDEN_SHAPE = [128, 128, 128, 128, 128] # # width, from highest layer to lowest, including output / sensory layer
 HIDDEN_ALPHAS = None#[0.5, 0.5, 0.5, 0.45, 0.25]
 OBS_WIDTH = ENV_WIDTH * ENV_HEIGHT * ENV_COLOUR_CHANNELS
 
@@ -143,9 +143,9 @@ activity_decay = 0.00001
 activity_reg_type: str = "l1"
 
 # Not stored on model.config, so must be added to metadata to be saved
-PARAM_OPTIM_NAME = "adam"
+PARAM_OPTIM_NAME = "adamw"
 PARAM_LR = 0.001
-ACTIVITY_OPTIM_NAME = "adam"
+ACTIVITY_OPTIM_NAME = "adamw"
 ACTIVITY_LR = 0.01
 
 metadata = {
@@ -198,22 +198,22 @@ model_key, data_key = jr.split(key)
 
 config = GraphModelConfig(
     node_specs=(
-        NodeSpec("ctrl0", "tpch_control", (32,), bidirectional=True, td_precision=0.5),
-        NodeSpec("h1", "tpch_hidden", (64,), parents=("ctrl0",), bidirectional=True, td_precision=0.5),
-        NodeSpec("h2", "tpch_hidden", (128,), parents=("h1",), bidirectional=True, td_precision=0.5),
+        NodeSpec("ctrl0", "tpch_control", (256,),),
+        NodeSpec("h1", "tpch_hidden", (512,), parents=("ctrl0",)),
+        NodeSpec("h2", "tpch_hidden", (256,), parents=("h1",)),
         NodeSpec("o3", "tpch_obs", (128,), td_act_fn="identity", parents=("h2",), clamped=True),
         # NodeSpec("c4", "pcn_conv", (8, 2, 4), act_fn="tanh", parents=("o3",)),
         # NodeSpec("c5", "pcn_conv", (4, 4, 8), act_fn="tanh", parents=("c4",), options={"td_output_padding": 1}),
         # NodeSpec("image6", "pcn_conv", (1, 8, 16), act_fn="identity", parents=("c5",), clamped=True,
         #          options={"td_output_padding": 1}),
-    ),td_act_fn="elu", bu_act_fn="elu"
+    ),td_act_fn="gelu", bu_act_fn="gelu", bidirectional=False, bu_precision=1.0, energy="pc",
 )
 model = GraphModel(config, key=model_key)
 
 #param_optim = grouped_optimiser(config, optax.adam, PARAM_LR, {"kind:pcn_conv": 0.1})
-param_optim = optax.adam(learning_rate=PARAM_LR)
+param_optim = optax.adamw(learning_rate=PARAM_LR)
 param_opt_state = param_optim.init(eqx.filter(model, eqx.is_array))
-activity_optim = optax.adam(learning_rate=ACTIVITY_LR)
+activity_optim = optax.adamw(learning_rate=ACTIVITY_LR)
 
 
 # one random "previous states" tuple and one time step of data

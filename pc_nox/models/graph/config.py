@@ -105,18 +105,19 @@ class NodeSpec:
     level: Optional[int] = None
     clamped: bool = False
     bidirectional: Optional[bool] = None
-    alpha: Optional[float] = None
     energy: Optional[str] = None
     td_act_fn: Optional[str] = None
     bu_act_fn: Optional[str] = None
-    weight_decay: Optional[float] = None
-    orthogonal_penalty: Optional[float] = None
-    activity_decay: Optional[float] = None
     options: Tuple[Tuple[str, Any], ...] = ()
     td_precision: Optional[float] = None
     bu_precision: Optional[float] = None
     release: bool = False
     weight_norm: Optional[str] = None
+    highway_from: Tuple[str, ...] = ()   # clamped source nodes, who provide HEP error signal to the node
+    weight_decay: Optional[float] = None
+    orthogonal_penalty: Optional[float] = None
+    activity_decay: Optional[float] = None
+    alpha: Optional[float] = None
 
     def __post_init__(self):
         # --- coerce JSON-round-tripped / convenient forms to canonical ones
@@ -253,6 +254,15 @@ class GraphModelConfig:
     td_act_fn: str = "tanh"
     bu_act_fn: str = "tanh"
     energy: str = "pc"
+    bidirectional: bool = False
+    td_precision: float = 1.0
+    bu_precision: float = 1.0
+    init_direction: str = "td"
+    weight_norm: str = "none"
+    weight_norm_scope: str = "all"
+    highway_alpha: float = 0.0  # strength of HEP error signal
+    highway_sigma: float = 1e-3  # std of normal distribution random fixed HEP weights are initiased from
+    highway_seed: int = 0
     weight_decay: float = 0.0
     weight_decay_scope: str = "all"
     orthogonal_penalty: float = 0.0
@@ -260,12 +270,6 @@ class GraphModelConfig:
     activity_decay: float = 0.0
     activity_reg_type: str = "l1"
     trace_mode: str = "readout"
-    bidirectional: bool = False
-    td_precision: float = 1.0
-    bu_precision: float = 1.0
-    init_direction: str = "td"
-    weight_norm: str = "none"
-    weight_norm_scope: str = "all"
 
     def __post_init__(self):
         specs = tuple(s if isinstance(s, NodeSpec) else NodeSpec(**s) for s in self.node_specs)

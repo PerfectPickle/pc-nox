@@ -33,6 +33,9 @@ class TpchControlNode(NodeBase):
     op_rec: eqx.nn.Linear  # recurrent weight (from self at t-1)
     op_in: eqx.nn.Linear = None  # optional control input
     op_bu: eqx.nn.Linear = None # optional bidirectional bottom up weight
+    
+    # activity normalisation
+    activity_norms: Dict[str, eqx.Module]          # subset of {"own_prev","control_input", "children_curr"}
 
     # static=True excludes this variable from the pytree, i.e. it's python metadata, not a leaf, and will be ignored during JAX autodifferentiation
     has_input: bool = eqx.field(static=True)
@@ -52,6 +55,8 @@ class TpchControlNode(NodeBase):
         bu_act_fn: Callable = jnp.tanh,
         bidirectional: bool = False,
         alpha: Optional[float] = None,
+        activity_norm: Optional[str] = None,      # None | "rms": normalise incoming activities 
+        activity_norm_targets: Tuple[str, ...] = ("control_input", "children_curr"),
         *,
         key: PRNGKeyArray,
     ):
@@ -75,6 +80,13 @@ class TpchControlNode(NodeBase):
             if child_size is None: # NOTE, handling of child_size wrong
                 raise ValueError("A node with no child_size cannot be bidirectional")
             self.op_bu = eqx.nn.Linear(child_size[0], own_size, use_bias=True, key=k_bu)
+
+        # set up activity normalisation
+        sizes = {"own_prev": own_size, "control_input": input_size,
+             "children_curr": child_size[0] if bidirectional else None}
+        self.norms = {f: make_activity_norm(activity_norm, (n,))
+                  for f, n in sizes.items()
+                  if activity_norm and n and f in activity_norm_targets}      # absent input => no key
 
     @property
     def state_shape(self) -> Tuple[int, ...]:
@@ -135,7 +147,7 @@ class TpchControlNode(NodeBase):
             if self.alpha is None or self.alpha == 0:
                 predictions["td"] = instantaneous_td
             else:
-                predictions["td"] = (1.0 - self.alpha) * state_prev + self.alpha * instantaneous_td
+                predictions["td"] = (1.0 - self.alpha) * inp.own_prev + self.alpha * instantaneous_td
 
         if self.bidirectional:
             pre_bu = self.op_bu(inp.children_curr)
@@ -190,6 +202,9 @@ class TpchHiddenNode(NodeBase):
     op_parents_curr: eqx.nn.Linear
     op_bu: eqx.nn.Linear = None # optional bidirectional bottom up weight
 
+    # activity normalisation
+    activity_norms: Dict[str, eqx.Module]          # subset of {"own_prev","parents_prev","parents_curr","children_curr"}
+
     td_act_fn: Callable = eqx.field(static=True) # not truly td because of rec self->self weight
     bu_act_fn: Callable = eqx.field(static=True)
     own_size: int = eqx.field(static=True)
@@ -206,6 +221,8 @@ class TpchHiddenNode(NodeBase):
         bu_act_fn: Callable = jnp.tanh,
         bidirectional: bool = False,
         alpha: Optional[float] = None,
+        activity_norm: Optional[str] = None,      # None | "rms": normalise incoming activities
+        activity_norm_targets: Tuple[str, ...] = ("parents_curr", "children_curr"),  # the scope
         *,
         key: PRNGKeyArray,
     ):
@@ -226,11 +243,19 @@ class TpchHiddenNode(NodeBase):
         self.op_rec = eqx.nn.Linear(own_size, own_size, use_bias=False, key=k_rec)
         self.op_parents_prev = eqx.nn.Linear(parent_size, own_size, use_bias=False, key=k_parent_prev)
         self.op_parents_curr = eqx.nn.Linear(parent_size, own_size, use_bias=True, key=k_parent_curr)
+        self.norm_parents_curr = make_activity_norm(activity_norm, (parent_size,))
 
         if bidirectional:
             if child_size is None or child_size[0] <= 0:
                 raise ValueError("A node with no child_size cannot be bidirectional")
             self.op_bu = eqx.nn.Linear(child_size[0], own_size, use_bias=True, key=k_bu)
+
+        # set up activity normalisation
+        sizes = {"own_prev": own_size, "parents_prev": parent_size, "parents_curr": parent_size,
+             "children_curr": child_size[0] if bidirectional else None}
+        self.norms = {f: make_activity_norm(activity_norm, (n,))
+                  for f, n in sizes.items()
+                  if activity_norm and n and f in activity_norm_targets}      # absent input => no key
 
 
     @property
@@ -264,11 +289,11 @@ class TpchHiddenNode(NodeBase):
         return True
 
     # top down only
-    def pre_activation(self, state_prev: Array, parent_prev: Array, parent_curr: Array) -> Array:
+    def pre_activation(self, own_prev: Array, parent_prev: Array, parent_curr: Array) -> Array:
         """P @ z_{t-1} + Q @ s_{t-1} + R @ s_t -- see
         `TpchControlNode.pre_activation` for why this is exposed."""
         return (
-            self.op_rec(state_prev)
+            self.op_rec(own_prev)
             + self.op_parents_prev(parent_prev)
             + self.op_parents_curr(parent_curr)
         )
@@ -284,7 +309,7 @@ class TpchHiddenNode(NodeBase):
             if self.alpha is None or self.alpha == 0:
                 predictions["td"] = instantaneous_td
             else:
-                predictions["td"] = (1.0 - self.alpha) * state_prev + self.alpha * instantaneous_td
+                predictions["td"] = (1.0 - self.alpha) * inp.own_prev + self.alpha * instantaneous_td
 
         if self.bidirectional:
             pre_bu = self.op_bu(inp.children_curr)
@@ -311,9 +336,11 @@ class TpchObservationNode(NodeBase):
     `energy` ("pc" for squared error, "ce" for cross-entropy on logits).
     """
     op_parents_curr: eqx.nn.Linear
+    norm_parents_curr: Optional[eqx.Module]  # activity normalisation
 
-    def __init__(self, obs_size: int, parent_size: int, key: PRNGKeyArray):
+    def __init__(self, obs_size: int, parent_size: int, activity_norm: str = None, *, key: PRNGKeyArray):
         self.op_parents_curr = eqx.nn.Linear(parent_size, obs_size, use_bias=False, key=key)
+        self.norm_parents_curr = make_activity_norm(activity_norm, (parent_size,))
 
     @property
     def state_shape(self) -> Tuple[int, ...]:
@@ -332,7 +359,8 @@ class TpchObservationNode(NodeBase):
     def predict(self, inp: NodeInputs) -> NodePrediction:
         """y_hat_t = C @ z_t  (no activation function -- pure linear readout)"""
         self.check_inputs(inp)
-        y_hat = self.op_parents_curr(inp.parents_curr)
+        x = inp.parents_curr if self.norm_parents_curr is None else self.norm_parents_curr(inp.parents_curr)
+        y_hat = self.op_parents_curr(x)
         return NodePrediction({"td": y_hat}, {"td": y_hat})   # linear: pre-activation == prediction
 
     def weight_entries(self) -> List[WeightEntry]:

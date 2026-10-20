@@ -105,7 +105,7 @@ def dino_encode(images_uint8, batch_size=128):
 
 
 # Number of settling iterations
-NUM_INFERENCE_STEPS = 50
+NUM_INFERENCE_STEPS = 20
 
 # example_env.mp4 has 2000 frames
 N_TRAIN_ITERS = 2000
@@ -198,9 +198,9 @@ model_key, data_key = jr.split(key)
 
 config = GraphModelConfig(
     node_specs=(
-        NodeSpec("ctrl0", "tpch_control", (256,),),
-        NodeSpec("h1", "tpch_hidden", (512,), parents=("ctrl0",)),
-        NodeSpec("h2", "tpch_hidden", (256,), parents=("h1",)),
+        NodeSpec("ctrl0", "tpch_control", (16,),),
+        NodeSpec("h1", "tpch_hidden", (32,), parents=("ctrl0",)),
+        NodeSpec("h2", "tpch_hidden", (64,), parents=("h1",)),
         NodeSpec("o3", "tpch_obs", (128,), td_act_fn="identity", parents=("h2",), clamped=True),
         # NodeSpec("c4", "pcn_conv", (8, 2, 4), act_fn="tanh", parents=("o3",)),
         # NodeSpec("c5", "pcn_conv", (4, 4, 8), act_fn="tanh", parents=("c4",), options={"td_output_padding": 1}),
@@ -213,7 +213,7 @@ model = GraphModel(config, key=model_key)
 #param_optim = grouped_optimiser(config, optax.adam, PARAM_LR, {"kind:pcn_conv": 0.1})
 param_optim = optax.adamw(learning_rate=PARAM_LR)
 param_opt_state = param_optim.init(eqx.filter(model, eqx.is_array))
-activity_optim = optax.adamw(learning_rate=ACTIVITY_LR)
+activity_optim = optax.adam(learning_rate=ACTIVITY_LR)
 
 
 # one random "previous states" tuple and one time step of data
@@ -234,7 +234,7 @@ for i, frame in enumerate(frames[0:N_TRAIN_ITERS]):
     # full JIT inference and weight update for the current frame
         # full JIT inference and weight update for the current frame. Outputs carry the batch axis, so [0] picks the sequence.
     model, param_opt_state, states_curr, y_hat_before, y_hat_after, energy_before, energy_after, energy_trace = train_step(
-        model, param_opt_state, y, states_prev=states_prev, init_direction="bu", before_init_dir="td", return_layerwise=False
+        model, param_opt_state, y, states_prev=states_prev, init_direction="td", before_init_dir="td", return_layerwise=False
     )
     states_prev = states_curr                            # thread time: this frame's settled states are the next frame's "previous"
  

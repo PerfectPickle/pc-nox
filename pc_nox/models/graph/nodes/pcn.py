@@ -45,6 +45,8 @@ class PcnNode(NodeBase):
     op_td: Optional[eqx.nn.Linear]
     prior: Optional[Array]
     op_bu: Optional[eqx.nn.Linear]
+    norm_td: Optional[eqx.Module]      # activity norm; normalises parents_curr, size = combined parent width
+    norm_bu: Optional[eqx.Module]      # activity norm; normalises children_curr, size = combined child width
 
     own_size: int = eqx.field(static=True)
     bidirectional: bool = eqx.field(static=True)
@@ -60,6 +62,7 @@ class PcnNode(NodeBase):
         bu_act_fn: Callable = jnp.tanh,
         bidirectional: bool = False,
         has_prior: bool = True,
+        activity_norm: Optional[str] = None,      # None | "rms": normalise incoming activities
         *,
         key: PRNGKeyArray,
     ):
@@ -88,6 +91,10 @@ class PcnNode(NodeBase):
 
         self.op_bu = eqx.nn.Linear(child_size, own_size, use_bias=True, key=k_bu) if bidirectional else None
 
+        # the norm exists exactly when its projection exists
+        self.norm_td = make_activity_norm(activity_norm, (parent_size,)) if self.op_td is not None else None
+        self.norm_bu = make_activity_norm(activity_norm, (child_size,)) if self.op_bu is not None else None
+
     @classmethod
     def from_spec(
         cls,
@@ -105,15 +112,15 @@ class PcnNode(NodeBase):
         if len(spec.shape) != 1:
             raise ValueError(f"node {spec.name!r}: PcnNode shape must be 1-D, got {spec.shape}")
         opts = spec.opts
-        unknown = set(opts) - {"prior"}
+        unknown = set(opts) - {"prior", "activity_norm"}
         if unknown:
-            raise ValueError(f"node {spec.name!r}: PcnNode takes no options other than 'prior', got {sorted(unknown)}")
+            raise ValueError(f"node {spec.name!r}: PcnNode takes no options other than 'prior' and/or 'activity norm', got {sorted(unknown)}")
         bi = bool(spec.bidirectional)
         return cls(
             own_size=spec.shape[0],
             parent_size=parent_shape[0] if parent_shape else None,
             child_size=child_shape[0] if (bi and child_shape) else None,
-            td_act_fn=td_act_fn, bu_act_fn=bu_act_fn, bidirectional=bi, has_prior=bool(opts.get("prior", True)), key=key,
+            td_act_fn=td_act_fn, bu_act_fn=bu_act_fn, bidirectional=bi, has_prior=bool(opts.get("prior", True)), activity_norm=opts.get("activity_norm"), key=key,
         )
 
     # ------------------------------------------------------------------ #
@@ -152,13 +159,19 @@ class PcnNode(NodeBase):
         self.check_inputs(inp)
 
         predictions, pre_activations = {}, {}
-        pre_td = self.op_td(inp.parents_curr) if self.op_td is not None else self.prior
+        if self.op_td is not None:
+            x_td = inp.parents_curr if self.norm_td is None else self.norm_td(inp.parents_curr)  # apply activity normalisation if specified
+            pre_td = self.op_td(x_td)
+        else:
+            pre_td = self.prior                  # root mode: nothing to normalise
+
         if pre_td is not None:
             predictions["td"] = self.td_act_fn(pre_td)
             pre_activations["td"] = pre_td
 
         if self.bidirectional:
-            pre_bu = self.op_bu(inp.children_curr)
+            x_bu = inp.children_curr if self.norm_bu is None else self.norm_bu(inp.children_curr)  # apply activity normalisation if specified
+            pre_bu = self.op_bu(x_bu)
             predictions["bu"] = self.bu_act_fn(pre_bu)
             pre_activations["bu"] = pre_bu
 

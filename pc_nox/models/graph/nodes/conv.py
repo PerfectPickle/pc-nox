@@ -48,12 +48,14 @@ import jax.random as jr
 from jaxtyping import Array, PRNGKeyArray
 
 from .base import NodeBase, NodeInputs, NodePrediction, WeightEntry
+from .norm import make_activity_norm
 
 # Keys a NodeSpec.options dict may carry for this node (anything else is
 # rejected by `from_spec`, so typos fail loudly instead of being ignored).
 CONV_OPTION_KEYS = frozenset({
     "td_kernel_size", "td_stride", "td_padding", "td_output_padding", "td_mode",
     "bu_kernel_size", "bu_stride", "bu_padding", "bu_output_padding", "bu_mode",
+    "activity_norm",
 })
 
 
@@ -102,6 +104,8 @@ class PcnConvNode(NodeBase):
 
     op_td: Optional[Union[eqx.nn.Linear, eqx.nn.ConvTranspose2d, eqx.nn.Conv2d]]
     op_bu: Optional[Union[eqx.nn.Conv2d, eqx.nn.ConvTranspose2d, eqx.nn.Linear]]
+    norm_td: Optional[eqx.nn.Module] # activity norm; normalises parents_curr, size = combined parent width
+    norm_bu: Optional[eqx.nn.Module] # activity norm; normalises children_curr, size = combined child width
 
     own_shape: Tuple[int, int, int] = eqx.field(static=True)
     is_td_dense: bool = eqx.field(static=True)
@@ -130,6 +134,7 @@ class PcnConvNode(NodeBase):
         td_act_fn: Callable = jnp.tanh,
         bu_act_fn: Callable = jnp.tanh,
         bidirectional: bool = False,
+        activity_norm: Optional[str] = None,      # None | "rms": normalise incoming activities
         *,
         key: PRNGKeyArray,
     ):
@@ -184,6 +189,8 @@ class PcnConvNode(NodeBase):
                 )
             _check_conv_output(self.op_td, parent_shape, own_shape, "top-down")
 
+        self.norm_td = make_activity_norm(activity_norm, parent_shape) if parent_shape is not None else None
+
         # 2. CHILD PROJECTION (bottom-up)
         self.is_bu_dense = False
         self.op_bu = None
@@ -214,6 +221,7 @@ class PcnConvNode(NodeBase):
                         key=k_bu,
                     )
                 _check_conv_output(self.op_bu, child_shape, own_shape, "bottom-up")
+        self.norm_bu = make_activity_norm(activity_norm, child_shape) if self.op_bu is not None else None
 
     # ------------------------------------------------------------------ #
     # Construction from a NodeSpec (called by the builder registry)
@@ -296,12 +304,14 @@ class PcnConvNode(NodeBase):
 
         predictions, pre_activations = {}, {}
         if self.op_td is not None:
-            pre_td = self._project(self.op_td, inp.parents_curr, self.is_td_dense)
+            x_td = inp.parents_curr if self.norm_td is None else self.norm_td(inp.parents_curr)    # apply activity normalisation if specified
+            pre_td = self._project(self.op_td, x_td, self.is_td_dense)
             predictions["td"] = self.td_act_fn(pre_td)
             pre_activations["td"] = pre_td
 
         if self.bidirectional:
-            pre_bu = self._project(self.op_bu, inp.children_curr, self.is_bu_dense)
+            x_bu = inp.children_curr if self.norm_bu is None else self.norm_bu(inp.children_curr)
+            pre_bu = self._project(self.op_bu, x_bu, self.is_bu_dense)
             predictions["bu"] = self.bu_act_fn(pre_bu)
             pre_activations["bu"] = pre_bu
 

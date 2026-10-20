@@ -338,6 +338,7 @@ class GraphModel(eqx.Module, ModelBase):
             for s in hooked
         }
 
+
     def _node_energies(
         self,
         states_prev: States,
@@ -345,6 +346,7 @@ class GraphModel(eqx.Module, ModelBase):
         observation: Optional[Mapping[str, Array]],
         control_input: Optional[Array],
         frozen: Optional[Mapping[str, object]] = None,
+        highway_matrices: Optional[Mapping[Tuple[str, str], Array]] = None, 
     ) -> List[Array]:
         """Each node's precision-weighted energy, in canonical order. This
         is the ONE place energy strategies are called. `frozen` is the
@@ -353,6 +355,20 @@ class GraphModel(eqx.Module, ModelBase):
         predictions, _ = self.predict(states_prev, states_curr, control_input, observation)
         curr = {**states_curr, **(observation or {})}
         energies = []
+
+        # --- Highway Error Propagation: output errors of the observed SOURCE nodes ---
+        # Only nodes that some checkpoint lists in `highway_from` are sources. This keeps
+        # non-HEP graphs untouched and avoids calling energies that need a frozen context.
+        source_names = {src for s in self.config.node_specs for src in s.highway_from}
+        source_errors = {
+            s.name: self._output_error(
+                s, obs[s.name], predictions[s.name],
+                {"td": self.config.get(s, "td_precision"), "bu": self.config.get(s, "bu_precision")},
+            )
+            for s in self.config.clamped
+            if s.name in source_names and s.name in obs and "td" in predictions[s.name].predictions
+        }
+
         for spec in self.config.node_specs:
             if spec.clamped and spec.name not in curr:        # unobserved (missing modality): no energy term
                 energies.append(jnp.asarray(0.0))
@@ -367,8 +383,29 @@ class GraphModel(eqx.Module, ModelBase):
                     f"node {spec.name!r} uses energy {self.config.get(spec, 'energy')!r}, which needs a frozen "
                     "context: pass `frozen=model.frozen_context(states_prev, states_init, observation, control_input)` "
                     "(settle_scan and the runners already do this)")
-            energies.append(strategy.fn(curr[spec.name], predictions[spec.name], node_frozen, weights))
+            
+            # ---------------------------------------------------------------------------
+            #    per node in the loop: this node's highway term, a SCALAR.
+            #    Implements  z_i^T  V_{L->i}  sg(eps_L), summed over this node's sources.
+            # ---------------------------------------------------------------------------
+            hw = jnp.asarray(0.0)
+            if spec.name in states_curr:                      # only inferred nodes have a state to nudge
+                z = states_curr[spec.name].ravel()
+                for src in spec.highway_from:
+                    if src in source_errors:                  # observed => has an error
+                        # V @ err : matrix-vector product, shape (n_node,). This is the
+                        #           "nudge direction" delivered to the node in one hop.
+                        # vdot(z, .) : dot product of the state with that nudge -> a scalar.
+                        # Taking jax.grad of this scalar w.r.t. z gives exactly  V @ err, so
+                        # each inference step moves z by (alpha * V @ eps), i.e. Eq. 8.
+                        hw = hw + jnp.vdot(z, highway_matrices[(spec.name, src)] @ source_errors[src].ravel())
+
+            energies.append(
+                strategy.fn(curr[spec.name], predictions[spec.name], node_frozen, weights)
+                + self.config.highway_alpha * hw
+                )
         return energies
+
 
     def _weight_reg_by_node(self) -> Array:
         """Weight decay + orthogonal penalty per node (canonical order),
@@ -395,6 +432,66 @@ class GraphModel(eqx.Module, ModelBase):
                     [states_curr[spec.name]], cfg.get(spec, "activity_decay"), cfg.activity_reg_type))
         return jnp.stack(terms)
 
+    # ---------------------------------------------------------------------------
+    #    Build the fixed random highway matrices
+    #    Called ONCE per settle (in _energy_closures), not once per inference step,
+    #    because the matrices never change.
+    # ---------------------------------------------------------------------------
+    def _highway_matrices(self):
+        cfg = self.config
+        # One base PRNG key, derived from an integer seed stored in the config.
+        # Because the seed lives in the config, the same V is regenerated after a
+        # checkpoint reload. V never needs to be saved or trained.
+        base = jr.PRNGKey(cfg.highway_seed)
+
+        # Dict comprehension: one matrix for every (checkpoint node, source node) pair.
+        #   key   = (checkpoint name, source name), e.g. ("vis", "label_obs")
+        #   value = V, a random matrix of shape (n_checkpoint, n_source)
+        return {
+            (s.name, src): cfg.highway_sigma * jr.normal(          # sigma_v * N(0, 1) entries
+                # A key unique to this pair, derived from the NAMES (via crc32 in
+                # node_key), so adding or removing other nodes never changes this V.
+                node_key(base, f"{s.name}<-{src}"),
+                # Rows = number of units in the checkpoint's state.
+                # Columns = number of units in the source node's error vector.
+                # prod() flattens a shape like (C, H, W) to C*H*W, so conv states work too.
+                (prod(s.shape), prod(cfg.spec(src).shape)),
+            )
+            for s in cfg.node_specs          # every node is a potential checkpoint...
+            for src in s.highway_from        # ...for each source it lists (empty tuple = none)
+        }
+
+    # ---------------------------------------------------------------------------
+    #    The output error eps = -dE_src/d(mu_src), for ONE source node.
+    #    This is the paper's eps_L: how the source's loss would change if its
+    #    prediction moved, with the sign flipped, so it points "toward the target".
+    # ---------------------------------------------------------------------------
+    def _highway_source_error(self, spec, state, pred, weights):
+        # spec    : NodeSpec of the SOURCE node (e.g. the label node)
+        # state   : the source's observed data (e.g. the one-hot label)
+        # pred    : the source's NodePrediction (its current "td" prediction)
+        # weights : the {"td": precision, "bu": precision} dict, as in _node_energies
+
+        # Look up whichever energy this source uses ("pc", "ce", ...).
+        strat = ENERGY_REGISTRY[self.config.get(spec, "energy")]
+
+        # `strat.fn(...)` is the source's own energy: a scalar function of its prediction.
+        # We wrap it in a lambda so that jax.grad differentiates w.r.t. the PREDICTION
+        # `mu`, holding the data `state` fixed (jax.grad differentiates w.r.t. the
+        # lambda's argument, here `mu`).
+        #   for "pc": energy = 0.5*||y - mu||^2  ->  grad = mu - y
+        #   for "ce": energy = CE(y, softmax(mu)) ->  grad = softmax(mu) - y
+        g = jax.grad(
+            lambda mu: strat.fn(state, NodePrediction({"td": mu}, {}), None, weights)
+        )(pred.predictions["td"])        # evaluate that gradient at the current prediction
+
+        # Negate it to get eps (pc: y - mu; ce: y - softmax(mu)).
+        # stop_gradient freezes eps as a constant. Gradients can't flow back into the
+        # source's prediction (and so into the weights) through the highway term.
+        # This is the "sg(eps_L)" of Eq. 7: the highway is strictly one-way.
+        return jax.lax.stop_gradient(-g)
+
+
     def energy_fn(
         self,
         states_prev: States,
@@ -404,6 +501,7 @@ class GraphModel(eqx.Module, ModelBase):
         weight_reg_total: Optional[Array] = None,
         return_layerwise: bool = False,
         frozen: Optional[Mapping[str, object]] = None,
+        highway_matrices: Optional[Mapping[Tuple[str, str], Array]] = None, 
     ) -> Array:
         """Total free energy: every node's precision-weighted energy, plus
         weight and activity regularisation.
@@ -420,7 +518,9 @@ class GraphModel(eqx.Module, ModelBase):
         plus its own regularisation; its sum equals the scalar result. An
         unobserved clamped node contributes 0 to its entry's energy term.
         """
-        node_energies = jnp.stack(self._node_energies(states_prev, states_curr, observation, control_input, frozen))
+        if highway_matrices is None:
+            highway_matrices = self._highway_matrices()
+        node_energies = jnp.stack(self._node_energies(states_prev, states_curr, observation, control_input, frozen, highway_matrices))
         activity = self._activity_reg_by_node(states_curr)
         if return_layerwise:
             return node_energies + self._weight_reg_by_node() + activity
@@ -438,8 +538,9 @@ class GraphModel(eqx.Module, ModelBase):
         `frozen` context (if any) closed over so it is constant while the
         states move."""
         weight_reg_total = jnp.sum(self._weight_reg_by_node())
+        highway_matrices = self._highway_matrices()
         energy = lambda s: self.energy_fn(
-            states_prev, s, observation, control_input, weight_reg_total=weight_reg_total, frozen=frozen)
+            states_prev, s, observation, control_input, weight_reg_total=weight_reg_total, frozen=frozen, highway_matrices=highway_matrices)
         layerwise = lambda s: self.energy_fn(
             states_prev, s, observation, control_input, return_layerwise=True, frozen=frozen)
         return energy, layerwise

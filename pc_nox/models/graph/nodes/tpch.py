@@ -24,18 +24,17 @@ import jax.random as jr
 import equinox as eqx
 
 from .base import NodeBase, NodeInputs, NodePrediction, WeightEntry
-
+from .activity_norm import apply_affine, make_activity_norms
 
 class TpchControlNode(NodeBase):
     """Top node: driven by the external control input and its own previous
     state. `s_hat_t = f(op_rec s_{t-1} + op_in x_t)` (optionally leaky)."""
+    activity_norms: Dict[str, eqx.Module]          # activity normalisation targets (e.g. 'parents_curr') and Modules
 
     op_rec: eqx.nn.Linear  # recurrent weight (from self at t-1)
     op_in: eqx.nn.Linear = None  # optional control input
     op_bu: eqx.nn.Linear = None # optional bidirectional bottom up weight
     
-    # activity normalisation
-    activity_norms: Dict[str, eqx.Module]          # subset of {"own_prev","control_input", "children_curr"}
 
     # static=True excludes this variable from the pytree, i.e. it's python metadata, not a leaf, and will be ignored during JAX autodifferentiation
     has_input: bool = eqx.field(static=True)
@@ -56,7 +55,7 @@ class TpchControlNode(NodeBase):
         bidirectional: bool = False,
         alpha: Optional[float] = None,
         activity_norm: Optional[str] = None,      # None | "rms": normalise incoming activities 
-        activity_norm_targets: Tuple[str, ...] = ("control_input", "children_curr"),
+        activity_norm_inputs: Tuple[str, ...] = ("control_input", "children_curr"),
         *,
         key: PRNGKeyArray,
     ):
@@ -81,12 +80,11 @@ class TpchControlNode(NodeBase):
                 raise ValueError("A node with no child_size cannot be bidirectional")
             self.op_bu = eqx.nn.Linear(child_size[0], own_size, use_bias=True, key=k_bu)
 
-        # set up activity normalisation
-        sizes = {"own_prev": own_size, "control_input": input_size,
-             "children_curr": child_size[0] if bidirectional else None}
-        self.norms = {f: make_activity_norm(activity_norm, (n,))
-                  for f, n in sizes.items()
-                  if activity_norm and n and f in activity_norm_targets}      # absent input => no key
+        # the norm exists exactly when its projection exists
+        self.activity_norms = make_activity_norms(activity_norm, activity_norm_inputs, {
+            "own_prev":  (own_size,) if self.op_td is not None else None,
+            "children_curr": (child_size,)  if self.op_bu is not None else None,
+        })
 
     @property
     def state_shape(self) -> Tuple[int, ...]:
@@ -197,13 +195,13 @@ class TpchControlNode(NodeBase):
 class TpchHiddenNode(NodeBase):
     """Middle node: `z_hat_t = f(P z_{t-1} + Q s_{t-1} + R s_t)` where `s`
     is the (combined) parent state; optionally leaky."""
+    activity_norms: Dict[str, eqx.Module]          # activity normalisation targets (e.g. 'parents_curr') and Modules
+
     op_rec: eqx.nn.Linear  # recurrent weight (from self at t-1)
     op_parents_prev: eqx.nn.Linear # node can have multiple parents, treated as one inside the node
     op_parents_curr: eqx.nn.Linear
     op_bu: eqx.nn.Linear = None # optional bidirectional bottom up weight
 
-    # activity normalisation
-    activity_norms: Dict[str, eqx.Module]          # subset of {"own_prev","parents_prev","parents_curr","children_curr"}
 
     td_act_fn: Callable = eqx.field(static=True) # not truly td because of rec self->self weight
     bu_act_fn: Callable = eqx.field(static=True)
@@ -222,7 +220,7 @@ class TpchHiddenNode(NodeBase):
         bidirectional: bool = False,
         alpha: Optional[float] = None,
         activity_norm: Optional[str] = None,      # None | "rms": normalise incoming activities
-        activity_norm_targets: Tuple[str, ...] = ("parents_curr", "children_curr"),  # the scope
+        activity_norm_inputs: Tuple[str, ...] = ("parents_curr", "children_curr"),
         *,
         key: PRNGKeyArray,
     ):
@@ -250,12 +248,13 @@ class TpchHiddenNode(NodeBase):
                 raise ValueError("A node with no child_size cannot be bidirectional")
             self.op_bu = eqx.nn.Linear(child_size[0], own_size, use_bias=True, key=k_bu)
 
-        # set up activity normalisation
-        sizes = {"own_prev": own_size, "parents_prev": parent_size, "parents_curr": parent_size,
-             "children_curr": child_size[0] if bidirectional else None}
-        self.norms = {f: make_activity_norm(activity_norm, (n,))
-                  for f, n in sizes.items()
-                  if activity_norm and n and f in activity_norm_targets}      # absent input => no key
+        # the norm exists exactly when its projection exists
+        self.activity_norms = make_activity_norms(activity_norm, activity_norm_inputs, {
+            "parents_prev":  (parent_size,) if self.op_td is not None else None,
+            "parents_curr":  (parent_size,) if self.op_td is not None else None,
+            "own_prev":  (own_size,) if self.op_td is not None else None,
+            "children_curr": (child_size,)  if self.op_bu is not None else None,
+        })
 
 
     @property
@@ -335,12 +334,15 @@ class TpchObservationNode(NodeBase):
     (its target is observed data), with its loss chosen by the spec's
     `energy` ("pc" for squared error, "ce" for cross-entropy on logits).
     """
+    activity_norms: Dict[str, eqx.Module]          # activity normalisation targets (e.g. 'parents_curr') and Modules
     op_parents_curr: eqx.nn.Linear
-    norm_parents_curr: Optional[eqx.Module]  # activity normalisation
 
-    def __init__(self, obs_size: int, parent_size: int, activity_norm: str = None, *, key: PRNGKeyArray):
+    def __init__(self, obs_size: int, parent_size: int, activity_norm: str = None, activity_norm_inputs: Tuple[str, ...] = ("parents_curr"), *, key: PRNGKeyArray):
         self.op_parents_curr = eqx.nn.Linear(parent_size, obs_size, use_bias=False, key=key)
-        self.norm_parents_curr = make_activity_norm(activity_norm, (parent_size,))
+        # the norm exists exactly when its projection exists
+        self.activity_norms = make_activity_norms(activity_norm, activity_norm_inputs, {
+            "parents_curr":  (parent_size,) if self.op_td is not None else None,
+        })
 
     @property
     def state_shape(self) -> Tuple[int, ...]:

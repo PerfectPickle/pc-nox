@@ -114,6 +114,8 @@ class BuildContext(NamedTuple):
     td_act_fn: Callable
     bu_act_fn: Callable
     input_size: int
+    activity_norm: str
+    activity_norm_inputs: Tuple[str, ...]
     key: PRNGKeyArray
 
 
@@ -284,6 +286,8 @@ def build_nodes(config: GraphModelConfig, key: PRNGKeyArray) -> Dict[str, NodeBa
     """Build every node in canonical order. Errors are re-raised with the
     node's name and kind attached."""
     nodes: Dict[str, NodeBase] = {}
+    activity_norm=config.get(spec, "activity_norm"),
+    norm_inputs=config.activity_norm_inputs,
     for spec in config.node_specs:
         builder = get_builder(spec.kind)
         try:

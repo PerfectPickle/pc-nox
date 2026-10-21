@@ -48,14 +48,13 @@ import jax.random as jr
 from jaxtyping import Array, PRNGKeyArray
 
 from .base import NodeBase, NodeInputs, NodePrediction, WeightEntry
-from .norm import make_activity_norm
+from .activity_norm import apply_affine, make_activity_norms
 
 # Keys a NodeSpec.options dict may carry for this node (anything else is
 # rejected by `from_spec`, so typos fail loudly instead of being ignored).
 CONV_OPTION_KEYS = frozenset({
     "td_kernel_size", "td_stride", "td_padding", "td_output_padding", "td_mode",
     "bu_kernel_size", "bu_stride", "bu_padding", "bu_output_padding", "bu_mode",
-    "activity_norm",
 })
 
 
@@ -102,10 +101,10 @@ class PcnConvNode(NodeBase):
         bu_act_fn: static metadata (hashable, resolved at trace time).
     """
 
+    activity_norms: Dict[str, eqx.Module]          # activity normalisation targets (e.g. 'parents_curr') and Modules
+
     op_td: Optional[Union[eqx.nn.Linear, eqx.nn.ConvTranspose2d, eqx.nn.Conv2d]]
     op_bu: Optional[Union[eqx.nn.Conv2d, eqx.nn.ConvTranspose2d, eqx.nn.Linear]]
-    norm_td: Optional[eqx.nn.Module] # activity norm; normalises parents_curr, size = combined parent width
-    norm_bu: Optional[eqx.nn.Module] # activity norm; normalises children_curr, size = combined child width
 
     own_shape: Tuple[int, int, int] = eqx.field(static=True)
     is_td_dense: bool = eqx.field(static=True)
@@ -135,6 +134,7 @@ class PcnConvNode(NodeBase):
         bu_act_fn: Callable = jnp.tanh,
         bidirectional: bool = False,
         activity_norm: Optional[str] = None,      # None | "rms": normalise incoming activities
+        activity_norm_inputs: Optional[Tuple[str, ...]] = None,   #  e.g. 'parents_curr'
         *,
         key: PRNGKeyArray,
     ):
@@ -189,8 +189,6 @@ class PcnConvNode(NodeBase):
                 )
             _check_conv_output(self.op_td, parent_shape, own_shape, "top-down")
 
-        self.norm_td = make_activity_norm(activity_norm, parent_shape) if parent_shape is not None else None
-
         # 2. CHILD PROJECTION (bottom-up)
         self.is_bu_dense = False
         self.op_bu = None
@@ -221,7 +219,12 @@ class PcnConvNode(NodeBase):
                         key=k_bu,
                     )
                 _check_conv_output(self.op_bu, child_shape, own_shape, "bottom-up")
-        self.norm_bu = make_activity_norm(activity_norm, child_shape) if self.op_bu is not None else None
+
+        # the norm exists exactly when its projection exists
+        self.activity_norms = make_activity_norms(activity_norm, activity_norm_inputs, {
+            "parents_curr":  parent_shape if self.op_td is not None else None,
+            "children_curr": child_shape  if self.op_bu is not None else None,
+        })
 
     # ------------------------------------------------------------------ #
     # Construction from a NodeSpec (called by the builder registry)

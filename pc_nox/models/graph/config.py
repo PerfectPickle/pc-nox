@@ -42,7 +42,9 @@ _SCOPES = ("all", "rec", "ff")
 _ACTIVITY_REG_TYPES = ("l1", "l2")
 _TRACE_MODES = ("readout", "accumulate")
 _WEIGHT_NORMS = ("none", "variance")     # see weight_norm.py
-
+# valid activity normalisation constants
+_NORM_INPUTS = ("own_prev", "parents_prev", "parents_curr", "children_curr")   # the NodeInputs fields a node may normalise
+_NORM_MODES = ("joint", "per_source")
 
 def _freeze(v: Any) -> Any:
     """Recursively turn lists/dicts into tuples (dicts -> sorted pairs)."""
@@ -293,6 +295,28 @@ class GraphModelConfig:
             if getattr(self, field) < 0:
                 errs.append(f"{field} must be >= 0, got {getattr(self, field)}")
 
+        # --- activity normalisation
+        # JSON has no tuples: after save_checkpoint -> load_checkpoint this field comes back
+        # as a LIST, which is unhashable and would break the config's use as a static jit
+        # field. Coerce it back to a tuple first, so everything below sees the canonical form.
+        # (object.__setattr__ is needed because the dataclass is frozen.)
+        object.__setattr__(self, "activity_norm_inputs", tuple(self.activity_norm_inputs))
+
+        # A typo in the scope (e.g. "parent_curr") would otherwise silently normalise
+        # nothing. Check every entry against the fields a node can actually have.
+        bad = [f for f in self.activity_norm_inputs if f not in _NORM_INPUTS]
+        if bad:
+            errs.append(f"activity_norm_inputs {bad} not in {_NORM_INPUTS}")
+
+        # "joint": statistic over the whole concatenation of parents.
+        # "per_source": statistic over each parent separately, before concatenating.
+        if self.activity_norm_mode not in _NORM_MODES:
+            errs.append(f"activity_norm_mode={self.activity_norm_mode!r} not in {_NORM_MODES}")
+        # (Deliberately NOT checked here: whether `activity_norm` names a registered norm.
+        #  The registry lives in nodes/norm.py and custom norms may be registered after
+        #  the config is created, so that check happens at build time instead, like
+        #  `resolve_act_fn` does for activation names.)
+
         # --- graph structure
         if not specs:
             errs.append("at least one node is required")
@@ -307,6 +331,7 @@ class GraphModelConfig:
                     errs.append(f"node {s.name!r} lists itself as a parent")
                 elif p not in by_name:
                     errs.append(f"node {s.name!r} has unknown parent {p!r}")
+                    
         if errs:  # structure is too broken to resolve levels
             raise ValueError("invalid GraphModelConfig:\n  - " + "\n  - ".join(errs))
 
@@ -370,7 +395,7 @@ class GraphModelConfig:
     def get(self, spec: NodeSpec, field: str) -> Any:
         """A per-node setting with fallback to the model-wide default.
         Valid for: act_fn, energy, weight_decay, orthogonal_penalty,
-        activity_decay, weight_norm.
+        activity_decay, weight_norm, activity_norm.
         """
         v = getattr(spec, field)
         return getattr(self, field) if v is None else v

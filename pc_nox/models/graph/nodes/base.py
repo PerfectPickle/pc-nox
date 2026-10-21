@@ -223,6 +223,12 @@ class NodeBase(eqx.Module):
         return False
 
     @property
+    def normed_inputs(self) -> Tuple[str, ...]:
+        """NodeInputs fields whose activity-norm STATISTIC the model applies in `_inputs`
+        (this node holds the matching affine module). Default: none."""
+        return ()
+
+    @property
     def supports_trace(self) -> bool:
         """Whether this node supports tPC-E eligibility traces. Dense
         recurrent nodes can; conv nodes cannot (the `outer(error, input)`

@@ -70,6 +70,7 @@ from .builders import build_nodes, combine, get_builder
 from .config import GraphModelConfig, NodeSpec
 from .energies import ENERGY_REGISTRY
 from .nodes.base import NodeBase, NodeInputs, NodePrediction, WeightEntry
+from .nodes.norm import resolve_activity_norm
 from .validation import validate_pairings
 from .weight_norm import normalise_weights, tag_in_scope
 
@@ -192,6 +193,8 @@ class GraphModel(eqx.Module, ModelBase):
         discarded (only the sweep direction's prediction is used), so the
         stand-in is harmless; any OTHER missing neighbour is still an error."""
         layout = get_builder(spec.kind).input_layout
+        norm = resolve_activity_norm(self.config.get(spec, "activity_norm"))
+        per_source = self.config.activity_norm_mode == "per_source"
         fields = {}
         if node.needs_own_prev:
             fields["own_prev"] = _get(states_prev, spec.name, "its previous state", spec.name)

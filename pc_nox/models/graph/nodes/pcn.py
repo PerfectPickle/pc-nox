@@ -29,6 +29,7 @@ import jax.random as jr
 from jaxtyping import Array, PRNGKeyArray
 
 from .base import NodeBase, NodeInputs, NodePrediction, WeightEntry
+from .activity_norm import apply_affine, make_activity_norms
 
 
 class PcnNode(NodeBase):
@@ -41,12 +42,12 @@ class PcnNode(NodeBase):
             `bidirectional`.
         own_size, bidirectional, td_act_fn, bu_act_fn: static metadata.
     """
+    activity_norms: Dict[str, eqx.Module]          # activity normalisation targets (e.g. 'parents_curr') and Modules
 
     op_td: Optional[eqx.nn.Linear]
     prior: Optional[Array]
     op_bu: Optional[eqx.nn.Linear]
-    norm_td: Optional[eqx.Module]      # activity norm; normalises parents_curr, size = combined parent width
-    norm_bu: Optional[eqx.Module]      # activity norm; normalises children_curr, size = combined child width
+
 
     own_size: int = eqx.field(static=True)
     bidirectional: bool = eqx.field(static=True)
@@ -63,6 +64,7 @@ class PcnNode(NodeBase):
         bidirectional: bool = False,
         has_prior: bool = True,
         activity_norm: Optional[str] = None,      # None | "rms": normalise incoming activities
+        activity_norm_inputs: Optional[Tuple[str, ...]] = None,   #  e.g. 'parents_curr'
         *,
         key: PRNGKeyArray,
     ):
@@ -92,8 +94,11 @@ class PcnNode(NodeBase):
         self.op_bu = eqx.nn.Linear(child_size, own_size, use_bias=True, key=k_bu) if bidirectional else None
 
         # the norm exists exactly when its projection exists
-        self.norm_td = make_activity_norm(activity_norm, (parent_size,)) if self.op_td is not None else None
-        self.norm_bu = make_activity_norm(activity_norm, (child_size,)) if self.op_bu is not None else None
+        self.activity_norms = make_activity_norms(activity_norm, activity_norm_inputs, {
+            "parents_curr":  (parent_size,) if self.op_td is not None else None,
+            "children_curr": (child_size,)  if self.op_bu is not None else None,
+        })
+
 
     @classmethod
     def from_spec(
@@ -152,6 +157,11 @@ class PcnNode(NodeBase):
     def provides_pre_activations(self) -> bool:
         return True
 
+    @property
+    def normed_inputs(self): 
+        return tuple(self.norms)
+
+
     def predict(self, inp: NodeInputs) -> NodePrediction:
         """Top-down prediction from `inp.parents_curr` (or the learned
         prior, in root mode), plus a bottom-up prediction from
@@ -159,8 +169,8 @@ class PcnNode(NodeBase):
         self.check_inputs(inp)
 
         predictions, pre_activations = {}, {}
-        if self.op_td is not None:
-            x_td = inp.parents_curr if self.norm_td is None else self.norm_td(inp.parents_curr)  # apply activity normalisation if specified
+        if self.op_td is not None:  
+            x_td = apply_affine(self.norms, "parents_curr", inp.parents_curr) # apply activity normalisation if specified
             pre_td = self.op_td(x_td)
         else:
             pre_td = self.prior                  # root mode: nothing to normalise
@@ -170,7 +180,7 @@ class PcnNode(NodeBase):
             pre_activations["td"] = pre_td
 
         if self.bidirectional:
-            x_bu = inp.children_curr if self.norm_bu is None else self.norm_bu(inp.children_curr)  # apply activity normalisation if specified
+            x_bu = apply_affine(self.norms, "children_curr", inp.children_curr)  # apply activity normalisation if specified
             pre_bu = self.op_bu(x_bu)
             predictions["bu"] = self.bu_act_fn(pre_bu)
             pre_activations["bu"] = pre_bu

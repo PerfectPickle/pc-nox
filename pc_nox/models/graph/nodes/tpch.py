@@ -34,10 +34,12 @@ class TpchControlNode(NodeBase):
     op_rec: eqx.nn.Linear  # recurrent weight (from self at t-1)
     op_in: eqx.nn.Linear = None  # optional control input
     op_bu: eqx.nn.Linear = None # optional bidirectional bottom up weight
+    op_skip: Optional[eqx.Module]
     
 
     # static=True excludes this variable from the pytree, i.e. it's python metadata, not a leaf, and will be ignored during JAX autodifferentiation
     has_input: bool = eqx.field(static=True)
+    has_skip: bool = eqx.field(static=True)
     td_act_fn: Callable = eqx.field(static=True) # not truly td because of rec self->self weight
     bu_act_fn: Callable = eqx.field(static=True)
     own_size: int = eqx.field(static=True)
@@ -161,34 +163,6 @@ class TpchControlNode(NodeBase):
         if self.op_bu is not None: # TODO -> consider adding more categories than 'rec' and 'ff'. 'ff' originally stood for feedforward, violted here.
             entries.append(WeightEntry("op_bu.weight", "ff", self.op_bu.weight))
         return entries
-
-    @classmethod
-    def from_spec(
-        cls,
-        spec,                                           # NodeSpec
-        parent_shape: Optional[Tuple[int, ...]],
-        child_shape: Optional[Tuple[int, ...]],
-        td_act_fn: Callable,
-        bu_act_fn: Callable,
-        *,
-        key: PRNGKeyArray,
-    ) -> "TpchControlNode":
-        """Build from a `NodeSpec`; shapes are the builder's COMBINED
-        (flattened) parent/child shapes. `act_fn` is used for both
-        directions."""
-        if len(spec.shape) != 1:
-            raise ValueError(f"node {spec.name!r}: PcnNode shape must be 1-D, got {spec.shape}")
-        opts = spec.opts
-        unknown = set(opts) - {"prior"}
-        if unknown:
-            raise ValueError(f"node {spec.name!r}: PcnNode takes no options other than 'prior', got {sorted(unknown)}")
-        bi = bool(spec.bidirectional)
-        return cls(
-            own_size=spec.shape[0],
-            parent_size=parent_shape[0] if parent_shape else None,
-            child_size=child_shape[0] if (bi and child_shape) else None,
-            td_act_fn=td_act_fn, bu_act_fn=bu_act_fn, bidirectional=bi, has_prior=bool(opts.get("prior", True)), key=key,
-        )
 
 
 

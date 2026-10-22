@@ -66,7 +66,7 @@ from pc_nox.core import penalties
 from pc_nox.core.model_base import ModelBase
 from pc_nox.engine import ode_settling
 
-from .builders import build_nodes, combine, get_builder
+from .builders import build_nodes, combine, get_builder, combine_normed
 from .config import GraphModelConfig, NodeSpec
 from .energies import ENERGY_REGISTRY
 from .nodes.base import NodeBase, NodeInputs, NodePrediction, WeightEntry
@@ -194,17 +194,25 @@ class GraphModel(eqx.Module, ModelBase):
         stand-in is harmless; any OTHER missing neighbour is still an error."""
         layout = get_builder(spec.kind).input_layout
         norm = resolve_activity_norm(self.config.get(spec, "activity_norm"))
-        per_source = self.config.activity_norm_mode == "per_source"
+        mode = self.config.activity_norm_mode
+
+        def gather(field, arrays):
+            stat = norm.stat if (norm is not None and field in node.normed_inputs) else None
+            return combine_normed(arrays, layout, stat, mode)
+
         fields = {}
         if node.needs_own_prev:
-            fields["own_prev"] = _get(states_prev, spec.name, "its previous state", spec.name)
+            x = _get(states_prev, spec.name, "its previous state", spec.name)
+            fields["own_prev"] = norm.stat(x) if (norm is not None and "own_prev" in node.normed_inputs) else x
         if node.needs_parents_prev:
-            fields["parents_prev"] = combine(
-                [_get(states_prev, p, "the previous state", spec.name) for p in spec.parents], layout)
+            fields["parents_prev"] = gather(
+                "parents_prev",
+                [_get(states_prev, p, "the previous state", spec.name) for p in spec.parents])
         if node.needs_parents_curr:
-            fields["parents_curr"] = combine(
+            fields["parents_curr"] = gather(
+                "parents_curr",
                 [curr[p] if p in curr else (jnp.zeros(self.config.spec(p).shape) if zero_fill == "parents" else
-                 _get(curr, p, "the current state (or observation)", spec.name)) for p in spec.parents], layout)
+                 _get(curr, p, "the current state (or observation)", spec.name)) for p in spec.parents])
         if node.needs_children:
             kids = []
             for c in _children_of(self.config)[spec.name]:
@@ -214,7 +222,7 @@ class GraphModel(eqx.Module, ModelBase):
                     kids.append(jnp.zeros(self.config.spec(c).shape))
                 else:
                     raise KeyError(f"node {spec.name!r} needs the current state of child {c!r}, which was not provided")
-            fields["children_curr"] = combine(kids, layout)
+            fields["children_curr"] = gather("children_curr", kids)
         if node.needs_control_input:
             fields["control_input"] = control_input
         return NodeInputs(**fields)

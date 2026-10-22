@@ -226,43 +226,6 @@ class PcnConvNode(NodeBase):
             "children_curr": child_shape  if self.op_bu is not None else None,
         })
 
-    # ------------------------------------------------------------------ #
-    # Construction from a NodeSpec (called by the builder registry)
-    # ------------------------------------------------------------------ #
-
-    @classmethod
-    def from_spec(
-        cls,
-        spec,                                   # NodeSpec
-        parent_shape: Tuple[int, ...],
-        child_shape: Optional[Tuple[int, ...]],
-        td_act_fn: Callable,
-        bu_act_fn: Callable,
-        *,
-        key: PRNGKeyArray,
-    ) -> "PcnConvNode":
-        """Build from a `NodeSpec`. `parent_shape`/`child_shape` are the
-        COMBINED shapes the builder derived from the spec's parents and the
-        config's children map; `act_fn` is the resolved activation (used for
-        both directions). `spec.options` may carry any of `CONV_OPTION_KEYS`.
-        """
-        opts = spec.opts
-        unknown = set(opts) - CONV_OPTION_KEYS
-        if unknown:
-            raise ValueError(
-                f"node {spec.name!r}: unknown PcnConvNode options {sorted(unknown)}; "
-                f"allowed: {sorted(CONV_OPTION_KEYS)}"
-            )
-        return cls(
-            parent_shape=parent_shape,
-            own_shape=spec.shape,
-            child_shape=child_shape if bool(spec.bidirectional) else None,
-            td_act_fn=td_act_fn,
-            bu_act_fn=bu_act_fn,
-            bidirectional=bool(spec.bidirectional),
-            key=key,
-            **opts,
-        )
 
     # ------------------------------------------------------------------ #
     # NodeBase interface

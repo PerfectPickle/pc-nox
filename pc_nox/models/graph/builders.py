@@ -90,6 +90,20 @@ def combine(arrays: Sequence[Array], layout: str) -> Array:
     raise ValueError(f"unknown layout {layout!r}; expected one of {LAYOUTS}")
 
 
+def combine_normed(arrays: Sequence[Array], layout: str, stat: Optional[Callable] = None,
+                   mode: str = "joint") -> Array:
+    """`combine`, plus an activity-norm statistic (see nodes/norm.py).
+
+    stat=None   -> plain combine.
+    "per_source" -> stat on each parent/child array BEFORE concatenation.
+    "joint"      -> stat on the combined array AFTER concatenation.
+    The statistic preserves shape, so `combined_shape` needs no counterpart."""
+    if stat is None:
+        return combine(arrays, layout)
+    if mode == "per_source":
+        return combine([stat(a) for a in arrays], layout)
+    return stat(combine(arrays, layout))
+
 # --------------------------------------------------------------------------- #
 # Registry
 # --------------------------------------------------------------------------- #
@@ -227,24 +241,45 @@ def _build_input(ctx: BuildContext) -> NodeBase:
     # a bottom-up-only conv or dense node, chosen by the declared shape.
     _require(ctx.child_shape is not None, s, "a bidirectional input node needs at least one child to predict it from")
     if len(s.shape) == 3:
-        return PcnConvNode.from_spec(s, None, ctx.child_shape, ctx.td_act_fn, ctx.bu_act_fn, key=ctx.key)
+        return PcnConvNode._conv_node(ctx, None)
     _require(len(s.shape) == 1, s, f"shape must be (D,) or (C, H, W), got {s.shape}")
     return PcnNode(s.shape[0], None, ctx.child_shape[0], ctx.td_act_fn, ctx.bu_act_fn, True, False, key=ctx.key)
 
 
 @register_node("pcn", input_layout="flat")
 def _build_pcn(ctx: BuildContext) -> NodeBase:
-    s = ctx.spec
+    s, bi = ctx.spec, bool(ctx.spec.bidirectional)
     _require(s.alpha is None, s, "a static PCN node has no memory, so alpha must be None")
-    return PcnNode.from_spec(s, ctx.parent_shape, ctx.child_shape, ctx.td_act_fn, ctx.bu_act_fn, key=ctx.key)
+    _require(len(s.shape) == 1, s, f"shape must be 1-D, got {s.shape}")
+    unknown = set(s.opts) - {"prior"}
+    _require(not unknown, s, f"takes no options other than 'prior', got {sorted(unknown)}")
+    return PcnNode(
+        own_size=s.shape[0],
+        parent_size=ctx.parent_shape[0] if ctx.parent_shape else None,
+        child_size=ctx.child_shape[0] if (bi and ctx.child_shape) else None,
+        td_act_fn=ctx.td_act_fn, bu_act_fn=ctx.bu_act_fn, bidirectional=bi,
+        has_prior=bool(s.opts.get("prior", True)),
+        activity_norm=ctx.activity_norm, activity_norm_inputs=ctx.norm_inputs, key=ctx.key,
+    )
 
-
+def _conv_node(ctx: BuildContext, parent_shape) -> PcnConvNode:
+    s = ctx.spec
+    unknown = set(s.opts) - CONV_OPTION_KEYS          # keep the constant in conv.py and import it
+    _require(not unknown, s, f"unknown conv options {sorted(unknown)}; allowed: {sorted(CONV_OPTION_KEYS)}")
+    bi = bool(s.bidirectional)
+    return PcnConvNode(
+        parent_shape=parent_shape, own_shape=s.shape,
+        child_shape=ctx.child_shape if bi else None,
+        td_act_fn=ctx.td_act_fn, bu_act_fn=ctx.bu_act_fn, bidirectional=bi,
+        activity_norm=ctx.activity_norm, norm_inputs=ctx.norm_inputs, key=ctx.key,
+        **dict(s.opts),
+    )
 @register_node("pcn_conv", input_layout="spatial")
 def _build_pcn_conv(ctx: BuildContext) -> NodeBase:
     s = ctx.spec
     _require(bool(s.parents) or s.bidirectional, s, "a conv node needs at least one parent (or bidirectional=True, for a bottom-up-only data root)")
     _require(s.alpha is None, s, "conv nodes are not leaky (no eligibility traces), alpha must be None")
-    return PcnConvNode.from_spec(s, ctx.parent_shape, ctx.child_shape, ctx.td_act_fn, ctx.bu_act_fn, key=ctx.key)
+    return PcnConvNode._conv_node(ctx, ctx.parent_shape)
 
 
 # --------------------------------------------------------------------------- #

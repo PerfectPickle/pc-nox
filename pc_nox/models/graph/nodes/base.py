@@ -49,12 +49,14 @@ class NodeInputs(NamedTuple):
         children_curr: Child state(s) at the current time step. Only nodes
             with a bottom-up (child-driven) path need this.
         control_input: External input x_t. Control-type nodes only.
+        skips_curr: State of skip connection source/s at the current time step.
     """
     own_prev: Optional[Array] = None
     parents_prev: Optional[Array] = None
     parents_curr: Optional[Array] = None
     children_curr: Optional[Array] = None
     control_input: Optional[Array] = None
+    skips_curr: Optional[Array] = None
 
 
 class NodePrediction(NamedTuple):
@@ -203,6 +205,11 @@ class NodeBase(eqx.Module):
     @property
     def needs_control_input(self) -> bool:
         """Whether `predict` reads `inp.control_input` (control nodes)."""
+        return False
+
+    @property
+    def needs_skips(self) -> bool:
+        """Whether `predict` reads `inp.skips_curr` (skip connection source nodes)."""
         return False
 
     @property

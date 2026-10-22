@@ -45,6 +45,11 @@ def validate_pairings(
                 f"the node's prediction paths {sorted(keys)}"
             )
 
+         # --- activity normalisation ---------------------------------
+        if spec.activity_norm not in (None, "none") and not node.normed_inputs:
+            errors.append(f"{where}: activity_norm={spec.activity_norm!r} requested but this node has no "
+                  f"normalisable inputs in scope {config.activity_norm_inputs}")
+
         # --- node needs vs graph structure ---------------------------------
         if node.needs_children and not children[spec.name]:
             errors.append(f"{where}: needs children (bottom-up path) but no node lists it as a parent")

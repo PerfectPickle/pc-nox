@@ -200,6 +200,13 @@ class GraphModel(eqx.Module, ModelBase):
             stat = norm.stat if (norm is not None and field in node.normed_inputs) else None
             return combine_normed(arrays, layout, stat, mode)
 
+        def cur(p):   # same rule parents_curr already uses
+            if p in curr: 
+                return curr[p]
+            if zero_fill == "parents": 
+                return jnp.zeros(self.config.spec(p).shape)
+            return _get(curr, p, "the current state (or observation)", spec.name)
+
         fields = {}
         if node.needs_own_prev:
             x = _get(states_prev, spec.name, "its previous state", spec.name)
@@ -225,6 +232,8 @@ class GraphModel(eqx.Module, ModelBase):
             fields["children_curr"] = gather("children_curr", kids)
         if node.needs_control_input:
             fields["control_input"] = control_input
+        if node.needs_skips_td:
+            fields["skip_parents_curr"] = combine([cur(p) for p in spec.skip_parents], layout)
         return NodeInputs(**fields)
 
     # ------------------------------------------------------------------ #

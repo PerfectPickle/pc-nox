@@ -30,6 +30,7 @@ from jaxtyping import Array, PRNGKeyArray
 
 from .base import NodeBase, NodeInputs, NodePrediction, WeightEntry
 from .activity_norm import apply_affine, make_activity_norms
+from .skip import make_skip_op, apply_skip
 
 
 class PcnNode(NodeBase):
@@ -47,11 +48,13 @@ class PcnNode(NodeBase):
     op_td: Optional[eqx.nn.Linear]
     prior: Optional[Array]
     op_bu: Optional[eqx.nn.Linear]
-    op_skip: Optional[eqx.Module]
+    op_skip_td: Optional[eqx.Module]
+    op_skip_bu: Optional[eqx.Module]
 
     own_size: int = eqx.field(static=True)
     bidirectional: bool = eqx.field(static=True)
-    has_skip: bool = eqx.field(static=True)
+    has_skip_td: bool = eqx.field(static=True) # whether this node receives outer (i.e. external to act_fn) skip connection input in the top-down pathway
+    has_skip_bu: bool = eqx.field(static=True) # same for bu pathway
     td_act_fn: Callable = eqx.field(static=True)
     bu_act_fn: Callable = eqx.field(static=True)
 
@@ -64,15 +67,22 @@ class PcnNode(NodeBase):
         bu_act_fn: Callable = jnp.tanh,
         bidirectional: bool = False,
         has_prior: bool = True,
-        activity_norm: Optional[str] = None,      # None | "rms": normalise incoming activities
-        activity_norm_inputs: Optional[Tuple[str, ...]] = None,   #  e.g. 'parents_curr'
+        activity_norm: Optional[str] = "none",      # "none" | "rms": normalise incoming activities
+        activity_norm_inputs: Optional[Tuple[str, ...]] = (),   #  e.g. 'parents_curr'
+        skip_shape_td: Optional[Tuple[int, ...]] = None,
+        skip_shape_bu: Optional[Tuple[int, ...]] = None,
         *,
         key: PRNGKeyArray,
     ):
         if own_size <= 0:
             raise ValueError(f"own_size must be positive, got {own_size}")
-        if bidirectional and not child_size:
-            raise ValueError("bidirectional=True requires child_size")
+        if bidirectional and not (not child_size or child_size <= 0):
+            raise ValueError("bidirectional=True requires child_size (nonzero)")
+        if skip_shape_td and (not parent_size or parent_size <= 0):
+            raise ValueError("bidirectional=True requires parent_size (nonzero)")
+
+        if skip_shape_bu and not bidirectional:
+            raise ValueError("skip_shape_bu requires bidirectional=True")
 
         k_td, k_bu = jr.split(key)
         self.own_size = own_size
@@ -93,6 +103,11 @@ class PcnNode(NodeBase):
             self.prior = None
 
         self.op_bu = eqx.nn.Linear(child_size, own_size, use_bias=True, key=k_bu) if bidirectional else None
+
+        self.has_skip_td = skip_shape_td is not None
+        self.op_skip_td = make_skip_op(skip_shape_td, (own_size,), jr.fold_in(key, 2)) if self.has_skip_td else None
+        self.has_skip_bu = skip_shape_bu is not None
+        self.op_skip_bu = make_skip_op(skip_shape_bu, (own_size,), jr.fold_in(key, 3)) if self.has_skip_bu else None
 
         # the norm exists exactly when its projection exists
         self.activity_norms = make_activity_norms(activity_norm, activity_norm_inputs, {
@@ -132,7 +147,15 @@ class PcnNode(NodeBase):
 
     @property
     def normed_inputs(self): 
-        return tuple(self.norms)
+        return tuple(self.activity_norms)
+
+    @property
+    def needs_skip_parents_curr(self): 
+        return self.has_skip_td
+
+    @property
+    def needs_skip_children_curr(self): 
+        return self.has_skip_bu
 
 
     def predict(self, inp: NodeInputs) -> NodePrediction:
@@ -143,19 +166,25 @@ class PcnNode(NodeBase):
 
         predictions, pre_activations = {}, {}
         if self.op_td is not None:  
-            x_td = apply_affine(self.norms, "parents_curr", inp.parents_curr) # apply activity normalisation if specified
+            x_td = apply_affine(self.activity_norms, "parents_curr", inp.parents_curr) # apply activity normalisation if specified
             pre_td = self.op_td(x_td)
         else:
             pre_td = self.prior                  # root mode: nothing to normalise
 
         if pre_td is not None:
-            predictions["td"] = self.td_act_fn(pre_td)
+            pred_td = self.td_act_fn(pre_td)
+            if self.has_skip_td:
+                pred_td += apply_skip(self.op_skip_td, inp.skip_parents_curr, self.state_shape)
+            predictions["td"] = pred_td
             pre_activations["td"] = pre_td
 
         if self.bidirectional:
-            x_bu = apply_affine(self.norms, "children_curr", inp.children_curr)  # apply activity normalisation if specified
+            x_bu = apply_affine(self.activity_norms, "children_curr", inp.children_curr)  # apply activity normalisation if specified
             pre_bu = self.op_bu(x_bu)
-            predictions["bu"] = self.bu_act_fn(pre_bu)
+            pred_bu = self.bu_act_fn(pre_bu)
+            if self.has_skip_bu:
+                pred_bu += apply_skip(self.op_skip_bu, inp.skip_children_curr, self.state_shape)
+            predictions["bu"] = pred_bu
             pre_activations["bu"] = pre_bu
 
         return NodePrediction(predictions, pre_activations)
@@ -168,4 +197,8 @@ class PcnNode(NodeBase):
             entries.append(WeightEntry("op_td.weight", "ff", self.op_td.weight))
         if self.op_bu is not None:
             entries.append(WeightEntry("op_bu.weight", "ff", self.op_bu.weight))
+        if self.op_skip_td is not None:
+            entries.append(WeightEntry("op_skip_td.weight", "ff", self.op_skip_td.weight))
+        if self.op_skip_bu is not None:
+            entries.append(WeightEntry("op_skip_bu.weight", "ff", self.op_skip_bu.weight))
         return entries

@@ -115,6 +115,8 @@ class BuildContext(NamedTuple):
         spec: The node's `NodeSpec`.
         parent_shape: Combined parent shape (per the kind's layout), or
             None if the node has no parents.
+        skip_parent_shape: Combined parent shape (per the kind's layout), or
+            None if the node has no parents.
         child_shape: Combined child shape, or None unless the spec is
             `bidirectional`.
         td_act_fn: Resolved top-down activation callable (spec override or model default).
@@ -124,7 +126,9 @@ class BuildContext(NamedTuple):
     """
     spec: NodeSpec
     parent_shape: Optional[Tuple[int, ...]]
+    skip_parents_shape: Optional[Tuple[int, ...]]
     child_shape: Optional[Tuple[int, ...]]
+    skip_children_shape: Optional[Tuple[int, ...]]
     td_act_fn: Callable
     bu_act_fn: Callable
     input_size: int
@@ -259,7 +263,9 @@ def _build_pcn(ctx: BuildContext) -> NodeBase:
         child_size=ctx.child_shape[0] if (bi and ctx.child_shape) else None,
         td_act_fn=ctx.td_act_fn, bu_act_fn=ctx.bu_act_fn, bidirectional=bi,
         has_prior=bool(s.opts.get("prior", True)),
-        activity_norm=ctx.activity_norm, activity_norm_inputs=ctx.norm_inputs, key=ctx.key,
+        activity_norm=ctx.activity_norm, activity_norm_inputs=ctx.norm_inputs, 
+        skip_shape_td=ctx.skip_parents_shape, skip_shape_bu=ctx.skip_children_shape,
+        key=ctx.key,
     )
 
 def _conv_node(ctx: BuildContext, parent_shape) -> PcnConvNode:

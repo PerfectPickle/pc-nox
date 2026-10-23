@@ -115,7 +115,10 @@ class NodeSpec:
     bu_precision: Optional[float] = None
     release: bool = False
     weight_norm: Optional[str] = None
-    highway_from: Tuple[str, ...] = ()   # clamped source nodes, who provide HEP error signal to the node
+    highway_from: Tuple[str, ...] = ()   # clamped source nodes, who provide HEP error signal to the node.
+    skip_parents: Tuple[str, ...] = ()  # parents used for 'outer' skip connections (where skip lives outside activation function, i.e. y = F(x) + x)
+    skip_children: Tuple[str, ...] = () # as above, but for bottom up pathway
+    
     weight_decay: Optional[float] = None
     orthogonal_penalty: Optional[float] = None
     activity_decay: Optional[float] = None
@@ -126,6 +129,8 @@ class NodeSpec:
         shape = (self.shape,) if isinstance(self.shape, int) else self.shape
         object.__setattr__(self, "shape", tuple(shape))
         object.__setattr__(self, "parents", tuple(self.parents))
+        object.__setattr__(self, "skip_parents", tuple(self.skip_parents))
+        object.__setattr__(self, "highway_from", tuple(self.highway_from))
 
         opts = self.options
         items = opts.items() if isinstance(opts, Mapping) else [tuple(p) for p in opts]
@@ -144,8 +149,15 @@ class NodeSpec:
             errs.append("kind must be a non-empty string")
         if not self.shape or not all(isinstance(d, int) and d > 0 for d in self.shape):
             errs.append(f"shape {self.shape} must be a non-empty tuple of positive ints")
-        if len(set(self.parents)) != len(self.parents):
+        if len(set(self.all_parents)) != len(self.all_parents):
             errs.append(f"duplicate parents {self.parents}")
+        # Check for overlap between parents and skip_parents
+        overlap = set(self.parents) & set(self.skip_parents)
+        if overlap:
+            raise ValueError(
+                f"Invalid NodeSpec: 'skip_parents' overlaps with 'parents'. "
+                f"Overlapping elements: {overlap}"
+            )
         if self.alpha is not None and not (0.0 < self.alpha <= 1.0):
             errs.append(f"alpha must be in (0, 1], got {self.alpha}")
         if self.alpha is not None and self.clamped:
@@ -172,6 +184,10 @@ class NodeSpec:
     def opts(self) -> Dict[str, Any]:
         """`options` as a plain dict, for builders."""
         return dict(self.options)
+
+    @property
+    def all_parents(self): 
+        return self.parents + self.skip_parents  
 
 
 def _resolve_levels(by_name: Mapping[str, NodeSpec]) -> Tuple[Dict[str, int], List[str]]:
@@ -204,7 +220,7 @@ def _resolve_levels(by_name: Mapping[str, NodeSpec]) -> Tuple[Dict[str, int], Li
         level_of(n)
     if not errors:
         for n, spec in by_name.items():
-            for p in spec.parents:
+            for p in spec.all_parents:
                 if resolved[p] >= resolved[n]:
                     errors.append(
                         f"node {n!r} (level {resolved[n]}) has parent {p!r} at level "
@@ -326,7 +342,7 @@ class GraphModelConfig:
             errs.append(f"duplicate node names: {dupes}")
         by_name = {s.name: s for s in specs}
         for s in specs:
-            for p in s.parents:
+            for p in s.all_parents:
                 if p == s.name:
                     errs.append(f"node {s.name!r} lists itself as a parent")
                 elif p not in by_name:
@@ -345,7 +361,7 @@ class GraphModelConfig:
         # data roots get a bottom-up-only path and leaves stay top-down-only (the paper's x1 / xL asymmetry).
         n_children = {s.name: 0 for s in canonical}
         for s in canonical:
-            for p in s.parents:
+            for p in s.all_parents:
                 n_children[p] += 1
         canonical = tuple(
             replace(s, bidirectional=bool(self.bidirectional and n_children[s.name] > 0)) if s.bidirectional is None else s
@@ -377,6 +393,10 @@ class GraphModelConfig:
         """Nodes whose state is observed data (the keys of `observation`)."""
         return tuple(s for s in self.node_specs if s.clamped)
 
+    @property
+    def all_parents(self): 
+        return self.parents + self.skip_parents  
+
     def spec(self, name: str) -> NodeSpec:
         for s in self.node_specs:
             if s.name == name:
@@ -388,7 +408,7 @@ class GraphModelConfig:
         `parents`), in canonical order."""
         out: Dict[str, List[str]] = {s.name: [] for s in self.node_specs}
         for s in self.node_specs:
-            for p in s.parents:
+            for p in s.all_parents:
                 out[p].append(s.name)
         return {k: tuple(v) for k, v in out.items()}
 

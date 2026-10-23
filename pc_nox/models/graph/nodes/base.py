@@ -49,14 +49,16 @@ class NodeInputs(NamedTuple):
         children_curr: Child state(s) at the current time step. Only nodes
             with a bottom-up (child-driven) path need this.
         control_input: External input x_t. Control-type nodes only.
-        skips_curr: State of skip connection source/s at the current time step.
+        skip_parents_curr: State of top-down skip connection source/s at the current time step.
+        skip_children_curr: State of bottom-up skip connection source/s at the current time step.
     """
     own_prev: Optional[Array] = None
     parents_prev: Optional[Array] = None
     parents_curr: Optional[Array] = None
     children_curr: Optional[Array] = None
     control_input: Optional[Array] = None
-    skips_curr: Optional[Array] = None
+    skip_parents_curr: Optional[Array] = None
+    skip_children_curr: Optional[Array] = None
 
 
 class NodePrediction(NamedTuple):
@@ -208,8 +210,8 @@ class NodeBase(eqx.Module):
         return False
 
     @property
-    def needs_skips(self) -> bool:
-        """Whether `predict` reads `inp.skips_curr` (skip connection source nodes)."""
+    def needs_skips_td(self) -> bool:
+        """Whether `predict` reads `inp.skip_parents_curr` (skip connection source nodes)."""
         return False
 
     @property
@@ -219,6 +221,11 @@ class NodeBase(eqx.Module):
         (`NodeSpec.bidirectional`); `validate_pairings` rejects switching
         it on for a node type that cannot support it.
         """
+        return False
+
+    @property
+    def needs_skips_bu(self) -> bool:
+        """Whether `predict` reads `inp.skip_children_curr` (skip connection source nodes)."""
         return False
 
     @property
@@ -260,6 +267,8 @@ class NodeBase(eqx.Module):
             "parents_curr": self.needs_parents_curr,
             "children_curr": self.needs_children,
             "control_input": self.needs_control_input,
+            "skip_parents_curr": self.needs_skip_parents_curr,
+            "skip_children_curr": self.needs_skip_children_curr,
         }
         missing = [f for f, need in required.items() if need and getattr(inp, f) is None]
         if missing:

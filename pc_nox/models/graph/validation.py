@@ -83,6 +83,29 @@ def validate_pairings(
         if spec.release and not keys:
             errors.append(f"{where}: is released (free when unobserved) but predicts nothing in either direction, so it cannot be initialised")
 
+        # --- HEP: every highway source must be able to supply the requested error ---
+        for src_name, path in spec.highway_sources:
+            src_spec = config.spec(src_name)
+            src_node = nodes[src_name]
+            src_where = f"{where}: highway source {src_name!r} (path {path!r})"
+
+            if not src_spec.clamped:
+                errors.append(f"{src_where} is not a clamped node, so it can never be observed and supply an error")
+
+            if path not in src_node.prediction_keys:          # the SOURCE's paths, not the receiver's
+                errors.append(f"{src_where}: the source returns paths {sorted(src_node.prediction_keys)}, not {path!r}")
+
+            src_energy = config.get(src_spec, "energy")       # the energy lives in the spec/config, not on the node
+            src_strategy = energy_registry.get(src_energy)
+            if src_strategy is None:                          # reported when the source node itself is checked
+                continue
+            if src_strategy.init_frozen is not None:          # meta, meta_ce, ...: they need a frozen context we don't supply
+                errors.append(f"{src_where}: source energy {src_energy!r} needs a frozen context, which "
+                              "highway errors cannot use; use a plain energy such as 'pc' or 'ce'")
+            if src_strategy.allowed_paths is not None and path not in src_strategy.allowed_paths:
+                errors.append(f"{src_where}: source energy {src_energy!r} cannot score path {path!r} "
+                              f"(it handles {sorted(src_strategy.allowed_paths)})")
+
         # --- node outputs vs energy requirements ---------------------------
         strategy = energy_registry.get(energy_name)
         if strategy is None:

@@ -114,10 +114,12 @@ class NodeSpec:
     td_precision: Optional[float] = None
     bu_precision: Optional[float] = None
     release: bool = False
-    weight_norm: Optional[str] = None
-    highway_from: Tuple[str, ...] = ()   # clamped source nodes, who provide HEP error signal to the node.
+    activity_norm: Optional[str] = None  # e.g. "rms". None = inherit, "none" = off
+    highway_from_td: Tuple[str, ...] = ()   # clamped, observed sources whose TOP-DOWN prediction error nudges this node's state
+    highway_from_bu: Tuple[str, ...] = ()   # clamped, observed sources whose BOTTOM-UP prediction error nudges this node's state
     skip_parents: Tuple[str, ...] = ()  # parents used for 'outer' skip connections (where skip lives outside activation function, i.e. y = F(x) + x)
     skip_children: Tuple[str, ...] = () # as above, but for bottom up pathway
+    weight_norm: Optional[str] = None
     
     weight_decay: Optional[float] = None
     orthogonal_penalty: Optional[float] = None
@@ -125,12 +127,14 @@ class NodeSpec:
     alpha: Optional[float] = None
 
     def __post_init__(self):
-        # --- coerce JSON-round-tripped / convenient forms to canonical ones
+        # --- coerce JSON-round-tripped / convenient forms to canonical ones so the spec stays hashable
         shape = (self.shape,) if isinstance(self.shape, int) else self.shape
         object.__setattr__(self, "shape", tuple(shape))
         object.__setattr__(self, "parents", tuple(self.parents))
         object.__setattr__(self, "skip_parents", tuple(self.skip_parents))
-        object.__setattr__(self, "highway_from", tuple(self.highway_from))
+        object.__setattr__(self, "skip_parents", tuple(self.skip_parents))
+        object.__setattr__(self, "highway_from_td", tuple(self.highway_from_td))
+        object.__setattr__(self, "highway_from_bu", tuple(self.highway_from_bu))
 
         opts = self.options
         items = opts.items() if isinstance(opts, Mapping) else [tuple(p) for p in opts]
@@ -177,6 +181,18 @@ class NodeSpec:
         for k, v in self.options:
             if not _is_json_value(v):
                 errs.append(f"option {k!r}={v!r} is not a JSON-compatible scalar/tuple")
+        # HEP
+        for field in ("highway_from_td", "highway_from_bu"):
+            srcs = getattr(self, field)
+            if not all(isinstance(n, str) for n in srcs):
+                errs.append(f"{field} must be node names (strings), got {srcs}")
+            if len(set(srcs)) != len(srcs):
+                errs.append(f"duplicate names in {field}: {srcs}")
+            if self.name in srcs:
+                errs.append(f"{field} lists the node itself ({self.name!r})")
+        if (self.highway_from_td or self.highway_from_bu) and self.clamped and not self.release:
+            errs.append("a clamped node without release is never inferred, so it has no state for a highway to nudge; "
+                        "set release=True or remove its highway sources")
         if errs:
             raise ValueError(f"invalid NodeSpec {self.name!r}:\n  - " + "\n  - ".join(errs))
 
@@ -187,7 +203,15 @@ class NodeSpec:
 
     @property
     def all_parents(self): 
-        return self.parents + self.skip_parents  
+        return self.parents + self.skip_parents 
+
+    @property
+    def highway_sources(self) -> Tuple[Tuple[str, str], ...]:
+        """Return (source_node_name, pathway) pairs."""
+        return (
+            *((name, "td") for name in self.highway_from_td),
+            *((name, "bu") for name in self.highway_from_bu),
+        )
 
 
 def _resolve_levels(by_name: Mapping[str, NodeSpec]) -> Tuple[Dict[str, int], List[str]]:
@@ -276,11 +300,14 @@ class GraphModelConfig:
     td_precision: float = 1.0
     bu_precision: float = 1.0
     init_direction: str = "td"
+    activity_norm: Optional[str] = "none"  # e.g. "rms". "none" = off
+    activity_norm_inputs: Tuple[str, ...] = ("parents_curr", "children_curr")  # inputs that when provided to a node, receive normalisation
+    activity_norm_mode: str = "joint"        # "joint" | "per_source"
     weight_norm: str = "none"
     weight_norm_scope: str = "all"
     highway_alpha: float = 0.0  # strength of HEP error signal
-    highway_sigma: float = 1e-3  # std of normal distribution random fixed HEP weights are initiased from
-    highway_seed: int = 0
+    highway_sigma: float = 1e-3  # std of normal distribution random fixed HEP weights (V) are initiased from
+    highway_seed: int = 0  # seed the V matrices are regenerated from (never stored)
     weight_decay: float = 0.0
     weight_decay_scope: str = "all"
     orthogonal_penalty: float = 0.0
@@ -347,7 +374,21 @@ class GraphModelConfig:
                     errs.append(f"node {s.name!r} lists itself as a parent")
                 elif p not in by_name:
                     errs.append(f"node {s.name!r} has unknown parent {p!r}")
-                    
+            # HEP
+            for field in ("highway_from_td", "highway_from_bu"):
+                for src in getattr(s, field):
+                    if src not in by_name:
+                        errs.append(f"node {s.name!r}: {field} names unknown node {src!r}")
+                    elif not by_name[src].clamped:
+                        errs.append(f"node {s.name!r}: {field} source {src!r} is not clamped, so it can never be "
+                                    "observed and supply an error")
+        # HEP
+        if self.highway_alpha < 0:
+            errs.append(f"highway_alpha must be >= 0, got {self.highway_alpha}")
+        if not self.highway_sigma > 0:
+            errs.append(f"highway_sigma must be > 0, got {self.highway_sigma}")
+        if isinstance(self.highway_seed, bool) or not isinstance(self.highway_seed, int) or self.highway_seed < 0:
+            errs.append(f"highway_seed must be a non-negative int, got {self.highway_seed!r}")
         if errs:  # structure is too broken to resolve levels
             raise ValueError("invalid GraphModelConfig:\n  - " + "\n  - ".join(errs))
 

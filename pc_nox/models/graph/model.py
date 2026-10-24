@@ -54,11 +54,13 @@ Extension points (each is one place, on purpose):
 import functools
 import warnings
 from typing import ClassVar, Dict, List, Mapping, Optional, Sequence, Tuple, Union
+from math import prod
 
 import diffrax
 import equinox as eqx
 import jax
 import jax.numpy as jnp
+import jax.random as jr
 import optax
 from jaxtyping import Array, PRNGKeyArray, PyTree
 
@@ -66,7 +68,7 @@ from pc_nox.core import penalties
 from pc_nox.core.model_base import ModelBase
 from pc_nox.engine import ode_settling
 
-from .builders import build_nodes, combine, get_builder, combine_normed
+from .builders import build_nodes, combine, get_builder, combine_normed, node_key
 from .config import GraphModelConfig, NodeSpec
 from .energies import ENERGY_REGISTRY
 from .nodes.base import NodeBase, NodeInputs, NodePrediction, WeightEntry
@@ -363,7 +365,7 @@ class GraphModel(eqx.Module, ModelBase):
         self,
         states_prev: States,
         states_curr: States,
-        observation: Optional[Mapping[str, Array]],
+        obs: Optional[Mapping[str, Array]], # observation
         control_input: Optional[Array],
         frozen: Optional[Mapping[str, object]] = None,
         highway_matrices: Optional[Mapping[Tuple[str, str], Array]] = None, 
@@ -372,21 +374,21 @@ class GraphModel(eqx.Module, ModelBase):
         is the ONE place energy strategies are called. `frozen` is the
         per-settle context from `frozen_context`; it is passed to each node's
         strategy (and required by those that declare an `init_frozen` hook)."""
-        predictions, _ = self.predict(states_prev, states_curr, control_input, observation)
-        curr = {**states_curr, **(observation or {})}
+        predictions, _ = self.predict(states_prev, states_curr, control_input, obs)
+        curr = {**states_curr, **(obs or {})}
         energies = []
 
         # --- Highway Error Propagation: output errors of the observed SOURCE nodes ---
         # Only nodes that some checkpoint lists in `highway_from` are sources. This keeps
         # non-HEP graphs untouched and avoids calling energies that need a frozen context.
-        source_names = {src for s in self.config.node_specs for src in s.highway_from}
+        # each element of highway_sources is a src tuple of the form: ("node_name", "pathway")
+        highway_sources = sorted({src for s in self.config.node_specs for src in s.highway_sources})
         source_errors = {
-            s.name: self._output_error(
-                s, obs[s.name], predictions[s.name],
-                {"td": self.config.get(s, "td_precision"), "bu": self.config.get(s, "bu_precision")},
-            )
-            for s in self.config.clamped
-            if s.name in source_names and s.name in obs and "td" in predictions[s.name].predictions
+            (src_name, path): self._highway_source_error(
+                self.config.spec(src_name), obs[src_name], predictions[src_name],
+                {"td": self.config.get(self.config.spec(src_name), "td_precision"),
+                "bu": self.config.get(self.config.spec(src_name), "bu_precision")}, path)
+            for src_name, path in highway_sources if src_name in obs and path in predictions[src_name].predictions
         }
 
         for spec in self.config.node_specs:
@@ -411,14 +413,14 @@ class GraphModel(eqx.Module, ModelBase):
             hw = jnp.asarray(0.0)
             if spec.name in states_curr:                      # only inferred nodes have a state to nudge
                 z = states_curr[spec.name].ravel()
-                for src in spec.highway_from:
-                    if src in source_errors:                  # observed => has an error
+                for src, path in spec.highway_sources:
+                    if (src, path) in source_errors:                  # observed => has an error
                         # V @ err : matrix-vector product, shape (n_node,). This is the
                         #           "nudge direction" delivered to the node in one hop.
                         # vdot(z, .) : dot product of the state with that nudge -> a scalar.
                         # Taking jax.grad of this scalar w.r.t. z gives exactly  V @ err, so
                         # each inference step moves z by (alpha * V @ eps), i.e. Eq. 8.
-                        hw = hw + jnp.vdot(z, highway_matrices[(spec.name, src)] @ source_errors[src].ravel())
+                        hw = hw + jnp.vdot(z, highway_matrices[(spec.name, src, path)] @ source_errors[(src, path)].ravel())
 
             energies.append(
                 strategy.fn(curr[spec.name], predictions[spec.name], node_frozen, weights)
@@ -452,12 +454,44 @@ class GraphModel(eqx.Module, ModelBase):
                     [states_curr[spec.name]], cfg.get(spec, "activity_decay"), cfg.activity_reg_type))
         return jnp.stack(terms)
 
-    # ---------------------------------------------------------------------------
-    #    Build the fixed random highway matrices
-    #    Called ONCE per settle (in _energy_closures), not once per inference step,
-    #    because the matrices never change.
-    # ---------------------------------------------------------------------------
+
     def _highway_matrices(self):
+        r"""Build the fixed random Highway Error Propagation (HEP) matrices $V_{src \to i}$.
+
+        One matrix per highway edge, i.e. per (checkpoint node, source node,
+        source path) triple listed in the specs' `highway_from_td` /
+        `highway_from_bu`. Each matrix projects the source's output error
+        $\epsilon$ (see `_highway_source_error`) onto the checkpoint's state, so
+        the checkpoint's energy gets the term $z_i^\top V\,\mathrm{sg}(\epsilon)$
+        (Eq. 7 of the HEP paper).
+
+        The matrices are never trained and never stored. Each is a pure function of
+        `config.highway_seed` and the node names, so the same matrices are
+        regenerated after a checkpoint reload, and adding or removing other nodes
+        does not change an existing edge's matrix. Because they are not model
+        leaves, the optimiser, weight decay and `weight_norm` cannot touch them.
+
+        Call once per settle (see `_energy_closures`), not per inference step:
+        they are constants while the states settle.
+
+        Returns:
+            A dict mapping `(checkpoint_name, source_name, path)` to a matrix `V`,
+            where:
+
+            * `checkpoint_name`: the node whose STATE is nudged (the spec that
+              lists the source).
+            * `source_name`: the clamped, observed node that supplies the error.
+            * `path`: "td" or "bu", which of the source's prediction errors is
+              used. A source listed under both paths gets two independent matrices.
+            * `V` has shape `(n_checkpoint, n_source)`: rows are the checkpoint's
+              units, columns are the source's units, with `(C, H, W)` shapes
+              flattened to `C*H*W`. `V @ eps.ravel()` is the nudge direction
+              delivered to the checkpoint's flattened state.
+
+            Entries are i.i.d. $\mathcal{N}(0, \sigma_v^2)$ with
+            $\sigma_v$ = `config.highway_sigma`. The dict is empty if no node lists
+            any highway source.
+        """
         cfg = self.config
         # One base PRNG key, derived from an integer seed stored in the config.
         # Because the seed lives in the config, the same V is regenerated after a
@@ -468,48 +502,84 @@ class GraphModel(eqx.Module, ModelBase):
         #   key   = (checkpoint name, source name), e.g. ("vis", "label_obs")
         #   value = V, a random matrix of shape (n_checkpoint, n_source)
         return {
-            (s.name, src): cfg.highway_sigma * jr.normal(          # sigma_v * N(0, 1) entries
+            (s.name, src, path): cfg.highway_sigma * jr.normal(          # sigma_v * N(0, 1) entries
                 # A key unique to this pair, derived from the NAMES (via crc32 in
                 # node_key), so adding or removing other nodes never changes this V.
-                node_key(base, f"{s.name}<-{src}"),
+                node_key(base, f"{s.name}<-{src}:{path}"),
                 # Rows = number of units in the checkpoint's state.
                 # Columns = number of units in the source node's error vector.
                 # prod() flattens a shape like (C, H, W) to C*H*W, so conv states work too.
                 (prod(s.shape), prod(cfg.spec(src).shape)),
             )
             for s in cfg.node_specs          # every node is a potential checkpoint...
-            for src in s.highway_from        # ...for each source it lists (empty tuple = none)
+            for src, path in s.highway_sources        # ...for each source, path it lists (empty tuple = none)
         }
 
-    # ---------------------------------------------------------------------------
-    #    The output error eps = -dE_src/d(mu_src), for ONE source node.
-    #    This is the paper's eps_L: how the source's loss would change if its
-    #    prediction moved, with the sign flipped, so it points "toward the target".
-    # ---------------------------------------------------------------------------
-    def _highway_source_error(self, spec, state, pred, weights):
-        # spec    : NodeSpec of the SOURCE node (e.g. the label node)
-        # state   : the source's observed data (e.g. the one-hot label)
-        # pred    : the source's NodePrediction (its current "td" prediction)
-        # weights : the {"td": precision, "bu": precision} dict, as in _node_energies
 
+    # ---------------------------------------------------------------------------
+    #    The output error eps = -dE_src/d(mu_src^path) for ONE source node and ONE
+    #    of its prediction paths ("td" or "bu").
+    #    This is the paper's eps_L: how the source's loss would change if that
+    #    prediction moved, with the sign flipped, so it points "toward the target".
+    #    It includes the source's precision weight for that path.
+    # ---------------------------------------------------------------------------
+    def _highway_source_error(self, spec, state, pred, weights, path):
+        r"""Output error of one source node on one prediction path, for a highway.
+
+        Computes the paper's $\epsilon_L = -\partial E_{src} / \partial \mu_{src}^{path}$
+        (Eq. 2 of the HEP paper): how the source's own energy would change if its
+        prediction on `path` moved, with the sign flipped so the result points toward
+        the target. Differentiating the source's own energy, not a second hand-written
+        formula, means the highway always uses the same loss the source is trained
+        with. The result includes the source's precision weight for `path`.
+
+        The error is returned stop-gradiented, so the highway term is strictly
+        one-way: no gradient flows back through it into the source's prediction, and
+        so none into the weights (the "sg" in Eq. 7). The local weight update (Eq. 9)
+        is therefore unchanged.
+
+        Worked examples (the data is the clamped `state`, written y):
+            "pc":  energy = sum_k w_k * 0.5 * ||y - mu_k||^2
+                   -> eps = w_path * (y - mu_path). The other paths' terms are
+                   constant in `mu`, so they drop out.
+            "ce":  energy = w_td * CE(y, softmax(mu_td))
+                   -> eps = w_td * (y - softmax(mu_td)).
+
+        Args:
+            spec: `NodeSpec` of the SOURCE node (e.g. the label node, or a
+                bidirectional data root).
+            state: The source's observed data (e.g. the one-hot label). It must be
+                an observation: inferred sources are not supported.
+            pred: The source's full `NodePrediction`, with every path it returns
+                (td and/or bu). Paths other than `path` are held fixed.
+            weights: The `{"td": precision, "bu": precision}` dict for the source,
+                as built in `_node_energies`.
+            path: Which prediction path's error to return, "td" or "bu".
+
+        Returns:
+            An array shaped like `pred.predictions[path]`, stop-gradiented.
+
+        Note:
+            The "ce" energy never reads the "bu" prediction, so for `path="bu"` the
+            gradient is exactly zero and the highway would silently do nothing.
+            `validate_pairings` must reject that pairing (and energies that need a
+            frozen context, such as "meta", since `None` is passed for it here).
+        """
         # Look up whichever energy this source uses ("pc", "ce", ...).
         strat = ENERGY_REGISTRY[self.config.get(spec, "energy")]
 
-        # `strat.fn(...)` is the source's own energy: a scalar function of its prediction.
-        # We wrap it in a lambda so that jax.grad differentiates w.r.t. the PREDICTION
-        # `mu`, holding the data `state` fixed (jax.grad differentiates w.r.t. the
-        # lambda's argument, here `mu`).
-        #   for "pc": energy = 0.5*||y - mu||^2  ->  grad = mu - y
-        #   for "ce": energy = CE(y, softmax(mu)) ->  grad = softmax(mu) - y
-        g = jax.grad(
-            lambda mu: strat.fn(state, NodePrediction({"td": mu}, {}), None, weights)
-        )(pred.predictions["td"])        # evaluate that gradient at the current prediction
+        # The source's own energy as a scalar function of ONE path's prediction `mu`:
+        # that path is replaced by `mu` and every other path is held fixed, so
+        # jax.grad below is the partial derivative with respect to that path only.
+        # `state` (the data) is also held fixed.
+        def energy_of(mu):
+            preds = {**pred.predictions, path: mu}
+            return strat.fn(state, NodePrediction(preds, pred.pre_activations), None, weights)
 
-        # Negate it to get eps (pc: y - mu; ce: y - softmax(mu)).
-        # stop_gradient freezes eps as a constant. Gradients can't flow back into the
-        # source's prediction (and so into the weights) through the highway term.
+        # stop_gradient freezes eps as a constant, so no gradient flows back through the
+        # highway term into the source's prediction (and so into the weights).
         # This is the "sg(eps_L)" of Eq. 7: the highway is strictly one-way.
-        return jax.lax.stop_gradient(-g)
+        return jax.lax.stop_gradient(-jax.grad(energy_of)(pred.predictions[path]))
 
 
     def energy_fn(

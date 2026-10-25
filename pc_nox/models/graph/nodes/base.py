@@ -252,6 +252,14 @@ class NodeBase(eqx.Module):
         """
         return False
 
+    @property
+    def needs_skip_parents_curr(self): 
+        return False
+
+    @property
+    def needs_skip_children_curr(self): 
+        return False
+
     # ------------------------------------------------------------------ #
     # Concrete helpers
     # ------------------------------------------------------------------ #

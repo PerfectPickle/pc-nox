@@ -72,7 +72,7 @@ from .builders import build_nodes, combine, get_builder, combine_normed, node_ke
 from .config import GraphModelConfig, NodeSpec
 from .energies import ENERGY_REGISTRY
 from .nodes.base import NodeBase, NodeInputs, NodePrediction, WeightEntry
-from .nodes.norm import resolve_activity_norm
+from .nodes.activity_norm import resolve_activity_norm
 from .validation import validate_pairings
 from .weight_norm import normalise_weights, tag_in_scope
 

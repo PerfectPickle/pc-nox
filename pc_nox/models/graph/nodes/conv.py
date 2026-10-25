@@ -39,7 +39,7 @@ Conventions (see `NodeBase` / `NodeInputs`):
 """
 
 from math import prod
-from typing import Callable, List, Optional, Tuple, Union
+from typing import Callable, List, Optional, Tuple, Union, Dict
 
 import equinox as eqx
 import jax
@@ -105,11 +105,15 @@ class PcnConvNode(NodeBase):
 
     op_td: Optional[Union[eqx.nn.Linear, eqx.nn.ConvTranspose2d, eqx.nn.Conv2d]]
     op_bu: Optional[Union[eqx.nn.Conv2d, eqx.nn.ConvTranspose2d, eqx.nn.Linear]]
+    op_skip_td: Optional[eqx.Module]
+    op_skip_bu: Optional[eqx.Module]
 
     own_shape: Tuple[int, int, int] = eqx.field(static=True)
     is_td_dense: bool = eqx.field(static=True)
     is_bu_dense: bool = eqx.field(static=True)
     bidirectional: bool = eqx.field(static=True)
+    has_skip_td: bool = eqx.field(static=True) # whether this node receives outer (i.e. external to act_fn) skip connection input in the top-down pathway
+    has_skip_bu: bool = eqx.field(static=True) # same for bu pathway
     td_act_fn: Callable = eqx.field(static=True)
     bu_act_fn: Callable = eqx.field(static=True)
 
@@ -135,6 +139,8 @@ class PcnConvNode(NodeBase):
         bidirectional: bool = False,
         activity_norm: Optional[str] = None,      # None | "rms": normalise incoming activities
         activity_norm_inputs: Optional[Tuple[str, ...]] = None,   #  e.g. 'parents_curr'
+        skip_shape_td: Optional[Tuple[int, ...]] = None,
+        skip_shape_bu: Optional[Tuple[int, ...]] = None,
         *,
         key: PRNGKeyArray,
     ):
@@ -153,7 +159,8 @@ class PcnConvNode(NodeBase):
             if len(child_shape) not in (1, 3):
                 raise ValueError(f"child_shape must be (D,) or (C, H, W), got {child_shape}")
 
-        k_td, k_bu = jr.split(key)
+        k_td = jr.fold_in(key, 0) 
+        k_bu = jr.fold_in(key, 1)
         self.own_shape = own_shape
         self.td_act_fn = td_act_fn
         self.bu_act_fn = bu_act_fn
@@ -220,6 +227,11 @@ class PcnConvNode(NodeBase):
                     )
                 _check_conv_output(self.op_bu, child_shape, own_shape, "bottom-up")
 
+        self.has_skip_td = skip_shape_td is not None
+        self.op_skip_td = make_skip_op(skip_shape_td, own_shape, jr.fold_in(key, 2)) if self.has_skip_td else None
+        self.has_skip_bu = skip_shape_bu is not None
+        self.op_skip_bu = make_skip_op(skip_shape_bu, own_shape, jr.fold_in(key, 3)) if self.has_skip_bu else None
+
         # the norm exists exactly when its projection exists
         self.activity_norms = make_activity_norms(activity_norm, activity_norm_inputs, {
             "parents_curr":  parent_shape if self.op_td is not None else None,
@@ -256,6 +268,18 @@ class PcnConvNode(NodeBase):
     def provides_pre_activations(self) -> bool:
         return True
 
+    @property
+    def normed_inputs(self): 
+        return tuple(self.activity_norms)
+
+    @property
+    def needs_skip_parents_curr(self): 
+        return self.has_skip_td
+
+    @property
+    def needs_skip_children_curr(self): 
+        return self.has_skip_bu
+
     def _project(self, op, x: Array, is_dense: bool) -> Array:
         """Apply `op` to `x`; a dense op's flat output is reshaped to
         `own_shape`."""
@@ -270,17 +294,21 @@ class PcnConvNode(NodeBase):
 
         predictions, pre_activations = {}, {}
         if self.op_td is not None:
-            x_td = inp.parents_curr if self.norm_td is None else self.norm_td(inp.parents_curr)    # apply activity normalisation if specified
+            x_td = apply_affine(self.activity_norms, "parents_curr", inp.parents_curr)    # apply activity normalisation if specified
             pre_td = self._project(self.op_td, x_td, self.is_td_dense)
-            predictions["td"] = self.td_act_fn(pre_td)
             pre_activations["td"] = pre_td
-
+            pred_td = self.td_act_fn(pre_td)
+            if self.has_skip_td:
+                pred_td += apply_skip(self.op_skip_td, inp.skip_parents_curr, self.state_shape)
+            predictions["td"] = pred_td
         if self.bidirectional:
-            x_bu = inp.children_curr if self.norm_bu is None else self.norm_bu(inp.children_curr)
+            x_bu = apply_affine(self.activity_norms, "children_curr", inp.children_curr)
             pre_bu = self._project(self.op_bu, x_bu, self.is_bu_dense)
-            predictions["bu"] = self.bu_act_fn(pre_bu)
             pre_activations["bu"] = pre_bu
-
+            pred_bu = self.bu_act_fn(pre_bu)
+            if self.has_skip_bu:
+                pred_bu += apply_skip(self.op_skip_bu, inp.skip_children_curr, self.state_shape)
+            predictions["bu"] = pred_bu
         return NodePrediction(predictions, pre_activations)
 
     def weight_entries(self) -> List[WeightEntry]:
@@ -290,7 +318,11 @@ class PcnConvNode(NodeBase):
         the real parameters. Biases are not included.
         """
         ops = ([("op_td", self.op_td)] if self.op_td is not None else []) + ([("op_bu", self.op_bu)] if self.op_bu is not None else [])
-        return [
+        entries = [
             WeightEntry(f"{name}.weight", "ff", jnp.reshape(op.weight, (op.weight.shape[0], -1)))
             for name, op in ops
         ]
+        for name, op in (("op_skip_td", self.op_skip_td), ("op_skip_bu", self.op_skip_bu)):
+            if isinstance(op, eqx.nn.Linear):
+                entries.append(WeightEntry(f"{name}.weight", "ff", op.weight))
+        return entries

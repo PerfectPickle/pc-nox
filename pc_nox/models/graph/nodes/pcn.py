@@ -21,7 +21,7 @@ Input layout is "flat": several parents/children are concatenated, and a
 conv parent/child is flattened (see `builders.py`).
 """
 
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple, Dict
 
 import equinox as eqx
 import jax.numpy as jnp
@@ -197,8 +197,7 @@ class PcnNode(NodeBase):
             entries.append(WeightEntry("op_td.weight", "ff", self.op_td.weight))
         if self.op_bu is not None:
             entries.append(WeightEntry("op_bu.weight", "ff", self.op_bu.weight))
-        if self.op_skip_td is not None:
-            entries.append(WeightEntry("op_skip_td.weight", "ff", self.op_skip_td.weight))
-        if self.op_skip_bu is not None:
-            entries.append(WeightEntry("op_skip_bu.weight", "ff", self.op_skip_bu.weight))
+        for name, op in (("op_skip_td", self.op_skip_td), ("op_skip_bu", self.op_skip_bu)):
+            if isinstance(op, eqx.nn.Linear):
+                entries.append(WeightEntry(f"{name}.weight", "ff", op.weight))
         return entries

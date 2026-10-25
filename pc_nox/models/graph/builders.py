@@ -189,15 +189,18 @@ def _build_tpch_control(ctx: BuildContext) -> NodeBase:
     _no_options(s)
     _require(not s.parents, s, "a control node has no parents")
     _require(len(s.shape) == 1, s, f"shape must be 1-D, got {s.shape}")
+    bi = bool(s.bidirectional)
     return TpchControlNode(
         own_size=s.shape[0], 
-        child_size=ctx.child_shape, 
+        child_size=ctx.child_shape[0] if bi else None, 
         bidirectional=s.bidirectional, 
         input_size=ctx.input_size, 
         td_act_fn=ctx.td_act_fn, 
         bu_act_fn=ctx.bu_act_fn, 
         alpha=s.alpha, 
-        key=ctx.key,
+        activity_norm=ctx.activity_norm, activity_norm_inputs=ctx.activity_norm_inputs, key=ctx.key,
+        skip_shape_td=ctx.skip_parents_shape,
+        skip_shape_bu=ctx.skip_children_shape if bi else None,
     )
 
 
@@ -207,15 +210,19 @@ def _build_tpch_hidden(ctx: BuildContext) -> NodeBase:
     _no_options(s)
     _require(bool(s.parents), s, "a hidden node needs at least one parent")
     _require(len(s.shape) == 1, s, f"shape must be 1-D, got {s.shape}")
+    bi = bool(s.bidirectional)
+    _require(not bi or ctx.child_shape is not None, s, "bidirectional=True but the node has no children")
     return TpchHiddenNode(
         own_size=s.shape[0], 
-        child_size=ctx.child_shape, 
-        bidirectional=s.bidirectional, 
+        child_size=ctx.child_shape[0] if bi else None, 
+        bidirectional=bi, 
         parent_size=ctx.parent_shape[0], 
         td_act_fn=ctx.td_act_fn, 
         bu_act_fn=ctx.bu_act_fn, 
         alpha=s.alpha, 
-        key=ctx.key,
+        activity_norm=ctx.activity_norm, activity_norm_inputs=ctx.activity_norm_inputs, key=ctx.key,
+        skip_shape_td=ctx.skip_parents_shape,
+        skip_shape_bu=ctx.skip_children_shape if bi else None,
     )
 
 
@@ -229,6 +236,8 @@ def _build_tpch_obs(ctx: BuildContext) -> NodeBase:
     # loss is chosen by the spec's `energy` ("pc" = squared error, "ce" = cross-entropy), not here
     return TpchObservationNode(
         obs_size=s.shape[0], parent_size=ctx.parent_shape[0], key=ctx.key,
+        activity_norm=ctx.activity_norm, activity_norm_inputs=ctx.activity_norm_inputs, 
+        skip_shape_td=ctx.skip_parents_shape, 
     )
 
 
@@ -263,21 +272,23 @@ def _build_pcn(ctx: BuildContext) -> NodeBase:
         child_size=ctx.child_shape[0] if (bi and ctx.child_shape) else None,
         td_act_fn=ctx.td_act_fn, bu_act_fn=ctx.bu_act_fn, bidirectional=bi,
         has_prior=bool(s.opts.get("prior", True)),
-        activity_norm=ctx.activity_norm, activity_norm_inputs=ctx.norm_inputs, 
+        activity_norm=ctx.activity_norm, activity_norm_inputs=ctx.activity_norm_inputs, 
         skip_shape_td=ctx.skip_parents_shape, skip_shape_bu=ctx.skip_children_shape,
         key=ctx.key,
     )
 
 def _conv_node(ctx: BuildContext, parent_shape) -> PcnConvNode:
     s = ctx.spec
-    unknown = set(s.opts) - CONV_OPTION_KEYS          # keep the constant in conv.py and import it
-    _require(not unknown, s, f"unknown conv options {sorted(unknown)}; allowed: {sorted(CONV_OPTION_KEYS)}")
+    #unknown = set(s.opts) - CONV_OPTION_KEYS          # keep the constant in conv.py and import it
+    #_require(not unknown, s, f"unknown conv options {sorted(unknown)}; allowed: {sorted(CONV_OPTION_KEYS)}")
     bi = bool(s.bidirectional)
     return PcnConvNode(
         parent_shape=parent_shape, own_shape=s.shape,
         child_shape=ctx.child_shape if bi else None,
         td_act_fn=ctx.td_act_fn, bu_act_fn=ctx.bu_act_fn, bidirectional=bi,
-        activity_norm=ctx.activity_norm, norm_inputs=ctx.norm_inputs, key=ctx.key,
+        activity_norm=ctx.activity_norm, activity_norm_inputs=ctx.activity_norm_inputs, key=ctx.key,
+        skip_shape_td=ctx.skip_parents_shape,
+        skip_shape_bu=ctx.skip_children_shape if bi else None,
         **dict(s.opts),
     )
 @register_node("pcn_conv", input_layout="spatial")
@@ -285,7 +296,7 @@ def _build_pcn_conv(ctx: BuildContext) -> NodeBase:
     s = ctx.spec
     _require(bool(s.parents) or s.bidirectional, s, "a conv node needs at least one parent (or bidirectional=True, for a bottom-up-only data root)")
     _require(s.alpha is None, s, "conv nodes are not leaky (no eligibility traces), alpha must be None")
-    return PcnConvNode._conv_node(ctx, ctx.parent_shape)
+    return _conv_node(ctx, ctx.parent_shape)
 
 
 # --------------------------------------------------------------------------- #
@@ -298,19 +309,28 @@ def node_key(key: PRNGKeyArray, name: str) -> PRNGKeyArray:
     (crc32, not `hash`, which is salted per Python process.)"""
     return jr.fold_in(key, zlib.crc32(name.encode()))
 
+class InputShapes(NamedTuple):
+    parent: Optional[Tuple[int, ...]]
+    skip_parents: Optional[Tuple[int, ...]]
+    child: Optional[Tuple[int, ...]]
+    skip_children: Optional[Tuple[int, ...]]
 
-def input_shapes(config: GraphModelConfig, spec: NodeSpec) -> Tuple[Optional[Tuple[int, ...]], Optional[Tuple[int, ...]]]:
-    """(combined parent shape, combined child shape) for a node, per its
-    kind's layout. The child shape is only computed for bidirectional nodes."""
+def input_shapes(config: GraphModelConfig, spec: NodeSpec) -> InputShapes:
+    """Combined shapes (per the kind's layout) of a node's parents, skip parents,
+    children and skip children. The two child-side shapes only exist for
+    bidirectional nodes."""
     layout = get_builder(spec.kind).input_layout
-    parent_shape = (
-        combined_shape([config.spec(p).shape for p in spec.parents], layout) if spec.parents else None
+
+    def comb(names):                       # None if there are no such neighbours
+        return combined_shape([config.spec(n).shape for n in names], layout) if names else None
+
+    bi = bool(spec.bidirectional)
+    return InputShapes(
+        parent=comb(spec.parents),
+        skip_parents=comb(spec.skip_parents),
+        child=comb(config.children()[spec.name]) if bi else None,
+        skip_children=comb(spec.skip_children) if bi else None,
     )
-    kids = config.children()[spec.name]
-    child_shape = (
-        combined_shape([config.spec(c).shape for c in kids], layout) if (spec.bidirectional and kids) else None
-    )
-    return parent_shape, child_shape
 
 
 def resolve_act_fn(name: str) -> Callable:
@@ -327,17 +347,20 @@ def build_nodes(config: GraphModelConfig, key: PRNGKeyArray) -> Dict[str, NodeBa
     """Build every node in canonical order. Errors are re-raised with the
     node's name and kind attached."""
     nodes: Dict[str, NodeBase] = {}
-    activity_norm=config.get(spec, "activity_norm"),
-    norm_inputs=config.activity_norm_inputs,
     for spec in config.node_specs:
         builder = get_builder(spec.kind)
         try:
-            parent_shape, child_shape = input_shapes(config, spec)
+            shapes = input_shapes(config, spec)
             ctx = BuildContext(
-                spec=spec, parent_shape=parent_shape, child_shape=child_shape,
+                spec=spec,
+                parent_shape=shapes.parent, skip_parents_shape=shapes.skip_parents,
+                child_shape=shapes.child,   skip_children_shape=shapes.skip_children,
                 td_act_fn=resolve_act_fn(config.get(spec, "td_act_fn")),
                 bu_act_fn=resolve_act_fn(config.get(spec, "bu_act_fn")),
-                input_size=config.input_size, key=node_key(key, spec.name),
+                input_size=config.input_size,
+                activity_norm=config.get(spec, "activity_norm"),
+                activity_norm_inputs=config.activity_norm_inputs,     # model-wide only, see below
+                key=node_key(key, spec.name),
             )
             nodes[spec.name] = builder.build(ctx)
         except ValueError as e:

@@ -40,7 +40,7 @@ import jax.numpy as jnp
 import jax.random as jr
 from jaxtyping import Array, PRNGKeyArray
 
-from .norm import Gain
+from .activity_norm import Gain
 
 SKIP_MODES = ("identity", "gain", "linear", "pad", "random")
 

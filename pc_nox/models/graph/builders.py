@@ -46,6 +46,7 @@ from .nodes.base import NodeBase
 from .nodes.conv import PcnConvNode
 from .nodes.input import InputNode
 from .nodes.pcn import PcnNode
+from .nodes.aux import AuxNode
 # nodes/tpch.py is the ONLY file that imports the tPC-H layers from the tpch package
 from .nodes.tpch import (
     TpchControlNode, TpchHiddenNode, TpchObservationNode,
@@ -254,7 +255,7 @@ def _build_input(ctx: BuildContext) -> NodeBase:
     # a bottom-up-only conv or dense node, chosen by the declared shape.
     _require(ctx.child_shape is not None, s, "a bidirectional input node needs at least one child to predict it from")
     if len(s.shape) == 3:
-        return PcnConvNode._conv_node(ctx, None)
+        return _conv_node(ctx, None)
     _require(len(s.shape) == 1, s, f"shape must be (D,) or (C, H, W), got {s.shape}")
     return PcnNode(s.shape[0], None, ctx.child_shape[0], ctx.td_act_fn, ctx.bu_act_fn, True, False, key=ctx.key)
 
@@ -298,6 +299,19 @@ def _build_pcn_conv(ctx: BuildContext) -> NodeBase:
     _require(s.alpha is None, s, "conv nodes are not leaky (no eligibility traces), alpha must be None")
     return _conv_node(ctx, ctx.parent_shape)
 
+
+@register_node("aux", input_layout="spatial")
+def _build_aux(ctx: BuildContext) -> NodeBase:
+    s, shape = ctx.spec, tuple(ctx.spec.shape)
+    _no_options(s)
+    _require(not s.clamped, s, "an aux node is an inferred state, so it must be clamped=False")
+    _require(s.alpha is None, s, "an aux node has no memory, so alpha must be None")
+    _require(len(s.parents) == 1, s, f"an aux node copies exactly one parent, got {s.parents}")
+    _require(ctx.parent_shape == shape, s, f"parent shape {ctx.parent_shape} must equal the aux shape {shape} (identity map)")
+    if s.bidirectional:
+        # more than one child would be concatenated, so the equality check below also catches that
+        _require(ctx.child_shape == shape, s, f"a bidirectional aux node needs exactly one child of identical shape, got combined child shape {ctx.child_shape}")
+    return AuxNode(shape=shape, bidirectional=bool(s.bidirectional))
 
 # --------------------------------------------------------------------------- #
 # Building

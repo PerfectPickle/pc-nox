@@ -279,6 +279,9 @@ def make_vgg_specs(
                             # "first": stride on the first conv of each stage
     downsample=True,        # set False to keep full resolution everywhere
     mirror_bu=True,         # set bu_stride / bu_output_padding to mirror td_stride
+    hep_checkpoint_interval=None,
+    skip_interval=None,
+
 ):
     assert downsample_at in ("first", "last")
 
@@ -291,6 +294,7 @@ def make_vgg_specs(
 
     prev_name = "image"
     _, h, w = input_shape
+    node_idx = 0
 
     for s, (channels, n_convs) in enumerate(stages, start=1):
         for i in range(1, n_convs + 1):
@@ -304,15 +308,27 @@ def make_vgg_specs(
             if mirror_bu and stride > 1:
                 options.update({"bu_stride": stride, "bu_output_padding": 1})
 
+            if hep_checkpoint_interval and (node_idx % hep_checkpoint_interval == 0):
+                highway_from_td = ("label",)
+            else:
+                highway_from_td = ()
+
+            # if skip_interval and node_idx != 0 and node_idx % skip_interval == 0:
+            #     highway_from_td = ("label",)
+            # else:
+            #     highway_from_td = ()
+
             specs.append(
                 NodeSpec(
                     name, "pcn_conv", (channels, h, w),
                     parents=(prev_name,),
                     td_act_fn=act,
                     options=options,
+                    highway_from_td=highway_from_td,
                 )
             )
             prev_name = name
+            node_idx += 1
 
     # --- dense tail ---
     for j, dim in enumerate(fc_dims, start=1):
@@ -335,76 +351,81 @@ def make_vgg_specs(
 
 
 # usage
-node_specs = make_vgg_specs()
+node_specs = make_vgg_specs(hep_checkpoint_interval=4)
 
 config = GraphModelConfig(
-    node_specs=node_specs,
-    # node_specs=(
-    #     # --- INPUT ---
-    #     NodeSpec(
-    #         "image",
-    #         "input",
-    #         (3, 32, 32),
-    #         clamped=True,
-    #         release=False,
-    #         bu_act_fn="identity",
-    #         #options={"bu_stride":1},
-    #     ),
-    #     # --- STAGE 1: (64 channels, 32x32) ---
-    #     NodeSpec(
-    #         "conv1",
-    #         "pcn_conv",
-    #         (64, 32, 32),
-    #         parents=("image",),
-    #         td_act_fn="gelu",
-    #         options={"td_stride": 1, "bu_stride": 2, "bu_output_padding": 1},
-    #     ),
-    #     # --- STAGE 2: Downsample to (128 channels, 16x16) ---
-    #     NodeSpec(
-    #         "conv2",
-    #         "pcn_conv",
-    #         (128, 16, 16),
-    #         parents=("conv1",),
-    #         td_act_fn="gelu",
-    #         options={"td_stride": 2, "bu_stride": 2, "bu_output_padding": 1},
-    #     ),
-    #     # --- STAGE 3: Downsample to (256 channels, 8x8) ---
-    #     NodeSpec(
-    #         "conv3",
-    #         "pcn_conv",
-    #         (256, 8, 8),
-    #         parents=("conv2",),
-    #         td_act_fn="gelu",
-    #         options={"td_stride": 2, "bu_stride": 2, "bu_output_padding": 1},
-    #     ),
-    #     NodeSpec(
-    #         "conv4", 
-    #         "pcn_conv", 
-    #         (256, 4, 4), 
-    #         parents=("conv3",), 
-    #         td_act_fn="gelu",
-    #         options={"td_stride": 2,}),
-    #     # --- DENSE TAIL ---
-    #     NodeSpec(
-    #         "fc", 
-    #         "pcn", 
-    #         2048, 
-    #         parents=("conv4",), 
-    #         td_act_fn="gelu",),
-    #     NodeSpec(
-    #         "label",
-    #         "pcn",
-    #         100,
-    #         parents=("fc",),
-    #         td_act_fn="identity",
-    #         clamped=True,
-    #         release=False,
-    #         energy="ce"
-    #     ),
-    # ),
+    #node_specs=node_specs,
+    node_specs=(
+        # --- INPUT ---
+        NodeSpec(
+            "image",
+            "input",
+            (3, 32, 32),
+            clamped=True,
+            release=False,
+            bu_act_fn="identity",
+            options={"bu_stride":1},
+        ),
+        # --- STAGE 1: (64 channels, 32x32) ---
+        NodeSpec(
+            "conv1",
+            "pcn_conv",
+            (64, 32, 32),
+            parents=("image",),
+            td_act_fn="gelu",
+            options={"td_stride": 1, "bu_stride": 2, "bu_output_padding": 1},
+            highway_from_td=("label",),
+        ),
+        # --- STAGE 2: Downsample to (128 channels, 16x16) ---
+        NodeSpec(
+            "conv2",
+            "pcn_conv",
+            (128, 16, 16),
+            parents=("conv1",),
+            td_act_fn="gelu",
+            options={"td_stride": 2, "bu_stride": 2, "bu_output_padding": 1},
+            highway_from_td=("label",),
+        ),
+        # --- STAGE 3: Downsample to (256 channels, 8x8) ---
+        NodeSpec(
+            "conv3",
+            "pcn_conv",
+            (256, 8, 8),
+            parents=("conv2",),
+            td_act_fn="gelu",
+            options={"td_stride": 2, "bu_stride": 2, "bu_output_padding": 1},
+            highway_from_td=("label",),
+        ),
+        NodeSpec(
+            "conv4", 
+            "pcn_conv", 
+            (256, 4, 4), 
+            parents=("conv3",), 
+            td_act_fn="gelu",
+            options={"td_stride": 2,},
+            highway_from_td=("label",),
+            ),
+        # --- DENSE TAIL ---
+        NodeSpec(
+            "fc", 
+            "pcn", 
+            2048, 
+            parents=("conv4",), 
+            td_act_fn="gelu",),
+        NodeSpec(
+            "label",
+            "pcn",
+            100,
+            parents=("fc",),
+            td_act_fn="identity",
+            clamped=True,
+            release=False,
+            energy="ce"
+        ),
+    ),
     activity_norm="rms",
-    highway_alpha=1.0,
-    bidirectional=False,
+    highway_alpha=0.1,
+    bidirectional=True,
     td_precision=1.0,
     bu_precision=0.1,
     energy="pc",
@@ -420,21 +441,21 @@ RETURN_LAYERWISE = False
 # CIFAR-100 with this graph: param lr 1e-3 collapsed the feedforward net to chance in every run (with activity lr 0.01
 # or 0.001); param lr 1e-4 trained, and lowering the activity lr to 0.001 as well gave the best result (~16.6% test
 # after 10 epochs, still rising). Tune these first if you change the architecture.
-ACTIVITY_LR = 0.2
+ACTIVITY_LR = 0.005
 #activity_optim = grouped_optimiser(config, optax.sgd, ACTIVITY_LR, {"kind:pcn_conv": 0.1})
 #param_optim = optax.adam(learning_rate=0.001)
-activity_optim = optax.sgd(learning_rate=ACTIVITY_LR)
-PARAM_LR = 0.0003
+activity_optim = optax.adam(learning_rate=ACTIVITY_LR)
+PARAM_LR = 6e-5
 param_optim = grouped_optimiser(config, optax.adamw, PARAM_LR, {"kind:pcn": 0.3})
-# param_optim = optax.adam(learning_rate=0.0001)
+#param_optim = optax.adamw(learning_rate=PARAM_LR)
 
 train_step = make_train_step(
     param_optim=param_optim,
     activity_optim=activity_optim,
-    n_infer_steps=20,
+    n_infer_steps=50,
 )
 
-eval_step = make_eval_step(activity_optim=activity_optim, n_infer_steps=20)
+eval_step = make_eval_step(activity_optim=activity_optim, n_infer_steps=50)
 
 
 print(
@@ -478,6 +499,7 @@ for epoch in range(num_epochs):
             model,
             param_opt_state,
             {"image": xs_batch, "label": ys_batch},   # CHANGED: every clamped node is one entry of the observation dict
+            init_direction="bu",
             return_layerwise=RETURN_LAYERWISE,
         )
 
@@ -538,4 +560,4 @@ def save_generated_samples(model, fine_names=None, n=10, n_steps=100, filename="
     print(f"Generated-from-label samples saved to '{filename}'")
 
 
-# save_generated_samples(model, fine_names=fine_names)
+save_generated_samples(model, fine_names=fine_names)

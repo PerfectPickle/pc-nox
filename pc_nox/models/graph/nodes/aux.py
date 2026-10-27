@@ -4,6 +4,10 @@
 after "Towards the Training of Deeper Predictive Coding Neural Networks" (Qi et al., 2025).
 """
 
+from .base import NodeBase, NodePrediction
+import equinox as eqx
+from typing import Tuple
+
 class AuxNode(NodeBase):
     shape: Tuple[int, ...] = eqx.field(static=True)
     bidirectional: bool = eqx.field(static=True)

@@ -76,7 +76,7 @@ class PcnNode(NodeBase):
     ):
         if own_size <= 0:
             raise ValueError(f"own_size must be positive, got {own_size}")
-        if bidirectional and not (not child_size or child_size <= 0):
+        if bidirectional and (not child_size or child_size <= 0):
             raise ValueError("bidirectional=True requires child_size (nonzero)")
         if skip_shape_td and (not parent_size or parent_size <= 0):
             raise ValueError("bidirectional=True requires parent_size (nonzero)")

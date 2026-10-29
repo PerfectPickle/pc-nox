@@ -195,7 +195,7 @@ model_key, data_key = jr.split(key)
 #   * image6 is kind "pcn_conv", not "input": "input" is a parentless data ROOT (the image at the top of a
 #     supervised chain). Here the image is the LEAF the decoder predicts, so it is a clamped conv node.
 # -------------------------------------------------------------------------------------------------------------
-def make_node_specs(obs_dim=128, num_hidden=64, min_width=4, highway_checkpoint_interval=10):
+def make_node_specs(obs_dim=128, num_hidden=64, min_width=4, highway_checkpoint_interval=5):
     obs_level = num_hidden + 1
     obs_name = f"o{obs_level}"
 

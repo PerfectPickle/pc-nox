@@ -466,7 +466,7 @@ class VisualPredictionPlotter:
     place rather than rebuilding the plot from scratch.
     """
 
-    def __init__(self, output_shape, figsize=(10, 3), cmap='gray'):
+    def __init__(self, output_shape, figsize=(10, 3), cmap='gray', vmin=0.0, vmax=1.0):
         """
         Creates the figure, axes, and image artists once, up front.
 
@@ -479,6 +479,13 @@ class VisualPredictionPlotter:
             Size of the combined (1x3) figure. Default (10, 3)
         cmap : str, optional
             Colormap used for all three images. Default 'gray'
+        vmin, vmax : float, optional
+            FIXED colour limits shared by all panels and all frames, so a
+            given pixel value always maps to the same shade (e.g. the
+            occluder's 85/255 always renders as dark grey, never white).
+            Default 0.0 / 1.0, matching frames normalised by / 255.0.
+            Use vmax=255 for raw uint8 frames. Predictions outside this
+            range are clipped in the display only.
 
         Returns:
         --------
@@ -487,11 +494,14 @@ class VisualPredictionPlotter:
         self.output_shape = output_shape
         self.fig, self.axes = plt.subplots(1, 3, figsize=figsize)
         self.cmap = cmap
+        self.vmin = vmin
+        self.vmax = vmax
         # Create the three image artists once, with dummy data
         blank = np.zeros(output_shape)
-        self.im_y = self.axes[0].imshow(blank, cmap=cmap)
-        self.im_prior = self.axes[1].imshow(blank, cmap=cmap)
-        self.im_post = self.axes[2].imshow(blank, cmap=cmap)
+        imshow_kw = dict(cmap=cmap, vmin=vmin, vmax=vmax)
+        self.im_y = self.axes[0].imshow(blank, **imshow_kw)
+        self.im_prior = self.axes[1].imshow(blank, **imshow_kw)
+        self.im_post = self.axes[2].imshow(blank, **imshow_kw)
         for ax in self.axes:
             ax.axis('off')
         # Do layout once up front instead of on every savefig call
@@ -580,11 +590,7 @@ class VisualPredictionPlotter:
         self.im_y.set_data(y_img)
         self.im_prior.set_data(prior_img)
         self.im_post.set_data(post_img)
-        # Rescale color limits per-image (skip this if your data range
-        # is already fixed/normalized — it's extra work per frame)
-        self.im_y.autoscale()
-        self.im_prior.autoscale()
-        self.im_post.autoscale()
+
         self.axes[0].set_title(f"Frame {frame_number}: Ground Truth")
         self.axes[1].set_title(prior_label)
         self.axes[2].set_title(posterior_label)
@@ -603,7 +609,8 @@ class VisualPredictionPlotter:
             for name, arr in arrays_by_name.items():
                 sub_dir = os.path.join(output_dir, name)
                 os.makedirs(sub_dir, exist_ok=True)
-                plt.imsave(os.path.join(sub_dir, frame_str), arr, cmap=self.cmap)
+                plt.imsave(os.path.join(sub_dir, frame_str), arr,
+                           cmap=self.cmap, vmin=self.vmin, vmax=self.vmax)
         if show_combined:
             self.fig.canvas.draw()
             plt.pause(0.001)

@@ -258,105 +258,10 @@ rng_key, model_key = jax.random.split(key)
 #     MUCH smaller than the discriminative one (1e-3 .. 1e-8): top-down errors are orders of magnitude larger, and with
 #     equal weights they swamp the classification signal. 1e-3 is a starting point, not a tuned value.
 #   * The label uses squared error against the one-hot vector (the paper's energy), not cross-entropy.
-import math
-
-# (channels, n_convs) per stage -> 2+2+4+4+4 = 16 convs, the VGG-19 layout
-VGG19_STAGES = ((64, 2), (128, 2), (256, 4), (512, 4), (512, 4))
-
-
-def _out_size(size: int, stride: int) -> int:
-    # 3x3 kernel, padding=1: stride 1 keeps size, stride 2 gives ceil(size / 2)
-    return math.ceil(size / stride)
-
-# THIS YIELDS DEGEN RESULT (1% test accuracy after 1 epoch)
-def make_vgg_specs(
-    input_shape=(3, 32, 32),
-    stages=VGG19_STAGES,
-    fc_dims=(4096, 4096),
-    n_classes=100,
-    act="gelu",
-    downsample_at="last",   # "last": stride on the last conv of each stage (where VGG puts its pool)
-                            # "first": stride on the first conv of each stage
-    downsample=True,        # set False to keep full resolution everywhere
-    mirror_bu=True,         # set bu_stride / bu_output_padding to mirror td_stride
-    hep_checkpoint_interval=None,
-    skip_interval=None,
-
-):
-    assert downsample_at in ("first", "last")
-
-    specs = [
-        NodeSpec(
-            "image", "input", tuple(input_shape),
-            clamped=True, release=False, bu_act_fn="identity",
-        )
-    ]
-
-    prev_name = "image"
-    _, h, w = input_shape
-    node_idx = 0
-
-    for s, (channels, n_convs) in enumerate(stages, start=1):
-        for i in range(1, n_convs + 1):
-            is_down_layer = (i == 1) if downsample_at == "first" else (i == n_convs)
-            stride = 2 if (downsample and is_down_layer) else 1
-
-            h, w = _out_size(h, stride), _out_size(w, stride)
-            name = f"conv{s}_{i}"
-
-            options = {"td_stride": stride}
-            if mirror_bu and stride > 1:
-                options.update({"bu_stride": stride, "bu_output_padding": 1})
-
-            if hep_checkpoint_interval and (node_idx % hep_checkpoint_interval == 0):
-                highway_from_td = ("label",)
-            else:
-                highway_from_td = ()
-
-            # if skip_interval and node_idx != 0 and node_idx % skip_interval == 0:
-            #     highway_from_td = ("label",)
-            # else:
-            #     highway_from_td = ()
-
-            specs.append(
-                NodeSpec(
-                    name, "pcn_conv", (channels, h, w),
-                    parents=(prev_name,),
-                    td_act_fn=act,
-                    options=options,
-                    highway_from_td=highway_from_td,
-                )
-            )
-            prev_name = name
-            node_idx += 1
-
-    # --- dense tail ---
-    for j, dim in enumerate(fc_dims, start=1):
-        name = f"fc{j}"
-        specs.append(
-            NodeSpec(name, "pcn", dim, parents=(prev_name,), td_act_fn=act)
-        )
-        prev_name = name
-
-    specs.append(
-        NodeSpec(
-            "label", "pcn", n_classes,
-            parents=(prev_name,),
-            td_act_fn="identity",
-            clamped=True, release=False, energy="ce",
-        )
-    )
-
-    return tuple(specs)
-
-
-# usage
-node_specs = make_vgg_specs(hep_checkpoint_interval=4)
 
 config = GraphModelConfig(
-    #node_specs=node_specs,
-    node_specs=(
-        # --- INPUT ---
+node_specs=(
+            # --- INPUT ---
         NodeSpec(
             "image",
             "input",
@@ -364,7 +269,7 @@ config = GraphModelConfig(
             clamped=True,
             release=False,
             bu_act_fn="identity",
-            options={"bu_stride":1},
+            #options={"bu_stride":1},
         ),
         # --- STAGE 1: (64 channels, 32x32) ---
         NodeSpec(
@@ -372,9 +277,7 @@ config = GraphModelConfig(
             "pcn_conv",
             (64, 32, 32),
             parents=("image",),
-            td_act_fn="gelu",
             options={"td_stride": 1, "bu_stride": 2, "bu_output_padding": 1},
-            highway_from_td=("label",),
         ),
         # --- STAGE 2: Downsample to (128 channels, 16x16) ---
         NodeSpec(
@@ -382,9 +285,7 @@ config = GraphModelConfig(
             "pcn_conv",
             (128, 16, 16),
             parents=("conv1",),
-            td_act_fn="gelu",
             options={"td_stride": 2, "bu_stride": 2, "bu_output_padding": 1},
-            highway_from_td=("label",),
         ),
         # --- STAGE 3: Downsample to (256 channels, 8x8) ---
         NodeSpec(
@@ -392,26 +293,22 @@ config = GraphModelConfig(
             "pcn_conv",
             (256, 8, 8),
             parents=("conv2",),
-            td_act_fn="gelu",
             options={"td_stride": 2, "bu_stride": 2, "bu_output_padding": 1},
-            highway_from_td=("label",),
         ),
         NodeSpec(
             "conv4", 
             "pcn_conv", 
             (256, 4, 4), 
             parents=("conv3",), 
-            td_act_fn="gelu",
             options={"td_stride": 2,},
-            highway_from_td=("label",),
-            ),
+        ),
         # --- DENSE TAIL ---
         NodeSpec(
             "fc", 
             "pcn", 
             2048, 
-            parents=("conv4",), 
-            td_act_fn="gelu",),
+            parents=("conv4",),
+        ), 
         NodeSpec(
             "label",
             "pcn",
@@ -424,11 +321,13 @@ config = GraphModelConfig(
         ),
     ),
     activity_norm="rms",
+    td_act_fn="tanh",
     highway_alpha=0.1,
-    bidirectional=True,
+    bidirectional=False,
     td_precision=1.0,
-    bu_precision=0.1,
+    bu_precision=1e-4,
     energy="pc",
+    weight_norm="none"
 )
 model = GraphModel(config, key=model_key)
 
@@ -441,21 +340,21 @@ RETURN_LAYERWISE = False
 # CIFAR-100 with this graph: param lr 1e-3 collapsed the feedforward net to chance in every run (with activity lr 0.01
 # or 0.001); param lr 1e-4 trained, and lowering the activity lr to 0.001 as well gave the best result (~16.6% test
 # after 10 epochs, still rising). Tune these first if you change the architecture.
-ACTIVITY_LR = 0.005
+ACTIVITY_LR = 0.001
 #activity_optim = grouped_optimiser(config, optax.sgd, ACTIVITY_LR, {"kind:pcn_conv": 0.1})
 #param_optim = optax.adam(learning_rate=0.001)
 activity_optim = optax.adam(learning_rate=ACTIVITY_LR)
-PARAM_LR = 6e-5
-param_optim = grouped_optimiser(config, optax.adamw, PARAM_LR, {"kind:pcn": 0.3})
-#param_optim = optax.adamw(learning_rate=PARAM_LR)
+PARAM_LR = 0.0001
+#param_optim = grouped_optimiser(config, optax.adamw, PARAM_LR, {"kind:pcn": 0.3})
+param_optim = optax.adamw(learning_rate=PARAM_LR)
 
 train_step = make_train_step(
     param_optim=param_optim,
     activity_optim=activity_optim,
-    n_infer_steps=50,
+    n_infer_steps=96,
 )
 
-eval_step = make_eval_step(activity_optim=activity_optim, n_infer_steps=50)
+eval_step = make_eval_step(activity_optim=activity_optim, n_infer_steps=96)
 
 
 print(
@@ -540,7 +439,7 @@ save_eval_samples(
 
 # CHANGED: the reverse query. Clamp ONLY the label; the image is released, initialised by the generative (bu) sweep
 # from the label up, then settled. More inference steps than in training, as in the paper.
-def save_generated_samples(model, fine_names=None, n=10, n_steps=100, filename="generated_from_label_cifar100.png"):
+def save_generated_samples(model, fine_names=None, n=10, n_steps=30, filename="generated_from_label_cifar100.png"):
     gen_step = make_eval_step(activity_optim=activity_optim, n_infer_steps=n_steps)
     onehots = jax.nn.one_hot(jnp.arange(n), 100)
     states_curr, *_ = gen_step(model, {"label": onehots}, init_direction="bu")
@@ -560,4 +459,4 @@ def save_generated_samples(model, fine_names=None, n=10, n_steps=100, filename="
     print(f"Generated-from-label samples saved to '{filename}'")
 
 
-save_generated_samples(model, fine_names=fine_names)
+#save_generated_samples(model, fine_names=fine_names)

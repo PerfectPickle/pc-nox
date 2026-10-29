@@ -9,4 +9,5 @@ ACT_FN_REGISTRY: dict[str, Callable]= {
     "identity": lambda x: x,
     "gelu": jnn.gelu,
     "elu": jnn.elu,
+    "swish": jnn.silu,
     }

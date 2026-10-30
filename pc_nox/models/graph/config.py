@@ -154,7 +154,7 @@ class NodeSpec:
         if not self.shape or not all(isinstance(d, int) and d > 0 for d in self.shape):
             errs.append(f"shape {self.shape} must be a non-empty tuple of positive ints")
         if len(set(self.all_parents)) != len(self.all_parents):
-            errs.append(f"duplicate parents {self.parents}")
+            errs.append(f"duplicate parents {self.all_parents}")
         # Check for overlap between parents and skip_parents
         overlap = set(self.parents) & set(self.skip_parents)
         if overlap:
@@ -232,7 +232,7 @@ def _resolve_levels(by_name: Mapping[str, NodeSpec]) -> Tuple[Dict[str, int], Li
             return None
         visiting.add(name)
         spec = by_name[name]
-        parent_levels = [level_of(p) for p in spec.parents]
+        parent_levels = [level_of(p) for p in spec.all_parents]
         visiting.discard(name)
         if any(pl is None for pl in parent_levels):
             return None
@@ -433,10 +433,6 @@ class GraphModelConfig:
     def clamped(self) -> Tuple[NodeSpec, ...]:
         """Nodes whose state is observed data (the keys of `observation`)."""
         return tuple(s for s in self.node_specs if s.clamped)
-
-    @property
-    def all_parents(self): 
-        return self.parents + self.skip_parents  
 
     def spec(self, name: str) -> NodeSpec:
         for s in self.node_specs:

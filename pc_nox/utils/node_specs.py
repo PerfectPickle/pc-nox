@@ -15,8 +15,11 @@ plain tuples of `NodeSpec` (specs are frozen, so nothing is ever mutated):
                             specs (and the names of a chain) and return new specs.
                             Orthogonal features are separate functions rather than
                             flags on one giant function.
-  4. presets             -> `make_tpch_specs`, `make_pcn_classifier_specs`: whole
-                            network types, written purely in terms of 1-3.
+  4. presets             -> `make_tpch_specs`, `make_pcn_classifier_specs` (whole
+                            network types, written purely in terms of 1-3) and
+                            `make_config` / `make_*_config`, which also set the
+                            MODEL-WIDE settings that a NodeSpec cannot carry
+                            (`input_size`, defaults, ...).
 
 There is no "whole network vs partial" mode: a chain with `parent=None` is a root
 chain, a chain with `parent="x"` hangs below node "x", and the transforms take
@@ -31,15 +34,36 @@ CONVENTIONS
   * Pass freshly built specs to the transforms, not `config.node_specs`: the
     latter have their levels resolved and pinned, which stops them re-deriving.
 
+SKIPS (see `add_skips`). A skip block runs from a SOURCE node to a CONSUMER node
+`span` hops further down the chain.
+  top-down skip     the consumer's td prediction gets "+ skip(source)" outside its
+                    activation. Listed in the consumer's `skip_parents`.
+  bottom-up skip    the source's bu prediction gets "+ skip(consumer)" outside its
+                    activation. Listed in the source's `skip_children`.
+Each pathway gets its OWN aux chain: a td aux node is a delayed copy of the source
+(predicted only from its skip parent), a bu aux node a delayed copy of the consumer
+(predicted only from its skip child). They are never one shared bidirectional node:
+a node predicted from both sides settles on the AVERAGE of its neighbours, so a
+shared chain would interpolate between source and consumer instead of copying either.
+
 REQUIREMENTS ON THE LIBRARY (these helpers only set spec fields):
-  * `NodeSpec.highway_from`    (HEP checkpoints; entries "src" or "src:td"/"src:bu")
-  * `NodeSpec.skip_parents`    (outside-activation skip sources)
-  * `config.py` must treat `skip_parents` like `parents` when resolving levels,
-    checking for unknown names and building `children()` (use `all_parents`).
-  * a node kind registered as "aux" if you use `via="aux"` (see `add_skips`).
+  * NodeSpec fields `highway_from`, `skip_parents`, `skip_children`.
+  * config: `skip_parents` counts as a parent edge for level resolution, unknown-name
+    checks and `children()`. `X.skip_children` containing `Y` counts as X being a
+    LEVEL-parent of Y, so bottom-up aux chains get aligned levels automatically.
+  * model: skip edges NEVER feed `parents_curr` / `children_curr` (a td aux node is a
+    copy of its source; as a regular child it would let the source's bottom-up path
+    predict itself from that copy). They are gathered into `skip_parents_curr` /
+    `skip_children_curr`.
+  * an "aux" node kind with option pathway="td" (default; reads skip_parents_curr, or
+    parents_curr when aux_wiring="parents") or pathway="bu" (bidirectional=True, no td
+    prediction, reads skip_children_curr). `validate_pairings` must accept such a
+    bu-only inferred node (it currently requires "td"); `init_activities` already
+    starts a node with no prediction in the sweep direction at zero.
 """
 
 import math
+import warnings
 from dataclasses import replace
 from typing import Callable, Iterable, List, NamedTuple, Optional, Sequence, Tuple, Union
 
@@ -50,6 +74,7 @@ Selector = Union[str, Iterable[str], Callable[[NodeSpec], bool]]
 
 WIDTH_PROFILES = ("linear", "hourglass", "barrel")
 SKIP_VIA = ("aux", "direct")
+AUX_WIRING = ("skip", "parents")
 _RESERVED = ("name", "kind", "shape", "parents")
 
 
@@ -238,15 +263,22 @@ def add_highways(
     return tuple(out)
 
 
+def _fresh(cur: dict, name: str) -> None:
+    if name in cur:
+        raise ValueError(f"node name {name!r} is already in use")
+
+
 def add_skips(
     specs: Sequence[NodeSpec],
     names: Sequence[str],
     span: int = 2,
     every: Optional[int] = None,
-    via: str = "aux",
+    via: Optional[str] = "aux",
+    bu_via: Optional[str] = None,
     mode: str = "auto",
+    bu_mode: str = "auto",
     aux_kind: str = "aux",
-    aux_bidirectional: Optional[bool] = None,
+    aux_wiring: str = "skip",
     match_precision: bool = True,
     start: int = 0,
 ) -> Tuple[NodeSpec, ...]:
@@ -255,37 +287,55 @@ def add_skips(
     A block starts at `names[i]` (the SOURCE) and ends at `names[i + span]` (the
     CONSUMER), bypassing `span - 1` layers. Blocks start at i = start, start+every, ...
     (`every` defaults to `span`: back-to-back ResNet-style blocks; smaller values
-    overlap them).
+    overlap them). `names` must be ONE connected path: for a network with parallel
+    branches, call this once per branch.
 
-    via="aux" (the auxiliary-neuron scheme): `span - 1` identity nodes are inserted,
-        one per bypassed layer, source -> aux1 -> ... -> aux_{span-1} -> consumer.
-        Each aux node has the same width as the source and runs ALONGSIDE the main
-        node it parallels, so the skip signal and the main signal reach the
-        consumer in the same number of steps. The consumer lists the last aux node
-        in `skip_parents`. Aux nodes are named f"{consumer}_aux{k}".
-    via="direct": the consumer lists the source itself in `skip_parents`. The skip
-        arrives early, which is the failure the aux scheme fixes; useful as a baseline.
+    TOP-DOWN skip (`via`; None disables it):
+        "aux"    `span - 1` identity nodes, one per bypassed layer:
+                     source -> aux1 -> ... -> aux_{span-1} -> consumer
+                 Each has the SOURCE's width and runs alongside the main node it
+                 parallels, so the skip signal and the main signal reach the
+                 consumer in the same number of steps. The consumer lists the last
+                 one in `skip_parents`. Names: f"{consumer}_aux{k}".
+        "direct" the consumer lists the source itself in `skip_parents`. The signal
+                 arrives early (the failure the aux scheme fixes): a baseline.
+    BOTTOM-UP skip (`bu_via`; None disables it): the mirror image.
+        "aux"    `span - 1` nodes with the CONSUMER's width, each predicted only
+                 from its `skip_children` entry: source <- bu_aux1 <- ... <- consumer.
+                 Names: f"{source}_bu_aux{m}". The source lists the first in
+                 `skip_children` (and is made bidirectional).
+        "direct" the source lists the consumer itself in `skip_children`.
 
     Args:
-        mode: The consumer's skip-op mode ("auto" leaves the node default;
-            otherwise written to the consumer's options as {"skip": mode}).
-            "identity" / "gain" need source and consumer to have the same shape.
+        mode, bu_mode: The receiving node's skip-op mode ("auto" = node default;
+            otherwise written to options as {"skip_td": mode} on the consumer /
+            {"skip_bu": bu_mode} on the source). "identity" / "gain" need source
+            and consumer to have the same shape.
         aux_kind: The registered node kind used for aux nodes.
-        aux_bidirectional: None inherits the model-wide default. The LAST aux node's
-            bottom-up child is the consumer, so if the consumer's width differs
-            from the source's that one node is switched off automatically (and an
-            explicit True is rejected).
-        match_precision: Give each aux node the td/bu precision of the main node it
-            runs alongside (the paper sets aux covariance equal to the main layer's).
+        aux_wiring: How td aux nodes are linked. "skip" (recommended) uses
+            `skip_parents`, so the aux copy never appears in its source's
+            `children_curr`. "parents" uses ordinary `parents`, which needs no
+            library change but, in a bidirectional graph, feeds the source a copy of
+            itself through its bottom-up path.
+        match_precision: Give each aux node the td/bu precision of the main-path
+            node it runs alongside, i.e. `names[i + k]` for the k-th aux node of a
+            block (the paper sets aux covariance equal to the main layer's). This
+            is by POSITION on the path you pass, not by level: with several nodes on
+            one level, pass each branch separately.
         start: Index in `names` of the first block's source.
 
-    Returns the specs with the consumers modified and the aux nodes appended.
+    Returns the specs with consumers/sources modified and the aux nodes appended.
     """
     specs = tuple(specs)
     chain = list(names)
     every = span if every is None else every
-    if via not in SKIP_VIA:
-        raise ValueError(f"via must be one of {SKIP_VIA}, got {via!r}")
+    for label, v in (("via", via), ("bu_via", bu_via)):
+        if v is not None and v not in SKIP_VIA:
+            raise ValueError(f"{label} must be None or one of {SKIP_VIA}, got {v!r}")
+    if via is None and bu_via is None:
+        raise ValueError("nothing to add: via and bu_via are both None")
+    if aux_wiring not in AUX_WIRING:
+        raise ValueError(f"aux_wiring must be one of {AUX_WIRING}, got {aux_wiring!r}")
     if span < 2:
         raise ValueError(f"span must be >= 2 (a skip over zero layers is meaningless), got {span}")
     if every < 1 or start < 0:
@@ -307,59 +357,120 @@ def add_skips(
     for i, j in blocks:
         src, con = cur[chain[i]], cur[chain[j]]
         same_shape = tuple(src.shape) == tuple(con.shape)
-        if mode in ("identity", "gain") and not same_shape:
-            raise ValueError(f"skip {src.name!r}{src.shape} -> {con.name!r}{con.shape}: mode {mode!r} cannot change shape; "
-                             "use 'auto', 'linear', 'pad' or 'random'")
-        if via == "aux" and aux_bidirectional and not same_shape:
-            raise ValueError(f"aux_bidirectional=True, but the last aux node's child is {con.name!r} with a different shape "
-                             f"({con.shape} vs {src.shape}); use aux_bidirectional=False/None or equal widths")
-        if via == "direct":
-            skip_src = src.name
-        else:
-            prev = src.name
-            for k in range(1, span):
-                name = f"{con.name}_aux{k}"
-                if name in cur:
-                    raise ValueError(f"node name {name!r} is already in use")
-                alongside = cur[chain[i + k]]                    # the main node at the same level
-                bidir = aux_bidirectional
-                if k == span - 1 and bidir is None and not same_shape:
-                    bidir = False                                 # its child is the consumer, which has another width
-                prec = dict(td_precision=alongside.td_precision, bu_precision=alongside.bu_precision) if match_precision else {}
-                aux = NodeSpec(name=name, kind=aux_kind, shape=src.shape, parents=(prev,), bidirectional=bidir, **prec)
-                cur[name] = aux
-                new_aux.append(aux)
-                prev = name
-            skip_src = prev
-        changes = {"skip_parents": con.skip_parents + (skip_src,)}
-        if mode != "auto":
-            changes["options"] = {**con.opts, "skip": mode}
-        cur[con.name] = replace(con, **changes)
+        for active, m, label in ((via, mode, "mode"), (bu_via, bu_mode, "bu_mode")):
+            if active and m in ("identity", "gain") and not same_shape:
+                raise ValueError(f"skip {src.name!r}{src.shape} <-> {con.name!r}{con.shape}: {label}={m!r} cannot change "
+                                 "shape; use 'auto', 'linear', 'pad' or 'random'")
+
+        def precision(k: int) -> dict:                           # of the main-path node k hops below the source
+            if not match_precision:
+                return {}
+            alongside = cur[chain[i + k]]
+            return dict(td_precision=alongside.td_precision, bu_precision=alongside.bu_precision)
+
+        # ---- top-down skip: source -> consumer
+        if via is not None:
+            if via == "direct":
+                skip_src = src.name
+            else:
+                prev = src.name
+                for k in range(1, span):
+                    name = f"{con.name}_aux{k}"
+                    _fresh(cur, name)
+                    link = {"skip_parents": (prev,)} if aux_wiring == "skip" else {"parents": (prev,)}
+                    # bidirectional=False EXPLICITLY: left as None it would inherit a model-wide True and the node
+                    # would settle on the average of its neighbours instead of copying its parent.
+                    aux = NodeSpec(name=name, kind=aux_kind, shape=src.shape, bidirectional=False, **link, **precision(k))
+                    cur[name] = aux
+                    new_aux.append(aux)
+                    prev = name
+                skip_src = prev
+            changes = {"skip_parents": con.skip_parents + (skip_src,)}
+            if mode != "auto":
+                changes["options"] = {**con.opts, "skip_td": mode}
+            cur[con.name] = replace(con, **changes)
+
+        # ---- bottom-up skip: consumer -> source
+        if bu_via is not None:
+            if cur[src.name].bidirectional is False:
+                raise ValueError(f"{src.name!r} has bidirectional=False but a bottom-up skip needs its bottom-up path")
+            if bu_via == "direct":
+                skip_child = con.name
+            else:
+                bu_names = [f"{src.name}_bu_aux{m}" for m in range(1, span)]
+                for m, name in enumerate(bu_names, start=1):
+                    _fresh(cur, name)
+                    nxt = bu_names[m] if m < span - 1 else con.name       # predicted from the next one down, the last from the consumer
+                    aux = NodeSpec(name=name, kind=aux_kind, shape=con.shape, bidirectional=True,
+                                   skip_children=(nxt,), options={"pathway": "bu"}, **precision(m))
+                    cur[name] = aux
+                    new_aux.append(aux)
+                skip_child = bu_names[0]
+            s_now = cur[src.name]
+            changes = {"skip_children": s_now.skip_children + (skip_child,), "bidirectional": True}
+            if bu_mode != "auto":
+                changes["options"] = {**s_now.opts, "skip_bu": bu_mode}
+            cur[src.name] = replace(s_now, **changes)
     return tuple(cur[s.name] for s in specs) + tuple(new_aux)
 
 
 def check_skip_sync(config: GraphModelConfig) -> List[str]:
     """Report skips that are not time-synchronised, as a list of messages (empty = fine).
 
-    The condition is simply LEVEL equality: a skip source must sit at the same
-    level as the consumer's main parents, so both signals take the same number of
-    hops. Aux chains built by `add_skips` satisfy it by construction. `via="direct"`
-    skips do not, by design, and will be reported.
+    The condition is LEVEL equality: a skip's far end must sit at the same level as
+    the near end's ordinary neighbours, so the skip and main signals take the same
+    number of hops.
+      top-down:  each of a consumer's `skip_parents` vs its `parents`.
+      bottom-up: each of a node's `skip_children` vs its ordinary children.
+    Aux chains built by `add_skips` satisfy it by construction. `via="direct"` skips
+    do not, by design, and will be reported. Aux nodes themselves are not checked.
     """
     problems = []
+    regular_children = {s.name: [x.name for x in config.node_specs if s.name in x.parents] for s in config.node_specs}
     for s in config.node_specs:
-        for src in s.skip_parents:
-            level = config.spec(src).level
+        if s.parents:
             main = sorted({config.spec(p).level for p in s.parents})
-            if main != [level]:
-                problems.append(f"node {s.name!r}: skip source {src!r} is at level {level} but its main parents are at "
-                                f"{main}; the two signals will not arrive together")
+            for src in s.skip_parents:
+                level = config.spec(src).level
+                if main != [level]:
+                    problems.append(f"node {s.name!r}: top-down skip source {src!r} is at level {level} but its parents are "
+                                    f"at {main}; the two signals will not arrive together")
+        if regular_children[s.name]:
+            main = sorted({config.spec(c).level for c in regular_children[s.name]})
+            for src in s.skip_children:
+                level = config.spec(src).level
+                if main != [level]:
+                    problems.append(f"node {s.name!r}: bottom-up skip source {src!r} is at level {level} but its children are "
+                                    f"at {main}; the two signals will not arrive together")
     return problems
+
+
+def make_config(specs: Sequence[NodeSpec], *, warn_unsynced: bool = True, **config_kwargs) -> GraphModelConfig:
+    """`GraphModelConfig(node_specs=specs, **config_kwargs)`, plus a warning (not an error)
+    for any unsynchronised skip, since `via="direct"` skips are deliberate baselines.
+
+    This is where MODEL-WIDE settings go: `input_size`, `bidirectional`, `td_act_fn`,
+    `init_direction`, ... A `NodeSpec` describes one node and has no field for them.
+    """
+    config = GraphModelConfig(node_specs=tuple(specs), **config_kwargs)
+    if warn_unsynced:
+        problems = check_skip_sync(config)
+        if problems:
+            warnings.warn("unsynchronised skips:\n  - " + "\n  - ".join(problems), stacklevel=2)
+    return config
 
 
 # --------------------------------------------------------------------------- #
 # 4. Presets
 # --------------------------------------------------------------------------- #
+
+def _apply_features(specs, names, highway_source, highway_every, highway_offset, skip_span, skip_kwargs):
+    if skip_span:
+        specs = add_skips(specs, names, span=skip_span, **skip_kwargs)
+    if highway_every:
+        specs = add_highways(specs, names, sources=highway_source, every=highway_every, offset=highway_offset)
+    return specs
+
 
 def make_tpch_specs(
     obs_dim: int,
@@ -373,15 +484,25 @@ def make_tpch_specs(
     obs_energy: Optional[str] = None,
     highway_every: Optional[int] = None,
     highway_offset: int = 0,
+    skip_span: Optional[int] = None,
+    skip_every: Optional[int] = None,
+    skip_via: Optional[str] = "aux",
+    bu_skip_via: Optional[str] = None,
+    skip_mode: str = "auto",
+    bu_skip_mode: str = "auto",
+    aux_wiring: str = "skip",
 ) -> Tuple[NodeSpec, ...]:
     """One-tail tPC-H network: core (control) -> h0 ... h{n-1} -> obs (clamped).
 
     Widths run from `min_width` at the core to `obs_dim` at the observation node
     (see `layer_widths`). Names: "core", "h0".., "obs". Highways, if enabled,
-    broadcast the obs node's error to every `highway_every`-th hidden node.
-    Remember `GraphModelConfig(input_size=...)` if the core takes a control input.
-    (`bidirectional` is applied to core and hidden nodes only: the observation
-    readout has no bottom-up path.)
+    broadcast the obs node's error to every `highway_every`-th hidden node. Skips
+    (`skip_span` set) run over the hidden chain; the tPC-H node classes must
+    implement them (see `add_skips`). `bidirectional` is applied to core and hidden
+    nodes only: the observation readout has no bottom-up path.
+
+    This returns specs only. The control input's width, `input_size`, belongs to the
+    model-wide config: use `make_tpch_config` to set it.
     """
     if num_hidden < 1:
         raise ValueError("num_hidden must be >= 1")
@@ -390,10 +511,9 @@ def make_tpch_specs(
     core = make_chain("tpch_control", widths[:1], "core", **shared)
     hidden = make_chain("tpch_hidden", widths[1:-1], "h", parent=core.last, **shared)
     obs = make_chain("tpch_obs", widths[-1:], "obs", parent=hidden.last, clamped=True, energy=obs_energy)
-    specs = core.specs + hidden.specs + obs.specs
-    if highway_every:
-        specs = add_highways(specs, hidden.names, sources=obs.last, every=highway_every, offset=highway_offset)
-    return specs
+    skip_kwargs = dict(every=skip_every, via=skip_via, bu_via=bu_skip_via, mode=skip_mode, bu_mode=bu_skip_mode, aux_wiring=aux_wiring)
+    return _apply_features(core.specs + hidden.specs + obs.specs, hidden.names, obs.last,
+                           highway_every, highway_offset, skip_span, skip_kwargs)
 
 
 def make_pcn_classifier_specs(
@@ -407,17 +527,19 @@ def make_pcn_classifier_specs(
     highway_offset: int = 0,
     skip_span: Optional[int] = None,
     skip_every: Optional[int] = None,
-    skip_via: str = "aux",
+    skip_via: Optional[str] = "aux",
+    bu_skip_via: Optional[str] = None,
     skip_mode: str = "auto",
-    aux_bidirectional: Optional[bool] = None,
+    bu_skip_mode: str = "auto",
+    aux_wiring: str = "skip",
 ) -> Tuple[NodeSpec, ...]:
     """Supervised static-PCN classifier: x (clamped data) -> h0 ... -> y (clamped label, CE).
 
     The setting of the HEP and aux-neuron papers. Names: "x", "h0".., "y" (plus
-    "{consumer}_aux{k}" for aux nodes). `skip_span=None` disables skips,
-    `highway_every=None` disables highways. Skips run over the hidden chain only.
-    The output node uses td_act_fn="identity" (a linear readout feeding the CE
-    loss); make sure "identity" is in your ACT_FN_REGISTRY.
+    aux nodes, see `add_skips`). `skip_span=None` disables skips, `highway_every=None`
+    disables highways. Skips run over the hidden chain only. The output node uses
+    td_act_fn="identity" (a linear readout feeding the CE loss); make sure
+    "identity" is in your ACT_FN_REGISTRY.
     """
     hidden_widths = list(hidden_widths)
     if not hidden_widths:
@@ -426,10 +548,25 @@ def make_pcn_classifier_specs(
     hidden = make_chain("pcn", hidden_widths, "h", parent=inp.last,
                         td_act_fn=td_act_fn, bu_act_fn=bu_act_fn, bidirectional=bidirectional)
     out = make_chain("pcn", [num_classes], "y", parent=hidden.last, clamped=True, energy="ce", td_act_fn="identity")
-    specs = inp.specs + hidden.specs + out.specs
-    if skip_span:
-        specs = add_skips(specs, hidden.names, span=skip_span, every=skip_every, via=skip_via,
-                          mode=skip_mode, aux_bidirectional=aux_bidirectional)
-    if highway_every:
-        specs = add_highways(specs, hidden.names, sources=out.last, every=highway_every, offset=highway_offset)
-    return specs
+    skip_kwargs = dict(every=skip_every, via=skip_via, bu_via=bu_skip_via, mode=skip_mode, bu_mode=bu_skip_mode, aux_wiring=aux_wiring)
+    return _apply_features(inp.specs + hidden.specs + out.specs, hidden.names, out.last,
+                           highway_every, highway_offset, skip_span, skip_kwargs)
+
+
+def make_tpch_config(*, input_size: int = 0, config_kwargs: Optional[dict] = None, warn_unsynced: bool = True,
+                     **spec_kwargs) -> GraphModelConfig:
+    """`make_tpch_specs(**spec_kwargs)` wrapped in a GraphModelConfig with `input_size` set.
+
+    `input_size` is the width of the external control input x_t that drives the core
+    node (0 = none). Other model-wide settings go in `config_kwargs`
+    (e.g. config_kwargs={"bidirectional": True, "init_direction": "td"}).
+    Spec arguments must be passed by keyword: make_tpch_config(obs_dim=128, num_hidden=8, input_size=3).
+    """
+    return make_config(make_tpch_specs(**spec_kwargs), warn_unsynced=warn_unsynced,
+                       input_size=input_size, **(config_kwargs or {}))
+
+
+def make_pcn_classifier_config(*, config_kwargs: Optional[dict] = None, warn_unsynced: bool = True,
+                               **spec_kwargs) -> GraphModelConfig:
+    """`make_pcn_classifier_specs(**spec_kwargs)` wrapped in a GraphModelConfig."""
+    return make_config(make_pcn_classifier_specs(**spec_kwargs), warn_unsynced=warn_unsynced, **(config_kwargs or {}))
